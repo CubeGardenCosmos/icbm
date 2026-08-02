@@ -11,12 +11,11 @@ use icbm_mc_767::packets::config::{
 };
 
 fn int_list(min: i32, max: i32) -> Nbt {
-    let mut value = NbtCompound::new();
-    value.insert("min_inclusive", Nbt::Int(min));
-    value.insert("max_inclusive", Nbt::Int(max));
+    // 官方 `dispatch` codec：type 与 min/max 平级（非 {type, value} 包裹）
     let mut uniform = NbtCompound::new();
     uniform.insert("type", Nbt::String("minecraft:uniform".to_owned()));
-    uniform.insert("value", Nbt::Compound(Box::new(value)));
+    uniform.insert("min_inclusive", Nbt::Int(min));
+    uniform.insert("max_inclusive", Nbt::Int(max));
     Nbt::Compound(Box::new(uniform))
 }
 
@@ -300,19 +299,427 @@ pub fn chat_type_registry() -> CRegistryData {
     }
 }
 
-/// `minecraft:damage_type` 注册表（Phase 1 发 1 个基础条目）。
+/// 单条 `damage_type` 官方数据。
+type DamageTypeRow = (
+    &'static str,
+    &'static str,
+    &'static str,
+    f32,
+    Option<&'static str>,
+    Option<&'static str>,
+);
+
+/// 官方 47 条 `damage_type`（`id`/`message_id`/`scaling`/`exhaustion`/`effects`/`death_message_type`）。
+const DAMAGE_TYPE_ENTRIES: &[DamageTypeRow] = &[
+    (
+        "minecraft:arrow",
+        "arrow",
+        "when_caused_by_living_non_player",
+        0.1,
+        None,
+        None,
+    ),
+    (
+        "minecraft:bad_respawn_point",
+        "badRespawnPoint",
+        "always",
+        0.1,
+        None,
+        Some("intentional_game_design"),
+    ),
+    (
+        "minecraft:cactus",
+        "cactus",
+        "when_caused_by_living_non_player",
+        0.1,
+        None,
+        None,
+    ),
+    (
+        "minecraft:campfire",
+        "inFire",
+        "when_caused_by_living_non_player",
+        0.1,
+        Some("burning"),
+        None,
+    ),
+    (
+        "minecraft:cramming",
+        "cramming",
+        "when_caused_by_living_non_player",
+        0.0,
+        None,
+        None,
+    ),
+    (
+        "minecraft:dragon_breath",
+        "dragonBreath",
+        "when_caused_by_living_non_player",
+        0.0,
+        None,
+        None,
+    ),
+    (
+        "minecraft:drown",
+        "drown",
+        "when_caused_by_living_non_player",
+        0.0,
+        Some("drowning"),
+        None,
+    ),
+    (
+        "minecraft:dry_out",
+        "dryout",
+        "when_caused_by_living_non_player",
+        0.1,
+        None,
+        None,
+    ),
+    (
+        "minecraft:explosion",
+        "explosion",
+        "always",
+        0.1,
+        None,
+        None,
+    ),
+    (
+        "minecraft:fall",
+        "fall",
+        "when_caused_by_living_non_player",
+        0.0,
+        None,
+        Some("fall_variants"),
+    ),
+    (
+        "minecraft:falling_anvil",
+        "anvil",
+        "when_caused_by_living_non_player",
+        0.1,
+        None,
+        None,
+    ),
+    (
+        "minecraft:falling_block",
+        "fallingBlock",
+        "when_caused_by_living_non_player",
+        0.1,
+        None,
+        None,
+    ),
+    (
+        "minecraft:falling_stalactite",
+        "fallingStalactite",
+        "when_caused_by_living_non_player",
+        0.1,
+        None,
+        None,
+    ),
+    (
+        "minecraft:fireball",
+        "fireball",
+        "when_caused_by_living_non_player",
+        0.1,
+        Some("burning"),
+        None,
+    ),
+    (
+        "minecraft:fireworks",
+        "fireworks",
+        "when_caused_by_living_non_player",
+        0.1,
+        None,
+        None,
+    ),
+    (
+        "minecraft:fly_into_wall",
+        "flyIntoWall",
+        "when_caused_by_living_non_player",
+        0.0,
+        None,
+        None,
+    ),
+    (
+        "minecraft:freeze",
+        "freeze",
+        "when_caused_by_living_non_player",
+        0.0,
+        Some("freezing"),
+        None,
+    ),
+    (
+        "minecraft:generic",
+        "generic",
+        "when_caused_by_living_non_player",
+        0.0,
+        None,
+        None,
+    ),
+    (
+        "minecraft:generic_kill",
+        "genericKill",
+        "when_caused_by_living_non_player",
+        0.0,
+        None,
+        None,
+    ),
+    (
+        "minecraft:hot_floor",
+        "hotFloor",
+        "when_caused_by_living_non_player",
+        0.1,
+        Some("burning"),
+        None,
+    ),
+    (
+        "minecraft:in_fire",
+        "inFire",
+        "when_caused_by_living_non_player",
+        0.1,
+        Some("burning"),
+        None,
+    ),
+    (
+        "minecraft:in_wall",
+        "inWall",
+        "when_caused_by_living_non_player",
+        0.0,
+        None,
+        None,
+    ),
+    (
+        "minecraft:indirect_magic",
+        "indirectMagic",
+        "when_caused_by_living_non_player",
+        0.0,
+        None,
+        None,
+    ),
+    (
+        "minecraft:lava",
+        "lava",
+        "when_caused_by_living_non_player",
+        0.1,
+        Some("burning"),
+        None,
+    ),
+    (
+        "minecraft:lightning_bolt",
+        "lightningBolt",
+        "when_caused_by_living_non_player",
+        0.1,
+        None,
+        None,
+    ),
+    (
+        "minecraft:magic",
+        "magic",
+        "when_caused_by_living_non_player",
+        0.0,
+        None,
+        None,
+    ),
+    (
+        "minecraft:mob_attack",
+        "mob",
+        "when_caused_by_living_non_player",
+        0.1,
+        None,
+        None,
+    ),
+    (
+        "minecraft:mob_attack_no_aggro",
+        "mob",
+        "when_caused_by_living_non_player",
+        0.1,
+        None,
+        None,
+    ),
+    (
+        "minecraft:mob_projectile",
+        "mob",
+        "when_caused_by_living_non_player",
+        0.1,
+        None,
+        None,
+    ),
+    (
+        "minecraft:on_fire",
+        "onFire",
+        "when_caused_by_living_non_player",
+        0.0,
+        Some("burning"),
+        None,
+    ),
+    (
+        "minecraft:out_of_world",
+        "outOfWorld",
+        "when_caused_by_living_non_player",
+        0.0,
+        None,
+        None,
+    ),
+    (
+        "minecraft:outside_border",
+        "outsideBorder",
+        "when_caused_by_living_non_player",
+        0.0,
+        None,
+        None,
+    ),
+    (
+        "minecraft:player_attack",
+        "player",
+        "when_caused_by_living_non_player",
+        0.1,
+        None,
+        None,
+    ),
+    (
+        "minecraft:player_explosion",
+        "explosion.player",
+        "always",
+        0.1,
+        None,
+        None,
+    ),
+    (
+        "minecraft:sonic_boom",
+        "sonic_boom",
+        "always",
+        0.0,
+        None,
+        None,
+    ),
+    (
+        "minecraft:spit",
+        "mob",
+        "when_caused_by_living_non_player",
+        0.1,
+        None,
+        None,
+    ),
+    (
+        "minecraft:stalagmite",
+        "stalagmite",
+        "when_caused_by_living_non_player",
+        0.0,
+        None,
+        None,
+    ),
+    (
+        "minecraft:starve",
+        "starve",
+        "when_caused_by_living_non_player",
+        0.0,
+        None,
+        None,
+    ),
+    (
+        "minecraft:sting",
+        "sting",
+        "when_caused_by_living_non_player",
+        0.1,
+        None,
+        None,
+    ),
+    (
+        "minecraft:sweet_berry_bush",
+        "sweetBerryBush",
+        "when_caused_by_living_non_player",
+        0.1,
+        Some("poking"),
+        None,
+    ),
+    (
+        "minecraft:thorns",
+        "thorns",
+        "when_caused_by_living_non_player",
+        0.1,
+        Some("thorns"),
+        None,
+    ),
+    (
+        "minecraft:thrown",
+        "thrown",
+        "when_caused_by_living_non_player",
+        0.1,
+        None,
+        None,
+    ),
+    (
+        "minecraft:trident",
+        "trident",
+        "when_caused_by_living_non_player",
+        0.1,
+        None,
+        None,
+    ),
+    (
+        "minecraft:unattributed_fireball",
+        "onFire",
+        "when_caused_by_living_non_player",
+        0.1,
+        Some("burning"),
+        None,
+    ),
+    (
+        "minecraft:wind_charge",
+        "mob",
+        "when_caused_by_living_non_player",
+        0.1,
+        None,
+        None,
+    ),
+    (
+        "minecraft:wither",
+        "wither",
+        "when_caused_by_living_non_player",
+        0.0,
+        None,
+        None,
+    ),
+    (
+        "minecraft:wither_skull",
+        "witherSkull",
+        "when_caused_by_living_non_player",
+        0.1,
+        None,
+        None,
+    ),
+];
+
+/// `minecraft:damage_type` 注册表（官方完整 47 条，取自 1.21.1 客户端 jar
+/// `data/minecraft/damage_type/*.json`；客户端 `DamageSources` 构造时
+/// `getHolderOrThrow` 每个 key，缺一条即崩）。
 #[must_use]
 pub fn damage_type_registry() -> CRegistryData {
-    let mut data = NbtCompound::new();
-    data.insert("message_id", Nbt::String("generic".to_owned()));
-    data.insert("scaling", Nbt::String("always".to_owned()));
-    data.insert("exhaustion", Nbt::Float(0.0));
     CRegistryData {
         registry_id: "minecraft:damage_type".to_owned(),
-        entries: vec![RegistryEntry {
-            id: "minecraft:generic".to_owned(),
-            data: Nbt::Compound(Box::new(data)),
-        }],
+        entries: DAMAGE_TYPE_ENTRIES
+            .iter()
+            .map(
+                |(id, message_id, scaling, exhaustion, effects, death_message_type)| {
+                    let mut data = NbtCompound::new();
+                    data.insert("message_id", Nbt::String((*message_id).to_owned()));
+                    data.insert("scaling", Nbt::String((*scaling).to_owned()));
+                    data.insert("exhaustion", Nbt::Float(*exhaustion));
+                    if let Some(effects) = effects {
+                        data.insert("effects", Nbt::String((*effects).to_owned()));
+                    }
+                    if let Some(death_message_type) = death_message_type {
+                        data.insert(
+                            "death_message_type",
+                            Nbt::String((*death_message_type).to_owned()),
+                        );
+                    }
+                    RegistryEntry {
+                        id: (*id).to_owned(),
+                        data: Nbt::Compound(Box::new(data)),
+                    }
+                },
+            )
+            .collect(),
     }
 }
 
