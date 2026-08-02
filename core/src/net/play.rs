@@ -686,6 +686,14 @@ fn handle_player_command(server: &Server, client: &Arc<Client>, command: &str) {
             let feedback = crate::console::apply_whitelist(server, &action);
             let _ = client.send_system_chat(&feedback, false);
         }
+        Some(Command::Enchant {
+            target,
+            enchantment,
+            level,
+        }) => {
+            let feedback = crate::console::apply_enchant(server, &target, &enchantment, level);
+            let _ = client.send_system_chat(&feedback, false);
+        }
         None => {}
     }
     if icbm_gameplay_icbm::bmtool::parse_bmtool(&line)
@@ -700,8 +708,8 @@ fn handle_player_command(server: &Server, client: &Arc<Client>, command: &str) {
 /// 顶层命令名（minecraft 命名空间 + icbm 命名空间 `bmtool`；升序，与
 /// `command_suggestions` 的排序约定一致）。
 const TOP_LEVEL_COMMANDS: &[&str] = &[
-    "about", "ban", "bmtool", "fill", "gamemode", "gamerule", "give", "help", "setblock", "tp",
-    "whitelist",
+    "about", "ban", "bmtool", "enchant", "fill", "gamemode", "gamerule", "give", "help",
+    "setblock", "tp", "whitelist",
 ];
 
 /// 构建客户端命令树（0x11 `CommandTreeS2CPacket`）。
@@ -714,7 +722,7 @@ pub fn build_command_tree() -> CCommands {
     CCommands {
         nodes: vec![
             Node::Root {
-                children: vec![1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11],
+                children: vec![1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12],
             },
             Node::Literal {
                 name: "about".to_owned(),
@@ -722,27 +730,31 @@ pub fn build_command_tree() -> CCommands {
             },
             Node::Literal {
                 name: "ban".to_owned(),
-                children: vec![12],
-            },
-            Node::Literal {
-                name: "bmtool".to_owned(),
-                children: vec![19],
-            },
-            Node::Literal {
-                name: "fill".to_owned(),
                 children: vec![13],
             },
             Node::Literal {
-                name: "gamemode".to_owned(),
+                name: "bmtool".to_owned(),
+                children: vec![20],
+            },
+            Node::Literal {
+                name: "enchant".to_owned(),
+                children: vec![12],
+            },
+            Node::Literal {
+                name: "fill".to_owned(),
                 children: vec![14],
             },
             Node::Literal {
-                name: "gamerule".to_owned(),
+                name: "gamemode".to_owned(),
                 children: vec![15],
             },
             Node::Literal {
-                name: "give".to_owned(),
+                name: "gamerule".to_owned(),
                 children: vec![16],
+            },
+            Node::Literal {
+                name: "give".to_owned(),
+                children: vec![17],
             },
             Node::Literal {
                 name: "help".to_owned(),
@@ -750,15 +762,15 @@ pub fn build_command_tree() -> CCommands {
             },
             Node::Literal {
                 name: "setblock".to_owned(),
-                children: vec![17],
-            },
-            Node::Literal {
-                name: "tp".to_owned(),
                 children: vec![18],
             },
             Node::Literal {
+                name: "tp".to_owned(),
+                children: vec![19],
+            },
+            Node::Literal {
                 name: "whitelist".to_owned(),
-                children: vec![20],
+                children: vec![21],
             },
             Node::Argument {
                 name: "target".to_owned(),
@@ -790,6 +802,10 @@ pub fn build_command_tree() -> CCommands {
             },
             Node::Literal {
                 name: "tps".to_owned(),
+                children: vec![],
+            },
+            Node::Argument {
+                name: "enchantment".to_owned(),
                 children: vec![],
             },
             Node::Argument {

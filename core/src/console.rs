@@ -428,6 +428,14 @@ impl Server {
                     let feedback = apply_whitelist(self, &action);
                     info!("{feedback}");
                 }
+                Command::Enchant {
+                    target,
+                    enchantment,
+                    level,
+                } => {
+                    let feedback = apply_enchant(self, &target, &enchantment, level);
+                    info!("{feedback}");
+                }
             }
             return;
         }
@@ -793,6 +801,43 @@ pub fn apply_whitelist(server: &Server, action: &WhitelistAction) -> String {
             }
         }
     }
+}
+
+/// 执行 `/enchant`：给玩家主手槽位设置附魔物品（钻石剑 + 指定附魔）。
+///
+/// 服务端不跟踪物品栏内容；此命令把主手替换为附魔物品，客户端渲染附魔发光。
+#[must_use]
+pub fn apply_enchant(server: &Server, target: &str, enchantment: &str, level: i32) -> String {
+    use icbm_mc_767::packets::play::clientbound::{CItemStack, CSetSlot};
+    if icbm_mc_767::enchantment_ids::enchantment_id(enchantment).is_none() {
+        return format!("未知附魔: {enchantment}");
+    }
+    let level = level.clamp(1, 255);
+    let client = {
+        let world = server.world.lock().expect("world lock");
+        world
+            .players
+            .values()
+            .find(|c| c.name.lock().expect("name").as_str() == target)
+            .cloned()
+    };
+    let Some(client) = client else {
+        return format!("找不到玩家 {target}");
+    };
+    // 主手放钻石剑（附魔目标），带指定附魔
+    let mut stack = CItemStack::of("diamond_sword", 1);
+    stack.enchantments.push((enchantment.to_owned(), level));
+    let _ = client.send_encoded(CSetSlot::packet_id(), |w| {
+        CSetSlot {
+            sync_id: -2,
+            revision: 0,
+            slot: 0,
+            stack,
+        }
+        .encode(w);
+    });
+    let _ = server;
+    format!("已给 {target} 主手附魔 {enchantment} {level}")
 }
 
 /// 广播系统消息（`say`）。

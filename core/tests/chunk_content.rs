@@ -682,8 +682,8 @@ fn run_command_tab_completion() {
     assert_eq!(
         texts,
         vec![
-            "about", "ban", "bmtool", "fill", "gamemode", "gamerule", "give", "help", "setblock",
-            "tp", "whitelist",
+            "about", "ban", "bmtool", "enchant", "fill", "gamemode", "gamerule", "give", "help",
+            "setblock", "tp", "whitelist",
         ]
     );
 

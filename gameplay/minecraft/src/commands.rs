@@ -116,6 +116,12 @@ pub enum Command {
     Whitelist {
         action: WhitelistAction,
     },
+    /// `/enchant <玩家> <附魔> [等级]`（附加到主手物品）。
+    Enchant {
+        target: String,
+        enchantment: String,
+        level: i32,
+    },
 }
 
 /// 解析命令行的第一段（`/gamemode ...` / `/gamerule ...` / `/help`）。
@@ -153,6 +159,16 @@ pub fn parse_command(line: &str) -> Option<Command> {
             Some(Command::Ban { target, reason })
         }
         "whitelist" => parse_whitelist(parts),
+        "enchant" => {
+            let target = parts.next()?.to_owned();
+            let enchantment = parts.next()?.to_owned();
+            let level = parts.next().and_then(|v| v.parse::<i32>().ok()).unwrap_or(1);
+            Some(Command::Enchant {
+                target,
+                enchantment: normalize_name(&enchantment),
+                level,
+            })
+        }
         _ => None,
     }
 }
