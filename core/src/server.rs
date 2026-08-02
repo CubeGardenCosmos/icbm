@@ -214,6 +214,8 @@ impl Server {
         crate::console::spawn_console(&self);
 
         let listener = TcpListener::bind(&self.config.address)?;
+        // 非阻塞 accept：running=false 时轮询退出（避免阻塞卡死 stop）
+        listener.set_nonblocking(true).map_err(ServerError::Io)?;
         info!("listening on {}", self.config.address);
 
         let mut handles = Vec::new();
@@ -225,6 +227,10 @@ impl Server {
                         crate::client::handle_connection(&server, stream);
                     }));
                 }
+                Err(err) if err.kind() == std::io::ErrorKind::WouldBlock => {
+                    // 无新连接：短暂等待后继续轮询 running
+                    std::thread::sleep(Duration::from_millis(50));
+                }
                 Err(err) => {
                     warn!(%err, "accept failed");
                     std::thread::sleep(Duration::from_millis(100));
@@ -232,18 +238,69 @@ impl Server {
             }
         }
 
-        // 停止：断开玩家、退出 region、等待连接线程
+        // 停止：断开玩家、退出 region（保存存档）、等待连接线程
         let mut world = self.world.lock().expect("world lock");
         for client in world.players.values() {
             client.alive.store(false, Ordering::Relaxed);
             client.kick("服务器关闭");
         }
         world.players.clear();
+        drop(world);
         // 连接线程在 read timeout（100ms）内观察到 running=false 后退出
         for handle in handles {
             handle.join().ok();
         }
+        // 保存并卸载所有 region（发送 UNLOAD，region flush 后退出；最多等 5 秒）
+        self.shutdown_regions();
         Ok(())
+    }
+
+    /// 保存并卸载所有 region：逐个发 `REGION_UNLOAD`，等待 region flush 存档并退出。
+    fn shutdown_regions(&self) {
+        let regions: Vec<(RegionId, Option<u32>)> = {
+            let world = self.world.lock().expect("world lock");
+            world
+                .regions
+                .ids()
+                .into_iter()
+                .map(|id| {
+                    let pid = world.regions.get(&id).map(|entry| entry.pid);
+                    (id, pid)
+                })
+                .collect()
+        };
+        for (id, _) in &regions {
+            info!(id = %id.service_name(), "shutting down region");
+            let _ = self.ipc.send(
+                &id.service_name(),
+                kind::REGION_UNLOAD,
+                &encode_unload(DIM_OVERWORLD, id.rx, id.rz),
+            );
+        }
+        // 等待 region 完成 flush 并退出（region 收到 UNLOAD 后 flush → running=false）
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while Instant::now() < deadline {
+            let remaining = self.world.lock().expect("world lock").regions.len();
+            if remaining == 0 {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(100));
+        }
+        // 仍未退出的 region：强制 kill（最后 drop SwitchHandle 清理 shm）
+        let stuck: Vec<(RegionId, u32)> = {
+            let world = self.world.lock().expect("world lock");
+            world
+                .regions
+                .ids()
+                .into_iter()
+                .filter_map(|id| world.regions.get(&id).map(|entry| (id, entry.pid)))
+                .collect()
+        };
+        for (id, pid) in stuck {
+            warn!(id = %id.service_name(), "region did not flush in time, killing");
+            let _ = kill_process(pid);
+        }
+        self.world.lock().expect("world lock").regions.clear_all();
     }
 
     /// 确保 region 已拉起并注册（无则等待最多 10 秒）。

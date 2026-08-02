@@ -695,9 +695,10 @@ pub fn apply_give(server: &Server, target: &str, item: &str, count: i32) -> Stri
     let Some(client) = client else {
         return format!("找不到玩家 {target}");
     };
-    // 主手槽（0）放入物品；后续槽位扩展可在此处排队
+    // 主手槽（0）放入物品并记录手持物品（放置方块用）
     let _ = server;
     let _ = item_name;
+    *client.held_item.lock().expect("held item") = Some(item.to_owned());
     let stack = CItemStack::of(item, count);
     let _ = client.send_encoded(CSetSlot::packet_id(), |w| {
         CSetSlot {

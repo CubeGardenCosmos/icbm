@@ -8,7 +8,10 @@ use crate::packets::play_ids::{
     SERVERBOUND_CHAT_COMMAND_SIGNED, SERVERBOUND_CHUNK_BATCH_RECEIVED, SERVERBOUND_CLIENT_COMMAND,
     SERVERBOUND_CLIENT_INFORMATION, SERVERBOUND_COMMAND_SUGGESTION, SERVERBOUND_CONFIRM_TELEPORT,
     SERVERBOUND_KEEP_ALIVE, SERVERBOUND_MOVE_POS, SERVERBOUND_MOVE_POS_ROT, SERVERBOUND_MOVE_ROT,
-    SERVERBOUND_MOVE_STATUS_ONLY, SERVERBOUND_PLAYER_ACTION, SERVERBOUND_PONG, SERVERBOUND_SWING,
+    SERVERBOUND_MOVE_STATUS_ONLY, SERVERBOUND_PICK_ITEM, SERVERBOUND_PLAYER_ACTION,
+    SERVERBOUND_PLAYER_COMMAND, SERVERBOUND_PLAYER_INPUT, SERVERBOUND_PONG,
+    SERVERBOUND_SET_CARRIED_ITEM, SERVERBOUND_SET_CREATIVE_MODE_SLOT, SERVERBOUND_SWING,
+    SERVERBOUND_USE_ITEM, SERVERBOUND_USE_ITEM_ON,
 };
 
 /// Serverbound：确认传送（0x00）。
@@ -519,6 +522,379 @@ impl SSwing {
         SERVERBOUND_SWING
     }
 }
+
+
+/// Serverbound：右键方块（0x38 `PlayerInteractBlockC2SPacket`；放置方块/使用方块）。
+///
+/// 字段（对照 `PlayerInteractBlockC2SPacket.java`）：`VarInt hand`（0=主手 1=副手）→
+/// `BlockHitResult`（`BlockPos` → `VarInt face`（Direction 序：0=下 1=上 2=北 3=南 4=西 5=东）→
+/// `f32 ×3` 命中偏移 → `bool` 是否在方块内）→ `VarInt sequence`。
+#[derive(Debug, Clone, Copy)]
+pub struct SUseItemOn {
+
+    /// 手（0=主手，1=副手）。
+    pub hand: i32,
+
+    /// 被点击方块位置。
+    pub location: BlockPos,
+
+    /// 方块面（Direction 枚举序）。
+    pub face: i32,
+
+    /// 命中偏移 X（相对方块原点 0..1）。
+    pub hit_x: f32,
+
+    /// 命中偏移 Y。
+    pub hit_y: f32,
+
+    /// 命中偏移 Z。
+    pub hit_z: f32,
+
+    /// 是否在方块内部。
+    pub inside: bool,
+
+    /// 序列号。
+    pub sequence: i32,
+
+}
+
+
+
+impl SUseItemOn {
+
+    /// 解码。
+    pub fn decode(reader: &mut Reader<'_>) -> Result<Self, CodecError> {
+
+        Ok(Self {
+
+            hand: reader.read_var_int()?,
+
+            location: BlockPos::from_long(reader.read_i64_be()?),
+
+            face: reader.read_var_int()?,
+
+            hit_x: reader.read_f32_be()?,
+
+            hit_y: reader.read_f32_be()?,
+
+            hit_z: reader.read_f32_be()?,
+
+            inside: reader.read_bool()?,
+
+            sequence: reader.read_var_int()?,
+
+        })
+
+    }
+
+
+
+    /// 包 ID。
+    #[must_use]
+    pub const fn packet_id() -> i32 {
+
+        SERVERBOUND_USE_ITEM_ON
+
+    }
+
+}
+
+
+
+/// Serverbound：右键使用物品（0x39 `PlayerInteractItemC2SPacket`）。
+#[derive(Debug, Clone, Copy)]
+pub struct SUseItem {
+
+    /// 手（0=主手，1=副手）。
+    pub hand: i32,
+
+    /// 序列号。
+    pub sequence: i32,
+
+}
+
+
+
+impl SUseItem {
+
+    /// 解码（对照 `PlayerInteractItemC2SPacket.java`）。
+    pub fn decode(reader: &mut Reader<'_>) -> Result<Self, CodecError> {
+
+        Ok(Self {
+
+            hand: reader.read_var_int()?,
+
+            sequence: reader.read_var_int()?,
+
+        })
+
+    }
+
+
+
+    /// 包 ID。
+    #[must_use]
+    pub const fn packet_id() -> i32 {
+
+        SERVERBOUND_USE_ITEM
+
+    }
+
+}
+
+
+
+/// Serverbound：切换选中槽（0x2F `UpdateSelectedSlotC2SPacket`）。
+#[derive(Debug, Clone, Copy)]
+pub struct SSetCarriedItem {
+
+    /// 选中槽（0..8）。
+    pub slot: i32,
+
+}
+
+
+
+impl SSetCarriedItem {
+
+    /// 解码（对照 `UpdateSelectedSlotC2SPacket.java`）。
+    pub fn decode(reader: &mut Reader<'_>) -> Result<Self, CodecError> {
+
+        Ok(Self {
+
+            slot: reader.read_var_int()?,
+
+        })
+
+    }
+
+
+
+    /// 包 ID。
+    #[must_use]
+    pub const fn packet_id() -> i32 {
+
+        SERVERBOUND_SET_CARRIED_ITEM
+
+    }
+
+}
+
+
+
+/// Serverbound：客户端命令（0x25 `ClientCommandC2SPacket`；如起身）。
+///
+/// 字段：`VarInt action`（0=按下开始潜行 1=释放 2=离开床 3=开始精灵飞行）。
+#[derive(Debug, Clone, Copy)]
+pub struct SPlayerCommand {
+
+    /// 动作。
+    pub action: i32,
+
+}
+
+
+
+impl SPlayerCommand {
+
+    /// 解码。
+    pub fn decode(reader: &mut Reader<'_>) -> Result<Self, CodecError> {
+
+        Ok(Self {
+
+            action: reader.read_var_int()?,
+
+        })
+
+    }
+
+
+
+    /// 包 ID。
+    #[must_use]
+    pub const fn packet_id() -> i32 {
+
+        SERVERBOUND_PLAYER_COMMAND
+
+    }
+
+}
+
+
+
+/// Serverbound：玩家输入（0x26 `PlayerInputC2SPacket`）。
+///
+/// 字段：`f32 xxa` `f32 zza` → 7×`bool`（前进/后退/左/右/跳跃/潜行/疾跑）。
+#[derive(Debug, Clone, Copy)]
+pub struct SPlayerInput {
+    /// 左右移动输入（-1..1）。
+    pub xxa: f32,
+    /// 前后移动输入（-1..1）。
+    pub zza: f32,
+    /// 前进。
+    pub forward: bool,
+    /// 后退。
+    pub back: bool,
+    /// 左。
+    pub left: bool,
+    /// 右。
+    pub right: bool,
+    /// 跳跃。
+    pub jump: bool,
+    /// 潜行。
+    pub sneak: bool,
+    /// 疾跑。
+    pub sprint: bool,
+}
+
+impl SPlayerInput {
+    /// 解码。
+    pub fn decode(reader: &mut Reader<'_>) -> Result<Self, CodecError> {
+        Ok(Self {
+            xxa: reader.read_f32_be()?,
+            zza: reader.read_f32_be()?,
+            forward: reader.read_bool()?,
+            back: reader.read_bool()?,
+            left: reader.read_bool()?,
+            right: reader.read_bool()?,
+            jump: reader.read_bool()?,
+            sneak: reader.read_bool()?,
+            sprint: reader.read_bool()?,
+        })
+    }
+
+    /// 包 ID。
+    #[must_use]
+    pub const fn packet_id() -> i32 {
+        SERVERBOUND_PLAYER_INPUT
+    }
+}
+
+/// Serverbound：创造模式物品栏操作（0x32 `CreativeInventoryActionC2SPacket`）。
+///
+/// 字段：`VarInt slot` → `ItemStack`（网络编码）。
+#[derive(Debug, Clone)]
+pub struct SSetCreativeModeSlot {
+
+    /// 槽位（-1 = 光标）。
+    pub slot: i32,
+
+    /// 物品（空栈表示清除）。
+    pub stack: super::clientbound::CItemStack,
+
+}
+
+
+
+impl SSetCreativeModeSlot {
+
+    /// 解码（对照 `CreativeInventoryActionC2SPacket.java`）。
+    pub fn decode(reader: &mut Reader<'_>) -> Result<Self, CodecError> {
+
+        let slot = reader.read_var_int()?;
+
+        let stack = decode_item_stack(reader)?;
+
+        Ok(Self { slot, stack })
+
+    }
+
+
+
+    /// 包 ID。
+    #[must_use]
+    pub const fn packet_id() -> i32 {
+
+        SERVERBOUND_SET_CREATIVE_MODE_SLOT
+
+    }
+
+}
+
+
+
+/// 解码 `ItemStack.OPTIONAL_PACKET_CODEC`（网络物品栈；含附魔组件）。
+fn decode_item_stack(reader: &mut Reader<'_>) -> Result<super::clientbound::CItemStack, CodecError> {
+
+    let count = reader.read_var_int()?;
+
+    if count <= 0 {
+
+        return Ok(super::clientbound::CItemStack::empty());
+
+    }
+
+    let item_id = reader.read_var_int()? - 1; // registryEntry：raw_id + 1
+
+    let item = crate::item_ids::item_name(item_id).map(str::to_owned);
+
+    // ComponentChanges：跳过（解析添加/移除数）
+
+    let to_add = reader.read_var_int()?;
+
+    let to_remove = reader.read_var_int()?;
+
+    let mut enchantments = Vec::new();
+
+    for _ in 0..to_add {
+
+        let component = reader.read_var_int()?;
+
+        let len = reader.read_var_int()?;
+
+        if component == 9 {
+
+            // minecraft:enchantments
+
+            let entries = reader.read_var_int()?;
+
+            for _ in 0..entries {
+
+                let ench_id = reader.read_var_int()? - 1;
+
+                let level = reader.read_var_int()?;
+
+                if let Some(name) = crate::enchantment_ids::enchantment_name(ench_id) {
+
+                    enchantments.push((name.to_owned(), level));
+
+                }
+
+            }
+
+            let _show = reader.read_bool()?;
+
+        } else {
+
+            // 未知组件：跳过数据
+
+            let skip = usize::try_from(len).unwrap_or(0);
+            let _ = reader.read_bytes(skip)?;
+
+        }
+
+    }
+
+    for _ in 0..to_remove {
+
+        let _component = reader.read_var_int()?;
+
+    }
+
+    Ok(super::clientbound::CItemStack {
+
+        item,
+
+        count,
+
+        enchantments,
+
+        show_in_tooltip: true,
+
+    })
+
+}
+
 
 #[cfg(test)]
 mod tests {

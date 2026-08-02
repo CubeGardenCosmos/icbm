@@ -209,6 +209,11 @@ impl RegionRegistry {
         self.entries.remove(&(id.rx, id.rz));
     }
 
+    /// 清空全部 region 记录（服务器关闭时）。
+    pub fn clear_all(&mut self) {
+        self.entries.clear();
+    }
+
     /// 活动（未沉睡）与沉睡 region 数量。
     #[must_use]
     pub fn counts(&self) -> (usize, usize) {

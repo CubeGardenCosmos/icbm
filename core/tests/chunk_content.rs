@@ -831,3 +831,73 @@ fn join_to_play(client: &mut FakeClient) {
     client.recv_until(play_ids::CLIENTBOUND_GAME_EVENT, "chunks coming");
     client.recv_until(play_ids::CLIENTBOUND_CHUNK_BATCH_START, "batch start");
 }
+
+/// 玩家放置与破坏方块：`give` 石头 → 右键（USE_ITEM_ON）在脚下放置 →
+/// 服务端应广播 `CBlockUpdate`（石头）；随后破坏该方块 → 广播空气。
+#[test]
+fn player_places_and_breaks_blocks() {
+    use icbm_mc_767::packets::play::block_state_ids;
+    use icbm_mc_767::packets::play::serverbound::SUseItemOn;
+
+    let server = TestServer::start("place");
+    let mut client = FakeClient::connect(&server.addr);
+    join_to_play(&mut client);
+    client.recv_until(play_ids::CLIENTBOUND_CHUNK_BATCH_FINISHED, "initial batch");
+
+    // /give diagplayer stone → 手持石头（放置方块用）
+    send_chat_command(&mut client, "give diagplayer stone");
+    recv_chat_until(&mut client, "已给");
+
+    // 模拟右键点击脚下地面（面=1 上 → 放置到 y+1）
+    // 玩家在 y≈64 站立，点击 y=63 的方块顶面 → 放置到 (8, 64, 8)
+    let mut w = Writer::new();
+    w.write_var_int(0); // hand = main
+    w.write_i64_be(icbm_mc_767::packets::play::BlockPos::new(8, 63, 8).as_long());
+    w.write_var_int(1); // face = UP
+    w.write_f32_be(0.5);
+    w.write_f32_be(1.0);
+    w.write_f32_be(0.5);
+    w.write_bool(false); // inside
+    w.write_var_int(0); // sequence
+    client.send(play_ids::SERVERBOUND_USE_ITEM_ON, &w.into_bytes());
+
+    // 等待 CBlockUpdate：位置 (8, 64, 8) 变石头
+    let deadline = Instant::now() + Duration::from_secs(15);
+    let placed = loop {
+        assert!(Instant::now() < deadline, "no block update for placement");
+        let (id, payload) = client.recv();
+        if id == play_ids::CLIENTBOUND_BLOCK_UPDATE {
+            let mut r = Reader::new(&payload);
+            let pos = icbm_mc_767::packets::play::BlockPos::from_long(r.read_i64_be().unwrap());
+            let state = r.read_var_int().unwrap();
+            if pos == icbm_mc_767::packets::play::BlockPos::new(8, 64, 8) {
+                break state;
+            }
+        }
+    };
+    assert_eq!(placed, block_state_ids::STONE, "placed stone");
+
+    // 破坏该方块：PLAYER_ACTION status=0（开始破坏）
+    let mut w = Writer::new();
+    w.write_var_int(0); // start digging
+    w.write_i64_be(icbm_mc_767::packets::play::BlockPos::new(8, 64, 8).as_long());
+    w.write_var_int(1); // face
+    w.write_var_int(0); // sequence
+    client.send(play_ids::SERVERBOUND_PLAYER_ACTION, &w.into_bytes());
+
+    // 等待 CBlockUpdate：位置 (8, 64, 8) 变空气
+    let deadline = Instant::now() + Duration::from_secs(15);
+    let broken = loop {
+        assert!(Instant::now() < deadline, "no block update for breaking");
+        let (id, payload) = client.recv();
+        if id == play_ids::CLIENTBOUND_BLOCK_UPDATE {
+            let mut r = Reader::new(&payload);
+            let pos = icbm_mc_767::packets::play::BlockPos::from_long(r.read_i64_be().unwrap());
+            let state = r.read_var_int().unwrap();
+            if pos == icbm_mc_767::packets::play::BlockPos::new(8, 64, 8) {
+                break state;
+            }
+        }
+    };
+    assert_eq!(broken, 0, "broken to air");
+}

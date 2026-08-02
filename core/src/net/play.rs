@@ -212,6 +212,7 @@ pub fn preload_neighbor_regions(server: &Server, client: &Arc<Client>) {
 }
 
 /// Play 阶段服务端包处理。
+#[allow(clippy::too_many_lines)] // 包分发 match 逐条对应协议包
 pub fn handle_play_packet(
     server: &Server,
     client: &Arc<Client>,
@@ -290,7 +291,31 @@ pub fn handle_play_packet(
             let _ = SMovePlayerStatusOnly::decode(reader)?;
         }
         play_ids::SERVERBOUND_PLAYER_ACTION => {
-            let _ = SPlayerAction::decode(reader)?;
+            let packet = SPlayerAction::decode(reader)?;
+            handle_player_action(server, client, &packet)?;
+        }
+        play_ids::SERVERBOUND_USE_ITEM_ON => {
+            let packet =
+                icbm_mc_767::packets::play::serverbound::SUseItemOn::decode(reader)?;
+            handle_use_item_on(server, client, &packet)?;
+        }
+        play_ids::SERVERBOUND_USE_ITEM => {
+            let _ = icbm_mc_767::packets::play::serverbound::SUseItem::decode(reader)?;
+        }
+        play_ids::SERVERBOUND_SET_CREATIVE_MODE_SLOT => {
+            let packet = icbm_mc_767::packets::play::serverbound::SSetCreativeModeSlot::decode(
+                reader,
+            )?;
+            handle_set_creative_slot(client, &packet);
+        }
+        play_ids::SERVERBOUND_SET_CARRIED_ITEM => {
+            let _ = icbm_mc_767::packets::play::serverbound::SSetCarriedItem::decode(reader)?;
+        }
+        play_ids::SERVERBOUND_PLAYER_COMMAND => {
+            let _ = icbm_mc_767::packets::play::serverbound::SPlayerCommand::decode(reader)?;
+        }
+        play_ids::SERVERBOUND_PLAYER_INPUT => {
+            let _ = icbm_mc_767::packets::play::serverbound::SPlayerInput::decode(reader)?;
         }
         play_ids::SERVERBOUND_PONG => {
             let _ = icbm_mc_767::packets::play::serverbound::SPong::decode(reader)?;
@@ -616,6 +641,103 @@ fn request_dimension_chunks(
         request_chunks_around(server, client, chunk_x, chunk_z)?;
     }
     Ok(())
+}
+
+/// 玩家动作：开始/完成破坏时把方块置为空气（发 `BLOCK_UPDATE`）。
+fn handle_player_action(
+    server: &Server,
+    client: &Arc<Client>,
+    packet: &icbm_mc_767::packets::play::serverbound::SPlayerAction,
+) -> Result<(), NetError> {
+    // status：0=开始破坏 1=取消 2=完成破坏（其余：掉落/使用物品等）
+    if packet.status != 0 && packet.status != 2 {
+        return Ok(());
+    }
+    let (bx, by, bz) = (packet.location.x, packet.location.y, packet.location.z);
+    if f64::from(by) > VIRTUAL_ZONE_MIN_Y {
+        return Ok(());
+    }
+    let region = RegionId::from_overworld_block(bx, bz);
+    server.ensure_region(region)?;
+    let body = icbm_region::protocol::encode_block_update(
+        icbm_region::protocol::DIM_OVERWORLD,
+        bx,
+        by,
+        bz,
+        0, // 空气
+    );
+    server.ipc.send(
+        &region.service_name(),
+        icbm_region::protocol::kind::BLOCK_UPDATE,
+        &body,
+    )?;
+    let _ = client;
+    Ok(())
+}
+
+/// 玩家右键方块（放置方块）：从手持物品确定方块，发 `BLOCK_UPDATE` 到 region。
+///
+/// 放置位置 = 点击方块 + 面方向偏移（对照 vanilla `ItemUsageContext`/放置逻辑）。
+fn handle_use_item_on(
+    server: &Server,
+    client: &Arc<Client>,
+    packet: &icbm_mc_767::packets::play::serverbound::SUseItemOn,
+) -> Result<(), NetError> {
+    // 手持物品 → 可放置方块（默认无）
+    let held = client.held_item.lock().expect("held item").clone();
+    let Some(item) = held else {
+        return Ok(()); // 空手：不放置
+    };
+    // give 的物品名即方块名（stone/dirt 等）
+    let state_id = icbm_mc_767::registry::name_to_state_id(&format!("minecraft:{item}"));
+    let Some(state_id) = state_id else {
+        return Ok(());
+    };
+    // 放置位置：点击方块 + 面方向
+    let (dx, dy, dz) = face_offset(packet.face);
+    let (bx, by, bz) = (packet.location.x + dx, packet.location.y + dy, packet.location.z + dz);
+    // Y>400 虚拟区不放置
+    if f64::from(by) > VIRTUAL_ZONE_MIN_Y {
+        return Ok(());
+    }
+    let region = RegionId::from_overworld_block(bx, bz);
+    server.ensure_region(region)?;
+    let body = icbm_region::protocol::encode_block_update(
+        icbm_region::protocol::DIM_OVERWORLD,
+        bx,
+        by,
+        bz,
+        state_id,
+    );
+    server.ipc.send(
+        &region.service_name(),
+        icbm_region::protocol::kind::BLOCK_UPDATE,
+        &body,
+    )?;
+    Ok(())
+}
+
+/// Direction 枚举序 → 偏移（0=下 1=上 2=北 3=南 4=西 5=东）。
+#[must_use]
+const fn face_offset(face: i32) -> (i32, i32, i32) {
+    match face {
+        0 => (0, -1, 0),
+        1 => (0, 1, 0),
+        2 => (0, 0, -1),
+        3 => (0, 0, 1),
+        4 => (-1, 0, 0),
+        _ => (1, 0, 0),
+    }
+}
+
+/// 创造模式物品栏槽位更新：记录主手（槽 0）物品为手持物品。
+fn handle_set_creative_slot(
+    client: &Arc<Client>,
+    packet: &icbm_mc_767::packets::play::serverbound::SSetCreativeModeSlot,
+) {
+    if packet.slot == 0 {
+        (*client.held_item.lock().expect("held item")).clone_from(&packet.stack.item);
+    }
 }
 
 /// 广播聊天。

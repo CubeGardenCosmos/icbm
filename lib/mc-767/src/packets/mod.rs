@@ -70,15 +70,24 @@ pub mod play_ids {
     pub const SERVERBOUND_CLIENT_COMMAND: i32 = 0x09;
     pub const SERVERBOUND_CLIENT_INFORMATION: i32 = 0x0A;
     pub const SERVERBOUND_COMMAND_SUGGESTION: i32 = 0x0B;
+    pub const SERVERBOUND_CONTAINER_CLICK: i32 = 0x0E;
+    pub const SERVERBOUND_INTERACT: i32 = 0x16;
     pub const SERVERBOUND_KEEP_ALIVE: i32 = 0x18;
     pub const SERVERBOUND_MOVE_POS: i32 = 0x1A;
     pub const SERVERBOUND_MOVE_POS_ROT: i32 = 0x1B;
     pub const SERVERBOUND_MOVE_ROT: i32 = 0x1C;
     pub const SERVERBOUND_MOVE_STATUS_ONLY: i32 = 0x1D;
+    pub const SERVERBOUND_PICK_ITEM: i32 = 0x20;
     pub const SERVERBOUND_PLAYER_ACTION: i32 = 0x24;
+    pub const SERVERBOUND_PLAYER_COMMAND: i32 = 0x25;
+    pub const SERVERBOUND_PLAYER_INPUT: i32 = 0x26;
+    pub const SERVERBOUND_SET_CARRIED_ITEM: i32 = 0x2F;
+    pub const SERVERBOUND_SET_CREATIVE_MODE_SLOT: i32 = 0x32;
+    pub const SERVERBOUND_SWING: i32 = 0x36;
+    pub const SERVERBOUND_USE_ITEM: i32 = 0x39;
+    pub const SERVERBOUND_USE_ITEM_ON: i32 = 0x38;
     pub const SERVERBOUND_CUSTOM_PAYLOAD: i32 = 0x12;
     pub const SERVERBOUND_PONG: i32 = 0x27;
-    pub const SERVERBOUND_SWING: i32 = 0x36;
     // clientbound
     pub const CLIENTBOUND_ADD_ENTITY: i32 = 0x01;
     pub const CLIENTBOUND_ADD_EXPERIENCE_ORB: i32 = 0x02;
