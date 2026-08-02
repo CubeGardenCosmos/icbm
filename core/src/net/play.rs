@@ -617,6 +617,7 @@ fn gamerule_value_suggestions(rule: &str) -> Vec<String> {
 
 /// `/about` 品牌信息（参考 master `core/src/command/commands/about.rs`，品牌为
 /// 大写 ICBM；Git 哈希由 `core/build.rs` 注入）。
+#[must_use]
 pub fn about_message() -> String {
     format!(
         "ICBM Block Game Server, fixable client protocol version.\nGit commit: {}\nDeveloped by CubeGarden Studio, Hosted by BlockMember.\nICBM Server is NOT an open source project or freeware. All right reserved except the gameplay assets.",

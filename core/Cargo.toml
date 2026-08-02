@@ -10,6 +10,7 @@ name = "icbm"
 path = "src/main.rs"
 
 [dependencies]
+aes = { version = "0.8", default-features = false }
 base64 = { version = "0.22", default-features = false, features = ["std"] }
 blinkcms-datarouter = { path = "../lib/datarouter" }
 flate2 = { version = "1", default-features = false, features = ["rust_backend"] }
@@ -20,11 +21,19 @@ icbm-mc-767 = { path = "../lib/mc-767" }
 icbm-region = { path = "../region" }
 libc = "0.2"
 md5 = "0.7"
+num-bigint = "0.4"
+rand = { version = "0.8", default-features = false, features = ["std", "std_rng"] }
+rsa = { version = "0.9", default-features = false, features = ["std", "sha2"] }
+rsa-pkcs8 = { package = "pkcs8", version = "0.10", default-features = false, features = ["std", "pem"] }
 rustyline = { version = "18", default-features = false, features = ["with-file-history"] }
+serde = { version = "1", features = ["derive"] }
 serde_json = { version = "1", default-features = false, features = ["std"] }
+sha1 = { version = "0.10", default-features = false }
+sha2 = { version = "0.10", default-features = false }
 time = { version = "0.3", default-features = false, features = ["std", "formatting", "macros", "local-offset"] }
 tracing = { version = "0.1", default-features = false }
 tracing-subscriber = { version = "0.3", default-features = false, features = ["fmt", "env-filter", "ansi", "time", "registry", "local-time", "std"] }
+ureq = { version = "3", default-features = false, features = ["json"] }
 uuid = { version = "1", features = ["v4"] }
 
 [lints]

@@ -5,8 +5,8 @@ use uuid::Uuid;
 use crate::codec::{CodecError, Reader, Writer};
 
 use super::login_ids::{
-    CLIENTBOUND_COMPRESSION, CLIENTBOUND_DISCONNECT, CLIENTBOUND_SUCCESS, SERVERBOUND_ACKNOWLEDGED,
-    SERVERBOUND_START,
+    CLIENTBOUND_COMPRESSION, CLIENTBOUND_DISCONNECT, CLIENTBOUND_HELLO, CLIENTBOUND_SUCCESS,
+    SERVERBOUND_ACKNOWLEDGED, SERVERBOUND_KEY, SERVERBOUND_START,
 };
 
 /// Serverbound：登录开始（0x00，1.21.1：`[String name≤16][UUID profile_id]`）。
@@ -48,6 +48,68 @@ impl SLoginAcknowledged {
     #[must_use]
     pub const fn packet_id() -> i32 {
         SERVERBOUND_ACKNOWLEDGED
+    }
+}
+
+/// Clientbound：加密请求（0x01 `LoginHelloS2CPacket`）。
+///
+/// 字段（对照 `LoginHelloS2CPacket.java`）：`String server_id(≤20)` →
+/// `ByteArray RSA 公钥` → `ByteArray verify token` → `Bool needs_authentication`。
+/// 正版验证时 `server_id` 为空串、`needs_authentication` 为 true（客户端因此走
+/// session server 认证流程）；离线模式下也可用加密但 `needs_authentication` 为 false。
+#[derive(Debug, Clone)]
+pub struct CEncryptionRequest {
+    /// server id（正版验证为空串）。
+    pub server_id: String,
+    /// RSA 公钥（SPKI DER）。
+    pub public_key: Vec<u8>,
+    /// 验证令牌（随机 4 字节）。
+    pub verify_token: Vec<u8>,
+    /// 是否要求 Mojang 认证（正版模式）。
+    pub needs_authentication: bool,
+}
+
+impl CEncryptionRequest {
+    /// 编码载荷。
+    pub fn encode(&self, writer: &mut Writer) {
+        writer.write_string(&self.server_id);
+        writer.write_byte_array(&self.public_key);
+        writer.write_byte_array(&self.verify_token);
+        writer.write_bool(self.needs_authentication);
+    }
+
+    /// 包 ID。
+    #[must_use]
+    pub const fn packet_id() -> i32 {
+        CLIENTBOUND_HELLO
+    }
+}
+
+/// Serverbound：加密响应（0x01 `LoginKeyC2SPacket`）。
+///
+/// 字段（对照 `LoginKeyC2SPacket.java`）：`ByteArray 加密共享密钥` →
+/// `ByteArray 加密 verify token`（均为 RSA 公钥加密）。
+#[derive(Debug, Clone)]
+pub struct SEncryptionResponse {
+    /// RSA 加密的共享密钥。
+    pub encrypted_secret: Vec<u8>,
+    /// RSA 加密的 verify token。
+    pub encrypted_token: Vec<u8>,
+}
+
+impl SEncryptionResponse {
+    /// 解码（对照 `LoginKeyC2SPacket.java`）。
+    pub fn decode(reader: &mut Reader<'_>) -> Result<Self, CodecError> {
+        Ok(Self {
+            encrypted_secret: reader.read_byte_array()?.to_vec(),
+            encrypted_token: reader.read_byte_array()?.to_vec(),
+        })
+    }
+
+    /// 包 ID。
+    #[must_use]
+    pub const fn packet_id() -> i32 {
+        SERVERBOUND_KEY
     }
 }
 

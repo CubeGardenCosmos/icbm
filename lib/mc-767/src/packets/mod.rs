@@ -31,8 +31,10 @@ pub mod status_ids {
 /// 登录包 ID。
 pub mod login_ids {
     pub const SERVERBOUND_START: i32 = 0x00;
+    pub const SERVERBOUND_KEY: i32 = 0x01;
     pub const SERVERBOUND_ACKNOWLEDGED: i32 = 0x03;
     pub const CLIENTBOUND_DISCONNECT: i32 = 0x00;
+    pub const CLIENTBOUND_HELLO: i32 = 0x01;
     pub const CLIENTBOUND_SUCCESS: i32 = 0x02;
     pub const CLIENTBOUND_COMPRESSION: i32 = 0x03;
 }

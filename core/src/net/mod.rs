@@ -1,5 +1,6 @@
-//! 网络层：MOTD/注册表数据/进服流程。
+//! 网络层：MOTD/注册表数据/进服流程/登录加密。
 
+pub mod crypto;
 pub mod play;
 pub mod registry;
 pub mod status;

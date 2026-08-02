@@ -672,7 +672,10 @@ fn run_command_tab_completion() {
 
     // 顶层命令："/" 列出全部命令（升序）。
     let texts = request_suggestions(&mut client, "/", 1);
-    assert_eq!(texts, vec!["bmtool", "gamemode", "gamerule", "help"]);
+    assert_eq!(
+        texts,
+        vec!["about", "bmtool", "gamemode", "gamerule", "help"]
+    );
 
     // "/gamemode cr" → creative；替换区间覆盖 "cr"（起点 10、长度 2）。
     let (start, length, texts) = request_suggestions_full(&mut client, "/gamemode cr", 2);

@@ -17,13 +17,15 @@ use icbm_mc_767::nbt::{Nbt, NbtCompound};
 use icbm_mc_767::packets::decode_frame;
 use icbm_mc_767::packets::handshake::SIntent;
 use icbm_mc_767::packets::login::{
-    CLoginDisconnect, CLoginSuccess, CSetCompression, SLoginAcknowledged, SLoginStart,
+    CEncryptionRequest, CLoginDisconnect, CLoginSuccess, CSetCompression, SEncryptionResponse,
+    SLoginAcknowledged, SLoginStart,
 };
 use icbm_mc_767::packets::play::clientbound::{
     CGameEvent, CPlayerAbilities, CPlayerInfoUpdate, CPlayerPosition, CSetChunkCacheCenter,
     CSetChunkCacheRadius, CSetDefaultSpawnPosition, PlayerInfoEntry,
 };
 use icbm_mc_767::packets::play_ids;
+use crate::net::crypto::AesCfb8;
 use icbm_mc_767::packets::status::{CPongResponse, CStatusResponse, SPingRequest, SStatusRequest};
 use icbm_mc_767::packets::status_ids;
 use icbm_region::RegionId;
@@ -162,6 +164,12 @@ pub struct Client {
     pub icbm_sequence: AtomicU64,
     /// 最近发送的包（ID, 载荷长度）环形缓冲，断线时 dump 用于定位协议错位。
     tx_log: Mutex<std::collections::VecDeque<(i32, usize)>>,
+    /// 登录加密共享密钥（启用后 `Some`；正版验证与 AES-CFB8 用）。
+    encryption_key: Mutex<Option<[u8; 16]>>,
+    /// 写侧 AES-CFB8 加密器（启用后持续使用，状态跨包保持）。
+    write_cipher: Mutex<Option<AesCfb8>>,
+    /// 登录 verify token（`CEncryptionRequest` 发出时生成，回包时比对）。
+    verify_token: Mutex<Option<Vec<u8>>>,
 }
 
 const STATE_HANDSHAKE: u8 = 0;
@@ -209,6 +217,9 @@ impl Client {
             icbm_subscribed: AtomicBool::new(false),
             icbm_sequence: AtomicU64::new(0),
             tx_log: Mutex::new(std::collections::VecDeque::new()),
+            encryption_key: Mutex::new(None),
+            write_cipher: Mutex::new(None),
+            verify_token: Mutex::new(None),
         })
     }
 
@@ -233,12 +244,20 @@ impl Client {
         *self.compression.lock().expect("compression lock")
     }
 
-    /// 发送一个完整包（自动帧编码与压缩）。
+    /// 发送一个完整包（自动帧编码与压缩；登录加密启用后经 AES-CFB8 写出）。
     pub fn send_packet(&self, packet_id: i32, payload: &[u8]) -> Result<(), NetError> {
         let frame =
             icbm_mc_767::packets::encode_frame(packet_id, payload, self.compression_threshold())?;
         let mut write = self.write.lock().expect("write lock");
-        write.write_all(&frame)?;
+        let mut cipher = self.write_cipher.lock().expect("write cipher");
+        match cipher.as_mut() {
+            Some(cipher) => {
+                let mut encrypted = frame;
+                cipher.encrypt(&mut encrypted);
+                write.write_all(&encrypted)?;
+            }
+            None => write.write_all(&frame)?,
+        }
         {
             let mut log = self.tx_log.lock().expect("tx log");
             log.push_back((packet_id, payload.len()));
@@ -325,8 +344,7 @@ impl Client {
     /// 记录一次位置更新并估算移动速度（方块/秒，3D 距离/间隔，EMA 平滑）。
     ///
     /// 间隔超出 [20ms, 2s] 视为传送/停滞：只更新基准不改变速度。
-    pub fn note_move(&self) {
-        let now = Instant::now();
+    pub fn note_move(&self) {let now = Instant::now();
         let position = *self.position.lock().expect("position");
         let mut last = self.last_move.lock().expect("last move");
         let dt = now.duration_since(last.1).as_secs_f64();
@@ -351,9 +369,23 @@ impl Client {
         let position = *self.position.lock().expect("position");
         *self.last_move.lock().expect("last move") = (position, Instant::now());
     }
+
+    /// 对端 IP（正版验证 `hasJoined&ip=` 参数）。
+    #[must_use]
+    pub fn peer_ip(&self) -> Option<String> {
+        let write = self.write.lock().expect("write lock");
+        write.peer_addr().ok().map(|addr| addr.ip().to_string())
+    }
+
+    /// 登录加密共享密钥（启用后 `Some`；`handle_connection` 读侧据此建立解密器）。
+    #[must_use]
+    pub fn encryption_key(&self) -> Option<[u8; 16]> {
+        *self.encryption_key.lock().expect("encryption key")
+    }
 }
 
 /// 处理单个连接（阻塞直到断开）。
+#[allow(clippy::too_many_lines)] // 状态机循环：帧解码/keep alive/读侧加密集中于此
 pub fn handle_connection(server: &Server, mut stream: TcpStream) {
     stream
         .set_read_timeout(Some(Duration::from_millis(100)))
@@ -364,13 +396,21 @@ pub fn handle_connection(server: &Server, mut stream: TcpStream) {
     let mut last_keep_alive = Instant::now();
     let mut keep_alive_id: i64 = 0;
     let mut client: Option<Arc<Client>> = None;
+    // 读侧 AES-CFB8 解密器（登录加密启用后建立，状态跨包保持）
+    let mut read_cipher: Option<AesCfb8> = None;
 
     loop {
         // 读一块
         let mut chunk = [0u8; 8192];
         match stream.read(&mut chunk) {
             Ok(0) => break,
-            Ok(n) => buffer.extend_from_slice(&chunk[..n]),
+            Ok(n) => {
+                let mut data = chunk[..n].to_vec();
+                if let Some(cipher) = read_cipher.as_mut() {
+                    cipher.decrypt(&mut data);
+                }
+                buffer.extend_from_slice(&data);
+            }
             Err(err)
                 if err.kind() == std::io::ErrorKind::WouldBlock
                     || err.kind() == std::io::ErrorKind::TimedOut => {}
@@ -429,6 +469,14 @@ pub fn handle_connection(server: &Server, mut stream: TcpStream) {
             continue;
         };
 
+        // 登录加密已建立（handle_login_key 设置了 encryption_key）：
+        // 在本轮循环开始后启用读侧解密器（一次性）。
+        if read_cipher.is_none()
+            && let Some(client_ref) = &client
+            && let Some(key) = client_ref.encryption_key()
+        {
+            read_cipher = Some(AesCfb8::new(&key));
+        }
         // keep alive（Play 阶段）
         if client_ref.connection_state() == ConnectionState::Play
             && last_keep_alive.elapsed() >= Duration::from_secs(5)
@@ -516,6 +564,10 @@ fn handle_serverbound(
                 let start = SLoginStart::decode(&mut reader)?;
                 handle_login_start(server, client, start)?;
             }
+            icbm_mc_767::packets::login_ids::SERVERBOUND_KEY => {
+                let key = SEncryptionResponse::decode(&mut reader)?;
+                handle_login_key(server, client, &key)?;
+            }
             icbm_mc_767::packets::login_ids::SERVERBOUND_ACKNOWLEDGED => {
                 let _ = SLoginAcknowledged::decode(&mut reader)?;
                 client.state.store(STATE_CONFIG, Ordering::Relaxed);
@@ -585,7 +637,7 @@ fn handle_status_request(server: &Server, client: &Arc<Client>) -> Result<(), Ne
     Ok(())
 }
 
-/// 登录开始：离线 UUID → 压缩 → 登录成功。
+/// 登录开始：正版模式发加密请求，离线模式直接成功。
 fn handle_login_start(
     server: &Server,
     client: &Arc<Client>,
@@ -602,10 +654,109 @@ fn handle_login_start(
         client.alive.store(false, Ordering::Relaxed);
         return Ok(());
     }
-    let uuid = offline_uuid(&name);
-    *client.uuid.lock().expect("uuid") = uuid;
     *client.name.lock().expect("name") = name;
+    // 玩家名合法性与正版验证在 `handle_login_key` 完成（加密响应后）。
+    match server.online_mode {
+        crate::net::crypto::OnlineMode::Offline => {
+            let uuid = offline_uuid(&client.name.lock().expect("name"));
+            *client.uuid.lock().expect("uuid") = uuid;
+            finish_login(server, client, uuid)?;
+        }
+        crate::net::crypto::OnlineMode::Online => {
+            // 正版模式：发 LoginHello（空 server_id、RSA 公钥、随机 token）。
+            let token: [u8; 4] = rand::random();
+            *client.verify_token.lock().expect("verify token") = Some(token.to_vec());
+            client.send_encoded(CEncryptionRequest::packet_id(), |w| {
+                CEncryptionRequest {
+                    server_id: String::new(),
+                    public_key: server.key_store.public_key_der().to_vec(),
+                    verify_token: token.to_vec(),
+                    needs_authentication: true,
+                }
+                .encode(w);
+            })?;
+        }
+    }
+    Ok(())
+}
 
+/// 加密响应：解密共享密钥、校验 token、启用流加密，随后按模式完成登录。
+fn handle_login_key(
+    server: &Server,
+    client: &Arc<Client>,
+    key: &SEncryptionResponse,
+) -> Result<(), NetError> {
+    use crate::net::crypto::CryptoError as CE;
+    // 解密共享密钥
+    let secret = server
+        .key_store
+        .decrypt(&key.encrypted_secret)
+        .map_err(|_| NetError::BadPacket("decrypt shared secret failed"))?;
+    let secret: [u8; 16] = secret
+        .as_slice()
+        .try_into()
+        .map_err(|_| NetError::BadPacket("shared secret length != 16"))?;
+    // 校验 verify token
+    let token = server
+        .key_store
+        .decrypt(&key.encrypted_token)
+        .map_err(|_| NetError::BadPacket("decrypt verify token failed"))?;
+    let expected = client.verify_token.lock().expect("verify token");
+    if expected.as_deref() != Some(token.as_slice()) {
+        client.kick("登录验证失败 (token mismatch)");
+        return Ok(());
+    }
+    // 启用加密：写侧 cipher + 读侧由 handle_connection 在下一轮启用
+    let cipher = AesCfb8::new(&secret);
+    *client.write_cipher.lock().expect("write cipher") = Some(cipher);
+    *client.encryption_key.lock().expect("encryption key") = Some(secret);
+    let _ = CE::Decrypt; // 保持导入使用
+    drop(expected);
+
+    match server.online_mode {
+        crate::net::crypto::OnlineMode::Offline => {
+            // 仅加密（不验证 Mojang）：离线 UUID
+            let name = client.name.lock().expect("name").clone();
+            let uuid = offline_uuid(&name);
+            *client.uuid.lock().expect("uuid") = uuid;
+            finish_login(server, client, uuid)?;
+        }
+        crate::net::crypto::OnlineMode::Online => {
+            // 正版验证：server_hash → Mojang session server
+            let hash = server.key_store.server_hash(&secret);
+            let name = client.name.lock().expect("name").clone();
+            let ip = client.peer_ip();
+            match crate::net::crypto::verify_session(&name, &hash, ip.as_deref()) {
+                Ok(profile) => {
+                    let uuid = profile.uuid().map_err(|_| {
+                        NetError::BadPacket("auth profile missing uuid")
+                    })?;
+                    *client.uuid.lock().expect("uuid") = uuid;
+                    // 若 Mojang 返回的 name 与请求一致（大小写可不同），采用 profile 名
+                    if !profile.name.is_empty() {
+                        *client.name.lock().expect("name") = profile.name;
+                    }
+                    finish_login(server, client, uuid)?;
+                }
+                Err(err) => {
+                    let reason = match &err {
+                        CE::UnverifiedUsername => "正版验证失败：用户名未验证".to_owned(),
+                        CE::Banned => "正版验证失败：账号已被封禁".to_owned(),
+                        CE::AuthRequest => "正版验证失败：认证服务器不可用".to_owned(),
+                        other => format!("正版验证失败：{other}"),
+                    };
+                    tracing::warn!(name = %client.name.lock().expect("name"), %err, "online auth failed");
+                    client.kick(&reason);
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
+/// 完成登录：压缩 → 登录成功（正版/离线共用）。
+fn finish_login(server: &Server, client: &Arc<Client>, uuid: Uuid) -> Result<(), NetError> {
+    let name = client.name.lock().expect("name").clone();
     // 压缩
     let threshold = server.config.compression_threshold;
     if threshold > 0 {
@@ -618,7 +769,7 @@ fn handle_login_start(
     client.send_encoded(CLoginSuccess::packet_id(), |w| {
         CLoginSuccess {
             uuid,
-            name: client.name.lock().expect("name").clone(),
+            name,
             strict_error_handling: true,
         }
         .encode(w);

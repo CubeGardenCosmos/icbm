@@ -34,6 +34,8 @@ pub enum ServerError {
     Switch(SwitchError),
     /// level.dat 错误。
     Level(icbm_anvil::level::LevelError),
+    /// 登录加密密钥生成失败。
+    Crypto(crate::net::crypto::CryptoError),
 }
 
 impl std::fmt::Display for ServerError {
@@ -43,6 +45,7 @@ impl std::fmt::Display for ServerError {
             Self::Ipc(err) => write!(f, "ipc: {err}"),
             Self::Switch(err) => write!(f, "switch: {err}"),
             Self::Level(err) => write!(f, "level: {err}"),
+            Self::Crypto(err) => write!(f, "crypto: {err}"),
         }
     }
 }
@@ -87,6 +90,10 @@ pub struct ServerInner {
     pub world: Mutex<WorldState>,
     /// 运行标志。
     pub running: AtomicBool,
+    /// 正版模式开关（`ICBM_ONLINE_MODE`）。
+    pub online_mode: crate::net::crypto::OnlineMode,
+    /// 登录 RSA 密钥对（正版/加密登录用）。
+    pub key_store: crate::net::crypto::KeyStore,
     /// 收到的 `CHUNK_DATA` 计数（诊断）。
     pub chunk_diag: std::sync::atomic::AtomicU64,
 }
@@ -136,6 +143,9 @@ impl Server {
                 switch,
                 world,
                 running: AtomicBool::new(true),
+                online_mode: crate::net::crypto::online_mode_from_env(),
+                key_store: crate::net::crypto::KeyStore::new()
+                    .map_err(ServerError::Crypto)?,
                 chunk_diag: std::sync::atomic::AtomicU64::new(0),
             }),
         })
