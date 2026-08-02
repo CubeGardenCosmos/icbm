@@ -55,8 +55,16 @@ pub mod kind {
     pub const BLOCK_QUERY_RESP: u8 = 0x8D;
     /// C→R：游戏规则变更（`[u8 名长][名][u8 值长][值]`）。
     pub const GAMERULE_UPDATE: u8 = 0x0E;
-    /// C→R：世界时间设置（`[i64 tick]`；`/time` 命令用）。
+    /// C→R：世界时间设置（`[i64 tick][u8 add]`；`/time` 命令用）。
     pub const TIME_UPDATE: u8 = 0x10;
+    /// C→R：方块 NBT 读取（`[u8 dim][i32 x][i32 y][i32 z]` → `BLOCK_NBT_RESP`）。
+    pub const BLOCK_NBT_GET: u8 = 0x11;
+    /// R→C：方块 NBT 响应（`[u8 dim][i32 x][i32 y][i32 z][u8 has][NBT]`）。
+    pub const BLOCK_NBT_RESP: u8 = 0x91;
+    /// C→R：方块 NBT 写入（`[u8 dim][i32 x][i32 y][i32 z][NBT]`；空 NBT 清除）。
+    pub const BLOCK_NBT_SET: u8 = 0x12;
+    /// R→C：执行命令（`[u8 长][命令]`；命令方块触发，core 以控制台身份执行）。
+    pub const COMMAND_EXECUTE: u8 = 0x13;
 }
 
 /// IPC 错误。
@@ -587,6 +595,84 @@ pub fn decode_time_update(body: &[u8]) -> Result<(i64, bool), IpcError> {
         i64::from_le_bytes(body[0..8].try_into().expect("slice")),
         body[8] != 0,
     ))
+}
+
+/// `BLOCK_NBT_GET` 载荷：`[u8 dim][i32 x][i32 y][i32 z]`。
+#[must_use]
+pub fn encode_block_nbt_get(dim: u8, x: i32, y: i32, z: i32) -> Vec<u8> {
+    encode_block_query(dim, x, y, z)
+}
+
+/// 解析 `BLOCK_NBT_GET` 载荷。
+pub fn decode_block_nbt_get(body: &[u8]) -> Result<(u8, i32, i32, i32), IpcError> {
+    decode_block_query(body)
+}
+
+/// `BLOCK_NBT_RESP` 载荷：`[u8 dim][i32 x][i32 y][i32 z][u8 has][NBT]`。
+#[must_use]
+pub fn encode_block_nbt_resp(dim: u8, x: i32, y: i32, z: i32, nbt: Option<&icbm_mc_767::nbt::Nbt>) -> Vec<u8> {
+    let mut out = encode_block_nbt_get(dim, x, y, z);
+    match nbt {
+        Some(nbt) => {
+            out.push(1);
+            let mut writer = icbm_mc_767::codec::Writer::new();
+            icbm_mc_767::nbt::encode_named(nbt, &mut writer)
+                .expect("block nbt must encode");
+            out.extend_from_slice(&writer.into_bytes());
+        }
+        None => out.push(0),
+    }
+    out
+}
+
+/// 解析 `BLOCK_NBT_RESP` 载荷。
+pub fn decode_block_nbt_resp(body: &[u8]) -> Result<(u8, i32, i32, i32, Option<icbm_mc_767::nbt::Nbt>), IpcError> {
+    let (dim, x, y, z) = decode_block_nbt_get(body)?;
+    let has = body.get(13).is_some_and(|&b| b != 0);
+    if !has {
+        return Ok((dim, x, y, z, None));
+    }
+    let mut reader = icbm_mc_767::codec::Reader::new(&body[14..]);
+    let nbt = icbm_mc_767::nbt::decode_named(&mut reader)
+        .map_err(|_| IpcError::Protocol("block nbt parse"))?;
+    Ok((dim, x, y, z, Some(nbt)))
+}
+
+/// `BLOCK_NBT_SET` 载荷：`[u8 dim][i32 x][i32 y][i32 z][NBT]`。
+#[must_use]
+pub fn encode_block_nbt_set(dim: u8, x: i32, y: i32, z: i32, nbt: &icbm_mc_767::nbt::Nbt) -> Vec<u8> {
+    let mut out = encode_block_nbt_get(dim, x, y, z);
+    let mut writer = icbm_mc_767::codec::Writer::new();
+    icbm_mc_767::nbt::encode_named(nbt, &mut writer).expect("block nbt must encode");
+    out.extend_from_slice(&writer.into_bytes());
+    out
+}
+
+/// 解析 `BLOCK_NBT_SET` 载荷。
+pub fn decode_block_nbt_set(body: &[u8]) -> Result<(u8, i32, i32, i32, icbm_mc_767::nbt::Nbt), IpcError> {
+    let (dim, x, y, z) = decode_block_nbt_get(body)?;
+    let mut reader = icbm_mc_767::codec::Reader::new(&body[13..]);
+    let nbt = icbm_mc_767::nbt::decode_named(&mut reader)
+        .map_err(|_| IpcError::Protocol("block nbt set"))?;
+    Ok((dim, x, y, z, nbt))
+}
+
+/// `COMMAND_EXECUTE` 载荷：`[u8 长][命令]`。
+#[must_use]
+pub fn encode_command_execute(command: &str) -> Vec<u8> {
+    let mut out = Vec::with_capacity(1 + command.len());
+    out.push(u8::try_from(command.len()).unwrap_or(u8::MAX));
+    out.extend_from_slice(command.as_bytes());
+    out
+}
+
+/// 解析 `COMMAND_EXECUTE` 载荷。
+pub fn decode_command_execute(body: &[u8]) -> Result<String, IpcError> {
+    let len = usize::from(body.first().copied().unwrap_or(0));
+    if body.len() < 1 + len {
+        return Err(IpcError::Length("command execute", body.len()));
+    }
+    Ok(String::from_utf8_lossy(&body[1..1 + len]).into_owned())
 }
 
 #[cfg(test)]

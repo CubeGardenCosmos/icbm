@@ -124,6 +124,27 @@ pub enum Command {
     },
     /// `/time set <day|night|noon|midnight|<tick>>` 或 `/time add <tick>`。
     Time { set: Option<i64>, add: Option<i64> },
+    /// `/data get block <x> <y> <z> [路径]` / `/data merge block <x> <y> <z> <nbt>`
+    /// / `/data remove block <x> <y> <z> <路径>`（NBT 编辑；方块实体/命令方块）。
+    Data {
+        action: DataAction,
+        x: i32,
+        y: i32,
+        z: i32,
+        path: Option<String>,
+        nbt: Option<String>,
+    },
+}
+
+/// `/data` 动作。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DataAction {
+    /// `get`：读取并输出 NBT。
+    Get,
+    /// `merge`：合并 NBT。
+    Merge,
+    /// `remove`：移除指定路径。
+    Remove,
 }
 
 /// 解析命令行的第一段（`/gamemode ...` / `/gamerule ...` / `/help`）。
@@ -172,8 +193,38 @@ pub fn parse_command(line: &str) -> Option<Command> {
             })
         }
         "time" => Some(parse_time(parts)),
+        "data" => parse_data(parts),
         _ => None,
     }
+}
+
+/// 解析 `/data <get|merge|remove> block <x> <y> <z> [路径|NBT]`。
+fn parse_data(mut parts: std::str::SplitWhitespace<'_>) -> Option<Command> {
+    let action = match parts.next()? {
+        "get" => DataAction::Get,
+        "merge" => DataAction::Merge,
+        "remove" => DataAction::Remove,
+        _ => return None,
+    };
+    if parts.next()? != "block" {
+        return None;
+    }
+    let x = parts.next()?.parse().ok()?;
+    let y = parts.next()?.parse().ok()?;
+    let z = parts.next()?.parse().ok()?;
+    let rest: Vec<&str> = parts.collect();
+    let (path, nbt) = match action {
+        DataAction::Merge => (None, Some(rest.join(" "))),
+        _ => (rest.first().map(|s| (*s).to_owned()), None),
+    };
+    Some(Command::Data {
+        action,
+        x,
+        y,
+        z,
+        path,
+        nbt,
+    })
 }
 
 /// 解析 `/time set <值>` 与 `/time add <tick>`。

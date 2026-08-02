@@ -12,11 +12,12 @@ use tracing::{debug, error, info, warn};
 use uuid::Uuid;
 
 use crate::protocol::{
-    CORE_SERVICE, DIM_OVERWORLD, Ipc, IpcError, IpcMessage, decode_block_query,
-    decode_block_update, decode_chunk_request, decode_gamerule_update, decode_player_enter,
-    decode_player_leave, decode_player_move, decode_register_ack, decode_time_update,
-    encode_block_query_resp, encode_chunk_data, encode_entity_data, encode_heartbeat,
-    encode_register, encode_stats, kind,
+    CORE_SERVICE, DIM_OVERWORLD, Ipc, IpcError, IpcMessage, decode_block_nbt_get,
+    decode_block_nbt_resp, decode_block_nbt_set, decode_block_query, decode_block_update,
+    decode_chunk_request, decode_gamerule_update, decode_player_enter, decode_player_leave,
+    decode_player_move, decode_register_ack, decode_time_update, encode_block_nbt_resp,
+    encode_block_query_resp, encode_chunk_data, encode_command_execute, encode_entity_data,
+    encode_heartbeat, encode_register, encode_stats, kind,
 };
 use crate::store::ChunkStore;
 use crate::{Face, RegionId};
@@ -223,6 +224,8 @@ pub struct RegionService {
     gamerules: std::collections::HashMap<String, String>,
     /// 世界时间（tick，昼夜循环用）。
     world_time: i64,
+    /// 上次命令方块执行状态（坐标 → 上次是否已触发；防止每 tick 重复执行）。
+    command_block_fired: std::collections::HashMap<(i32, i32, i32), bool>,
     /// 上次广播时间（节流：每秒一次）。
     last_time_broadcast: Instant,
     /// 天气状态（雨/雷/梯度）。
@@ -425,6 +428,7 @@ impl RegionService {
             world_time: 0,
             weather: crate::weather::WeatherState::new(),
             last_time_broadcast: Instant::now(),
+            command_block_fired: std::collections::HashMap::new(),
         })
     }
 
@@ -491,6 +495,7 @@ impl RegionService {
         self.flush_chunks()?;
         self.tick_fluids()?;
         self.tick_redstone()?;
+        self.tick_command_blocks()?;
         self.tick_crops()?;
         self.tick_time()?;
         self.tick_weather()?;
@@ -607,6 +612,20 @@ impl RegionService {
                         tick
                     };
                 }
+            }
+            kind::BLOCK_NBT_GET => {
+                let (dim, x, y, z) = decode_block_nbt_get(&message.body)?;
+                let nbt = self.store.block_entity(x, y, z).cloned();
+                self.ipc.send(
+                    CORE_SERVICE,
+                    kind::BLOCK_NBT_RESP,
+                    &encode_block_nbt_resp(dim, x, y, z, nbt.as_ref()),
+                )?;
+            }
+            kind::BLOCK_NBT_SET => {
+                let (dim, x, y, z, nbt) = decode_block_nbt_set(&message.body)?;
+                let _ = dim;
+                self.store.set_block_entity(x, y, z, nbt);
             }
             kind::BLOCK_QUERY => {
                 let (dim, x, y, z) = decode_block_query(&message.body)?;
@@ -946,6 +965,56 @@ impl RegionService {
                 packet.encode(w);
             })?;
             self.last_time_broadcast = Instant::now();
+        }
+        Ok(())
+    }
+
+    /// 命令方块 tick：被红石信号供电（相邻方块红石强度 ≥ 1）且尚未触发时，
+    /// 经 `COMMAND_EXECUTE` 交给 core 以控制台身份执行其 `Command` NBT。
+    ///
+    /// 三种命令方块（普通/循环/连锁）统一按“上升沿触发一次”处理（简化）；
+    /// 循环方块原版每 tick 执行，此处同样只触发一次（避免刷屏）。
+    /// 位置表由 store 维护（`set_block` 增量更新），避免全量扫描。
+    fn tick_command_blocks(&mut self) -> Result<(), RegionError> {
+        use crate::redstone::compute_wire_power;
+        let positions = self.store.command_block_positions();
+        if positions.is_empty() {
+            return Ok(());
+        }
+        let mut executions: Vec<(i32, i32, i32, String)> = Vec::new();
+        for (x, y, z) in positions {
+            // 供电检测：相邻方块红石强度 ≥ 1（红石线/红石块/火把/灯等）
+            let neighbors = [
+                (x + 1, y, z),
+                (x - 1, y, z),
+                (x, y, z + 1),
+                (x, y, z - 1),
+                (x, y + 1, z),
+                (x, y - 1, z),
+            ]
+            .into_iter()
+            .map(|(nx, ny, nz)| {
+                self.store.block_at(Face::Overworld, nx, ny, nz).unwrap_or(0)
+            })
+            .collect::<Vec<_>>();
+            let powered = compute_wire_power(neighbors) >= 1;
+            let fired = self.command_block_fired.get(&(x, y, z)).copied().unwrap_or(false);
+            if powered && !fired {
+                if let Some(command) = self.store.command_block_command(x, y, z) {
+                    executions.push((x, y, z, command));
+                }
+                self.command_block_fired.insert((x, y, z), true);
+            } else if !powered {
+                self.command_block_fired.insert((x, y, z), false);
+            }
+        }
+        for (x, y, z, command) in executions {
+            debug!(x, y, z, %command, "command block executed");
+            self.ipc.send_retry(
+                CORE_SERVICE,
+                kind::COMMAND_EXECUTE,
+                &encode_command_execute(&command),
+            )?;
         }
         Ok(())
     }
@@ -1351,6 +1420,8 @@ pub fn run_region(config: RegionConfig) -> Result<(), RegionError> {
         }
     }
 }
+
+
 
 #[cfg(test)]
 mod tests {

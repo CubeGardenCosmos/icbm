@@ -651,6 +651,52 @@ fn creeper_chases_and_explodes_near_player() {
     assert!(saw_explosion, "creeper should explode after fuse");
 }
 
+/// `/data` NBT 编辑与命令方块：设置命令 → 红石供电触发 → 执行 setblock。
+#[test]
+fn data_command_and_command_block() {
+    let server = TestServer::start("cmdblock");
+    let mut client = FakeClient::connect(&server.addr);
+    join_to_play(&mut client);
+    client.recv_until(play_ids::CLIENTBOUND_CHUNK_BATCH_FINISHED, "initial batch");
+
+    // 放置命令方块并写入 Command NBT（/data merge block）
+    send_chat_command(&mut client, "setblock 20 -60 20 command_block");
+    recv_chat_until(&mut client, "已放置");
+    send_chat_command(&mut client, r#"data merge block 20 -60 20 {Command:"setblock 21 -60 20 stone"}"#);
+    let merge_feedback = recv_chat_until(&mut client, "方块实体数据已更新");
+    assert!(merge_feedback.contains("setblock 21 -60 20 stone"), "merge feedback: {merge_feedback}");
+
+    // /data get block 应回显 Command
+    send_chat_command(&mut client, "data get block 20 -60 20");
+    let get_feedback = recv_chat_until(&mut client, "方块实体数据");
+    assert!(get_feedback.contains("setblock 21 -60 20 stone"), "get feedback: {get_feedback}");
+
+    // 旁边放红石块供电 → 命令方块触发 → setblock 21 -60 20 stone
+    send_chat_command(&mut client, "setblock 19 -60 20 redstone_block");
+    recv_chat_until(&mut client, "已放置");
+
+    // 等待 CBlockUpdate：位置 (21, -60, 20) 变石头
+    let deadline = Instant::now() + Duration::from_secs(20);
+    let placed = loop {
+        assert!(Instant::now() < deadline, "command block did not place stone");
+        let (id, payload) = client.recv();
+        if id == play_ids::CLIENTBOUND_BLOCK_UPDATE {
+            let mut r = Reader::new(&payload);
+            let pos = icbm_mc_767::packets::play::BlockPos::from_long(r.read_i64_be().unwrap());
+            let state = r.read_var_int().unwrap();
+            if pos == icbm_mc_767::packets::play::BlockPos::new(21, -60, 20) {
+                break state;
+            }
+        }
+    };
+    assert_eq!(placed, 1, "command block placed stone (id 1)");
+
+    // /data remove block 移除 Command 键
+    send_chat_command(&mut client, "data remove block 20 -60 20 Command");
+    let remove_feedback = recv_chat_until(&mut client, "已从");
+    assert!(remove_feedback.contains("Command"), "remove feedback: {remove_feedback}");
+}
+
 /// 服务端命令：`/gamemode creative`、`/gamerule`（含 level.dat 持久化）与
 /// `/bmtool tps` 应从系统聊天返回反馈。
 #[test]

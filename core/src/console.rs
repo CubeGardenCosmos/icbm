@@ -443,6 +443,29 @@ impl Server {
                         info!("{feedback}");
                     }
                 }
+                Command::Data {
+                    action,
+                    x,
+                    y,
+                    z,
+                    path,
+                    nbt,
+                } => {
+                    let feedback = if let Some(client) = self
+                        .world
+                        .lock()
+                        .expect("world lock")
+                        .players
+                        .values()
+                        .next()
+                        .cloned()
+                    {
+                        apply_data(self, &client, action, x, y, z, path.as_deref(), nbt.as_deref())
+                    } else {
+                        "控制台执行 /data 需要在线玩家作为响应通道".to_owned()
+                    };
+                    info!("{feedback}");
+                }
             }
             return;
         }
@@ -875,6 +898,235 @@ pub fn apply_time(server: &Server, set: Option<i64>, add: Option<i64>) -> Option
         format!("已将时间设置为 {tick}")
     })
 }
+
+/// 执行 `/data get|merge|remove block <x> <y> <z> [...]`（方块实体 NBT）。
+///
+/// 读写经 `BLOCK_NBT_GET`/`BLOCK_NBT_SET` IPC 到所在 region；`get` 的响应由
+/// receiver 线程写入 `client.pending_block_nbt` 后在此轮询读取。
+pub fn apply_data(
+    server: &Server,
+    client: &std::sync::Arc<crate::client::Client>,
+    action: icbm_gameplay_minecraft::commands::DataAction,
+    x: i32,
+    y: i32,
+    z: i32,
+    path: Option<&str>,
+    nbt_text: Option<&str>,
+) -> String {
+    use icbm_gameplay_minecraft::commands::DataAction;
+    use icbm_mc_767::nbt::{Nbt, NbtCompound, nbt_to_snbt, parse_snbt};
+    let region = icbm_region::RegionId::from_overworld_block(x, z);
+    if let Err(err) = server.ensure_region(region) {
+        return format!("无法访问区域 {}: {err}", region.service_name());
+    }
+    match action {
+        DataAction::Get => {
+            client.data_request_pending.store(true, std::sync::atomic::Ordering::Relaxed);
+            if server
+                .ipc
+                .send(
+                    &region.service_name(),
+                    icbm_region::protocol::kind::BLOCK_NBT_GET,
+                    &icbm_region::protocol::encode_block_nbt_get(
+                        icbm_region::protocol::DIM_OVERWORLD,
+                        x,
+                        y,
+                        z,
+                    ),
+                )
+                .is_err()
+            {
+                client.data_request_pending.store(false, std::sync::atomic::Ordering::Relaxed);
+                return "无法发送方块 NBT 读取请求".to_owned();
+            }
+            let deadline = std::time::Instant::now() + std::time::Duration::from_millis(500);
+            let response = loop {
+                let nbt = client.pending_block_nbt.lock().expect("block nbt").take();
+                if nbt.is_some() {
+                    break nbt;
+                }
+                if std::time::Instant::now() > deadline {
+                    break None;
+                }
+                std::thread::sleep(std::time::Duration::from_millis(5));
+            };
+            client.data_request_pending.store(false, std::sync::atomic::Ordering::Relaxed);
+            let Some(nbt) = response else {
+                return format!("[{x},{y},{z}] 的方块实体数据不可用");
+            };
+            let text = nbt_to_snbt(&nbt);
+            let shown = path.map_or(text.clone(), |p| {
+                path_value(&nbt, p).map_or_else(|| "路径不存在".to_owned(), nbt_to_snbt)
+            });
+            format!("[{x},{y},{z}] 的方块实体数据: {shown}")
+        }
+        DataAction::Merge => {
+            let Some(text) = nbt_text else {
+                return "缺少 NBT 参数".to_owned();
+            };
+            let Ok(merge) = parse_snbt(text) else {
+                return format!("NBT 解析失败: {text}");
+            };
+            // 读取现有 NBT 合并后写回（命令方块 Command 等）
+            client.data_request_pending.store(true, std::sync::atomic::Ordering::Relaxed);
+            let _ = server.ipc.send(
+                &region.service_name(),
+                icbm_region::protocol::kind::BLOCK_NBT_GET,
+                &icbm_region::protocol::encode_block_nbt_get(
+                    icbm_region::protocol::DIM_OVERWORLD,
+                    x,
+                    y,
+                    z,
+                ),
+            );
+            let deadline = std::time::Instant::now() + std::time::Duration::from_millis(500);
+            let existing = loop {
+                let nbt = client.pending_block_nbt.lock().expect("block nbt").take();
+                if nbt.is_some() {
+                    break nbt;
+                }
+                if std::time::Instant::now() > deadline {
+                    break None;
+                }
+                std::thread::sleep(std::time::Duration::from_millis(5));
+            };
+            client.data_request_pending.store(false, std::sync::atomic::Ordering::Relaxed);
+            let merged = match existing {
+                Some(Nbt::Compound(existing)) => {
+                    let Nbt::Compound(add) = merge else {
+                        return "merge 需要复合 NBT".to_owned();
+                    };
+                    let mut out = (*existing).clone();
+                    for (key, value) in add.entries {
+                        out.insert(key, value);
+                    }
+                    Nbt::Compound(Box::new(out))
+                }
+                _ => merge,
+            };
+            let _ = server.ipc.send(
+                &region.service_name(),
+                icbm_region::protocol::kind::BLOCK_NBT_SET,
+                &icbm_region::protocol::encode_block_nbt_set(
+                    icbm_region::protocol::DIM_OVERWORLD,
+                    x,
+                    y,
+                    z,
+                    &merged,
+                ),
+            );
+            format!("[{x},{y},{z}] 的方块实体数据已更新: {}", nbt_to_snbt(&merged))
+        }
+        DataAction::Remove => {
+            let Some(path) = path else {
+                return "remove 需要路径".to_owned();
+            };
+            client.data_request_pending.store(true, std::sync::atomic::Ordering::Relaxed);
+            let _ = server.ipc.send(
+                &region.service_name(),
+                icbm_region::protocol::kind::BLOCK_NBT_GET,
+                &icbm_region::protocol::encode_block_nbt_get(
+                    icbm_region::protocol::DIM_OVERWORLD,
+                    x,
+                    y,
+                    z,
+                ),
+            );
+            let deadline = std::time::Instant::now() + std::time::Duration::from_millis(500);
+            let existing = loop {
+                let nbt = client.pending_block_nbt.lock().expect("block nbt").take();
+                if nbt.is_some() {
+                    break nbt;
+                }
+                if std::time::Instant::now() > deadline {
+                    break None;
+                }
+                std::thread::sleep(std::time::Duration::from_millis(5));
+            };
+            client.data_request_pending.store(false, std::sync::atomic::Ordering::Relaxed);
+            let Some(Nbt::Compound(mut compound)) = existing else {
+                return format!("[{x},{y},{z}] 没有方块实体数据");
+            };
+            let removed = remove_path(&mut compound, path);
+            if !removed {
+                return format!("路径不存在: {path}");
+            }
+            let nbt = Nbt::Compound(compound);
+            let _ = server.ipc.send(
+                &region.service_name(),
+                icbm_region::protocol::kind::BLOCK_NBT_SET,
+                &icbm_region::protocol::encode_block_nbt_set(
+                    icbm_region::protocol::DIM_OVERWORLD,
+                    x,
+                    y,
+                    z,
+                    &nbt,
+                ),
+            );
+            format!("已从 [{x},{y},{z}] 移除 {path}")
+        }
+    }
+}
+
+/// 按点分路径读取 NBT（仅支持复合/列表下标的简单路径，如 `a.b[0].c`）。
+fn path_value<'a>(nbt: &'a icbm_mc_767::nbt::Nbt, path: &str) -> Option<&'a icbm_mc_767::nbt::Nbt> {
+    let mut current = nbt;
+    for part in path.split('.') {
+        let (key, index) = match part.find('[') {
+            Some(bracket) => {
+                let key = &part[..bracket];
+                let index = part[bracket + 1..].trim_end_matches(']').parse::<usize>().ok();
+                (key, index)
+            }
+            None => (part, None),
+        };
+        match current {
+            icbm_mc_767::nbt::Nbt::Compound(compound) => {
+                if let Some(index) = index {
+                    // 形如 `a[0]` 且 a 是列表
+                    if let Some(list) = compound.get(key) {
+                        if let icbm_mc_767::nbt::Nbt::List(list) = list {
+                            current = list.values.get(index)?;
+                            continue;
+                        }
+                    }
+                    return None;
+                }
+                current = compound.get(key)?;
+            }
+            icbm_mc_767::nbt::Nbt::List(list) => {
+                let index = index.or_else(|| part.parse::<usize>().ok())?;
+                current = list.values.get(index)?;
+            }
+            _ => return None,
+        }
+    }
+    Some(current)
+}
+
+/// 按点分路径移除 NBT 键（复合键或列表下标）。
+/// 按点分路径移除 NBT 键（复合键或列表下标；递归下降避免借用链）。
+fn remove_path(compound: &mut icbm_mc_767::nbt::NbtCompound, path: &str) -> bool {
+    let mut parts = path.split('.');
+    let key = parts.next().unwrap_or("");
+    if key.is_empty() {
+        return false;
+    }
+    let rest = parts.collect::<Vec<_>>().join(".");
+    if rest.is_empty() {
+        let before = compound.entries.len();
+        compound.entries.retain(|(k, _)| k != key);
+        return compound.entries.len() < before;
+    }
+    let Some(idx) = compound.entries.iter().position(|(k, _)| k == key) else {
+        return false;
+    };
+    match &mut compound.entries[idx].1 {
+        icbm_mc_767::nbt::Nbt::Compound(next) => remove_path(next, &rest),
+        _ => false,
+    }
+}
+
 
 /// 广播系统消息（`say`）。
 fn broadcast_say(server: &Server, message: &str) {

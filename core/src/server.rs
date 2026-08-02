@@ -13,9 +13,9 @@ use icbm_mc_767::packets::play::clientbound::{
 use icbm_mc_767::packets::play_ids;
 use icbm_region::RegionId;
 use icbm_region::protocol::{
-    DIM_OVERWORLD, Ipc, IpcError, decode_block_query_resp, decode_chunk_data,
-    decode_entity_data, decode_heartbeat, decode_register, encode_register_ack, encode_unload,
-    kind,
+    DIM_OVERWORLD, Ipc, IpcError, decode_block_nbt_resp, decode_block_query_resp,
+    decode_chunk_data, decode_command_execute, decode_entity_data, decode_heartbeat,
+    decode_register, encode_register_ack, encode_unload, kind,
 };
 use tracing::{debug, info, trace, warn};
 
@@ -633,6 +633,32 @@ fn handle_core_message(server: &Server, message: &icbm_region::protocol::IpcMess
         }
         kind::REGION_STATS_RESP => {
             // Phase 1：心跳已含统计；统计响应暂不消费
+        }
+        kind::BLOCK_NBT_RESP => {
+            if let Ok((_dim, x, y, z, nbt)) = decode_block_nbt_resp(&message.body) {
+                // 路由到挂起的 /data 请求玩家（receiver 线程）
+                let players: Vec<Arc<crate::client::Client>> = {
+                    let world = server.world.lock().expect("world lock");
+                    world.players.values().cloned().collect()
+                };
+                for player in players {
+                    if player
+                        .data_request_pending
+                        .swap(false, std::sync::atomic::Ordering::Relaxed)
+                    {
+                        *player.pending_block_nbt.lock().expect("block nbt") = nbt;
+                        let _ = (x, y, z);
+                        break;
+                    }
+                }
+            }
+        }
+        kind::COMMAND_EXECUTE => {
+            if let Ok(command) = decode_command_execute(&message.body) {
+                // 命令方块触发：以控制台身份执行（反馈仅记录日志）
+                debug!(source = %message.source, %command, "command block executed via core");
+                server.handle_command(&format!("/{command}"));
+            }
         }
         other => {
             warn!(kind = other, source = %message.source, "unhandled core message");

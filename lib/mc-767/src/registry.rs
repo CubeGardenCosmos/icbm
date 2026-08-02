@@ -63,6 +63,12 @@ pub mod names {
     pub const MELON_STEM: &str = "minecraft:melon_stem";
     /// 可可果。
     pub const COCOA: &str = "minecraft:cocoa";
+    /// 命令方块。
+    pub const COMMAND_BLOCK: &str = "minecraft:command_block";
+    /// 屏障。
+    pub const BARRIER: &str = "minecraft:barrier";
+    /// 亮度方块（vanilla 注册键 `minecraft:light`）。
+    pub const LIGHT: &str = "minecraft:light";
 }
 
 use crate::packets::play::block_state_ids as ids;
@@ -99,6 +105,9 @@ pub const fn state_id_to_name(id: i32) -> Option<&'static str> {
         ids::PUMPKIN_STEM_AGE_0 => Some(names::PUMPKIN_STEM),
         ids::MELON_STEM_AGE_0 => Some(names::MELON_STEM),
         ids::COCOA_AGE_0 => Some(names::COCOA),
+        ids::COMMAND_BLOCK => Some(names::COMMAND_BLOCK),
+        ids::BARRIER => Some(names::BARRIER),
+        ids::LIGHT_BLOCK => Some(names::LIGHT),
         _ => None,
     }
 }
@@ -135,6 +144,9 @@ pub fn name_to_state_id(name: &str) -> Option<i32> {
         names::PUMPKIN_STEM => Some(ids::PUMPKIN_STEM_AGE_0),
         names::MELON_STEM => Some(ids::MELON_STEM_AGE_0),
         names::COCOA => Some(ids::COCOA_AGE_0),
+        names::COMMAND_BLOCK => Some(ids::COMMAND_BLOCK),
+        names::BARRIER => Some(ids::BARRIER),
+        names::LIGHT => Some(ids::LIGHT_BLOCK),
         _ => None,
     }
 }

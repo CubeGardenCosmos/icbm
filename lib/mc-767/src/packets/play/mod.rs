@@ -112,6 +112,13 @@ pub mod block_state_ids {
     pub const MELON_STEM_AGE_0: i32 = 6829;
     /// 可可果（age 0..2 × 4 朝向 → 7419..7430；facing 顺序 south/west/north/east）。
     pub const COCOA_AGE_0: i32 = 7419;
+    /// 命令方块（默认态：conditional=false, facing=up）。
+    pub const COMMAND_BLOCK: i32 = 7912;
+    /// 屏障（waterlogged=false 默认态；waterlogged=true = 10365）。
+    pub const BARRIER: i32 = 10366;
+    /// 亮度方块（level=15, waterlogged=false 默认态；level 0..15 × waterlogged
+    /// 2 → 10367..10398，level L 非含水 = 10367 + L*2）。
+    pub const LIGHT_BLOCK: i32 = 10398;
 }
 
 /// 1.21.1 生物群系网络 ID（icbm 服务器自定义注册表顺序）。

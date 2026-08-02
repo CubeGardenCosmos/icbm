@@ -70,6 +70,10 @@ pub struct ChunkStore {
     dirty: std::collections::HashSet<(i32, i32)>,
     /// 含红石方块的主世界区块（红石 tick 用）。
     redstone_dirty: std::collections::HashSet<(i32, i32)>,
+    /// 方块实体 NBT（世界坐标 → NBT；命令方块命令等 `/data` 操作目标）。
+    block_entities: std::collections::HashMap<(i32, i32, i32), icbm_mc_767::nbt::Nbt>,
+    /// 命令方块位置（`set_block` 维护；tick_command_blocks 遍历用，避免全量扫描）。
+    command_blocks: std::collections::HashSet<(i32, i32, i32)>,
 }
 
 impl ChunkStore {
@@ -87,6 +91,8 @@ impl ChunkStore {
             loaded: 0,
             dirty: std::collections::HashSet::new(),
             redstone_dirty: std::collections::HashSet::new(),
+            block_entities: std::collections::HashMap::new(),
+            command_blocks: std::collections::HashSet::new(),
         })
     }
 
@@ -242,6 +248,12 @@ impl ChunkStore {
             if crate::redstone::is_redstone_block(state_id) {
                 self.redstone_dirty.insert((cx, cz));
             }
+            // 维护命令方块位置表（tick_command_blocks 增量遍历）
+            if is_command_block(state_id) {
+                self.command_blocks.insert((x, y, z));
+            } else {
+                self.command_blocks.remove(&(x, y, z));
+            }
         }
         Ok((cx, cz))
     }
@@ -277,6 +289,45 @@ impl ChunkStore {
         let chunks: Vec<(i32, i32)> = self.redstone_dirty.iter().copied().collect();
         self.redstone_dirty.clear();
         chunks
+    }
+
+    /// 读取方块实体 NBT（不存在返回 `None`）。
+    pub fn block_entity(&self, x: i32, y: i32, z: i32) -> Option<&icbm_mc_767::nbt::Nbt> {
+        self.block_entities.get(&(x, y, z))
+    }
+
+    /// 写入方块实体 NBT（`/data merge block` 与命令方块命令）。
+    pub fn set_block_entity(
+        &mut self,
+        x: i32,
+        y: i32,
+        z: i32,
+        nbt: icbm_mc_767::nbt::Nbt,
+    ) {
+        self.block_entities.insert((x, y, z), nbt);
+    }
+
+    /// 移除方块实体 NBT（`/data remove block`）。
+    pub fn remove_block_entity(&mut self, x: i32, y: i32, z: i32) -> bool {
+        self.block_entities.remove(&(x, y, z)).is_some()
+    }
+
+    /// 命令方块：读取 `Command` 字符串（NBT 缺省时取 `Command`/`command` 键）。
+    pub fn command_block_command(&self, x: i32, y: i32, z: i32) -> Option<String> {
+        use icbm_mc_767::nbt::Nbt;
+        let nbt = self.block_entities.get(&(x, y, z))?;
+        let Nbt::Compound(compound) = nbt else {
+            return None;
+        };
+        compound
+            .get_string("Command")
+            .or_else(|| compound.get_string("command"))
+            .map(str::to_owned)
+    }
+
+    /// 命令方块位置列表。
+    pub fn command_block_positions(&self) -> Vec<(i32, i32, i32)> {
+        self.command_blocks.iter().copied().collect()
     }
 }
 
@@ -408,6 +459,14 @@ pub const fn gen_dimension(dim_byte: u8) -> GenDimension {
     } else {
         GenDimension::Overworld
     }
+}
+
+/// 是否命令方块状态（普通 7906..=7917 / 循环 12515..=12526 / 连锁 12527..=12538）。
+#[must_use]
+pub const fn is_command_block(state_id: i32) -> bool {
+    (state_id >= 7906 && state_id <= 7917)
+        || (state_id >= 12_515 && state_id <= 12_526)
+        || (state_id >= 12_527 && state_id <= 12_538)
 }
 
 #[cfg(test)]

@@ -894,6 +894,18 @@ fn handle_player_command(server: &Server, client: &Arc<Client>, command: &str) {
                 let _ = client.send_system_chat(&feedback, false);
             }
         }
+        Some(Command::Data {
+            action,
+            x,
+            y,
+            z,
+            path,
+            nbt,
+        }) => {
+            let feedback =
+                crate::console::apply_data(server, client, action, x, y, z, path.as_deref(), nbt.as_deref());
+            let _ = client.send_system_chat(&feedback, false);
+        }
         None => {}
     }
     if icbm_gameplay_icbm::bmtool::parse_bmtool(&line)

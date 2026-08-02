@@ -182,6 +182,10 @@ pub struct Client {
     pub last_player_move_sent: Mutex<Instant>,
     /// 待消费的传送门检测结果（`BLOCK_QUERY_RESP` 写入；-1 = 无）。
     pub pending_portal_block: std::sync::atomic::AtomicI32,
+    /// `/data` 请求挂起标志（receiver 收到 `BLOCK_NBT_RESP` 后写入响应）。
+    pub data_request_pending: std::sync::atomic::AtomicBool,
+    /// `/data` 响应（`BLOCK_NBT_RESP` 写入）。
+    pub pending_block_nbt: Mutex<Option<icbm_mc_767::nbt::Nbt>>,
 }
 
 const STATE_HANDSHAKE: u8 = 0;
@@ -238,6 +242,8 @@ impl Client {
             last_portal_check: Mutex::new(Instant::now()),
             last_player_move_sent: Mutex::new(Instant::now()),
             pending_portal_block: std::sync::atomic::AtomicI32::new(-1),
+            data_request_pending: std::sync::atomic::AtomicBool::new(false),
+            pending_block_nbt: Mutex::new(None),
         })
     }
 
