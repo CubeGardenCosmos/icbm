@@ -378,6 +378,7 @@ fn gamerule_values(rule: &str) -> Vec<String> {
 
 impl Server {
     /// 处理一行控制台命令。
+    #[allow(clippy::too_many_lines)] // 命令分发的 match 分支逐条对应
     pub fn handle_command(&self, line: &str) {
         let line = line.trim();
         if line.is_empty() {
@@ -400,6 +401,7 @@ impl Server {
                     info!("{feedback}");
                     if ok {
                         self.persist_gamerules();
+                        self.broadcast_gamerules();
                     }
                 }
                 Command::Help => print_help(),

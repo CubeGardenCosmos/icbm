@@ -51,6 +51,8 @@ pub mod kind {
     pub const BLOCK_QUERY: u8 = 0x0D;
     /// R→C：方块查询响应（`[u8 dim][i32 x][i32 y][i32 z][i32 state_id]`）。
     pub const BLOCK_QUERY_RESP: u8 = 0x8D;
+    /// C→R：游戏规则变更（`[u8 名长][名][u8 值长][值]`）。
+    pub const GAMERULE_UPDATE: u8 = 0x0E;
 }
 
 /// IPC 错误。
@@ -507,6 +509,36 @@ pub fn decode_block_query_resp(body: &[u8]) -> Result<(u8, i32, i32, i32, i32), 
     ))
 }
 
+/// `GAMERULE_UPDATE` 载荷：`[u8 名长][名][u8 值长][值]`。
+#[must_use]
+pub fn encode_gamerule_update(name: &str, value: &str) -> Vec<u8> {
+    let mut out = Vec::with_capacity(2 + name.len() + value.len());
+    out.push(u8::try_from(name.len()).unwrap_or(u8::MAX));
+    out.extend_from_slice(name.as_bytes());
+    out.push(u8::try_from(value.len()).unwrap_or(u8::MAX));
+    out.extend_from_slice(value.as_bytes());
+    out
+}
+
+/// 解析 `GAMERULE_UPDATE` 载荷。
+pub fn decode_gamerule_update(body: &[u8]) -> Result<(String, String), IpcError> {
+    if body.len() < 2 {
+        return Err(IpcError::Length("gamerule update", body.len()));
+    }
+    let name_len = usize::from(body[0]);
+    if body.len() < 1 + name_len + 1 {
+        return Err(IpcError::Length("gamerule update", body.len()));
+    }
+    let value_len = usize::from(body[1 + name_len]);
+    if body.len() < 2 + name_len + value_len {
+        return Err(IpcError::Length("gamerule update", body.len()));
+    }
+    let name = String::from_utf8_lossy(&body[1..=name_len]).into_owned();
+    let value =
+        String::from_utf8_lossy(&body[2 + name_len..2 + name_len + value_len]).into_owned();
+    Ok((name, value))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -583,6 +615,18 @@ mod tests {
         let (decoded, dim, x, y, z) = decode_portal_enter(&body).unwrap();
         assert_eq!(decoded, uuid);
         assert_eq!((dim, x, y, z), (DIM_NETHER, 3, 64, -8));
+    }
+
+    #[test]
+    fn gamerule_update_round_trip() {
+        let body = encode_gamerule_update("doDaylightCycle", "false");
+        let (name, value) = decode_gamerule_update(&body).unwrap();
+        assert_eq!(name, "doDaylightCycle");
+        assert_eq!(value, "false");
+        // 空名/空值可解析
+        let body = encode_gamerule_update("", "");
+        let (name, value) = decode_gamerule_update(&body).unwrap();
+        assert_eq!((name.as_str(), value.as_str()), ("", ""));
     }
 
     #[test]

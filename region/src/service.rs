@@ -13,7 +13,7 @@ use uuid::Uuid;
 
 use crate::protocol::{
     CORE_SERVICE, DIM_OVERWORLD, Ipc, IpcError, IpcMessage, decode_block_query,
-    decode_block_query_resp, decode_block_update, decode_chunk_request, decode_player_enter,
+    decode_block_update, decode_chunk_request, decode_gamerule_update, decode_player_enter,
     decode_player_leave, decode_register_ack, encode_block_query_resp, encode_chunk_data,
     encode_entity_data, encode_heartbeat, encode_register, encode_stats, kind,
 };
@@ -200,6 +200,12 @@ pub struct RegionService {
     creepers: Vec<Creeper>,
     /// xorshift64 状态（种子取自区域坐标，固定种子可复现）。
     rng: u64,
+    /// 世界游戏规则（`GAMERULE_UPDATE` 同步；默认原版值）。
+    gamerules: std::collections::HashMap<String, String>,
+    /// 世界时间（tick，昼夜循环用）。
+    world_time: i64,
+    /// 上次广播时间（节流：每秒一次）。
+    last_time_broadcast: Instant,
 }
 
 impl RegionService {
@@ -392,6 +398,9 @@ impl RegionService {
             mobs: crate::mobs::MobManager::new(),
             creepers: Vec::new(),
             rng: rng | 1,
+            gamerules: std::collections::HashMap::new(),
+            world_time: 0,
+            last_time_broadcast: Instant::now(),
         })
     }
 
@@ -458,6 +467,7 @@ impl RegionService {
         self.flush_chunks()?;
         self.tick_fluids()?;
         self.tick_redstone()?;
+        self.tick_time()?;
         self.tick_entities()?;
         self.tick_mobs()?;
         // Phase 1 世界 tick：仅随机漫游 Creeper（region 存活信号）
@@ -548,6 +558,11 @@ impl RegionService {
                 info!(id = %self.config.id.service_name(), "unload requested, flushing");
                 self.store.flush()?;
                 self.running = false;
+            }
+            kind::GAMERULE_UPDATE => {
+                if let Ok((name, value)) = decode_gamerule_update(&message.body) {
+                    self.gamerules.insert(name, value);
+                }
             }
             kind::BLOCK_QUERY => {
                 let (dim, x, y, z) = decode_block_query(&message.body)?;
@@ -842,14 +857,44 @@ impl RegionService {
         Ok(())
     }
 
+    /// 读取布尔游戏规则（默认 `true`）。
+    fn gamerule_bool(&self, name: &str) -> bool {
+        self.gamerules.get(name).is_none_or(|value| value == "true")
+    }
+
+    /// 世界时间 tick：`doDaylightCycle` 控制推进，广播 `CUpdateTime`。
+    fn tick_time(&mut self) -> Result<(), RegionError> {
+        let daylight = self.gamerule_bool("doDaylightCycle");
+        if daylight {
+            self.world_time = self.world_time.wrapping_add(1);
+        }
+        // 约每秒广播一次（节流，避免每 tick 刷包）
+        if self.last_time_broadcast.elapsed() >= Duration::from_secs(1) {
+            let packet = icbm_mc_767::packets::play::clientbound::CUpdateTime {
+                game_time: self.world_time,
+                day_time: if daylight {
+                    self.world_time
+                } else {
+                    // 冻结：负数表示停止昼夜循环（对照 `WorldTimeUpdateS2CPacket`）
+                    -self.world_time
+                },
+            };
+            self.send_entity_packet(play_ids::CLIENTBOUND_SET_TIME, |w| {
+                packet.encode(w);
+            })?;
+            self.last_time_broadcast = Instant::now();
+        }
+        Ok(())
+    }
+
     /// 友好生物 tick：生成（未达上限时）、随机游走、环境音效广播。
     fn tick_mobs(&mut self) -> Result<(), RegionError> {
         let min_x = f64::from(self.config.id.rx) * 512.0;
         let min_z = f64::from(self.config.id.rz) * 512.0;
         let max_x = min_x + 512.0;
         let max_z = min_z + 512.0;
-        // 生成：约每 2 秒尝试一只（上限由 MobManager 控制）
-        if self.rand_f64() < 1.0 / 40.0 {
+        // 生成：约每 2 秒尝试一只（上限由 MobManager 控制；`doMobSpawning` 关闭时禁止）
+        if self.gamerule_bool("doMobSpawning") && self.rand_f64() < 1.0 / 40.0 {
             let entity_id = self.entity_base + 2000 + i32::try_from(self.mobs.len())
                 .unwrap_or(i32::MAX);
             if self.mobs.try_spawn(entity_id, min_x, max_x, min_z, max_z) {

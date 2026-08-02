@@ -654,6 +654,7 @@ fn handle_player_command(server: &Server, client: &Arc<Client>, command: &str) {
             let _ = client.send_system_chat(&feedback, false);
             if ok {
                 server.persist_gamerules();
+                server.broadcast_gamerules();
             }
         }
         Some(Command::Help) => {

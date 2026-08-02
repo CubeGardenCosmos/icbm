@@ -158,6 +158,34 @@ impl Server {
         })
     }
 
+    /// 把当前游戏规则广播给所有 region（`GAMERULE_UPDATE`）。
+    ///
+    /// 规则变更后调用；region 据此控制昼夜循环、生物生成等行为。
+    pub fn broadcast_gamerules(&self) {
+        let rules: Vec<(String, String)> = {
+            let world = self.world.lock().expect("world lock");
+            world
+                .gamerules
+                .iter()
+                .map(|(name, value)| (name.to_owned(), value.to_owned()))
+                .collect()
+        };
+        let regions: Vec<RegionId> = {
+            let world = self.world.lock().expect("world lock");
+            world.regions.ids()
+        };
+        for region in regions {
+            for (name, value) in &rules {
+                let body = icbm_region::protocol::encode_gamerule_update(name, value);
+                let _ = self.ipc.send(
+                    &region.service_name(),
+                    icbm_region::protocol::kind::GAMERULE_UPDATE,
+                    &body,
+                );
+            }
+        }
+    }
+
     /// 把当前游戏规则持久化到 level.dat（`GameRules` 复合）。
     pub fn persist_gamerules(&self) {
         let path = self.config.world_dir.join("level.dat");
