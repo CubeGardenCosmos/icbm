@@ -9,7 +9,8 @@ pub struct ServerConfig {
     pub address: String,
     /// 世界目录。
     pub world_dir: PathBuf,
-    /// datarouter 共享内存名。
+    /// datarouter 共享内存对象名（缺省 `/icbm`，可用 `--shm` 覆盖；
+    /// 避免与本机其它 datarouter 实例冲突）。
     pub shm_name: String,
     /// MOTD。
     pub motd: String,
@@ -36,9 +37,9 @@ impl Default for ServerConfig {
         Self {
             address: "0.0.0.0:25565".to_owned(),
             world_dir: PathBuf::from("world"),
-            shm_name: "/datarouter".to_owned(),
+            shm_name: "/icbm".to_owned(),
             motd: "ICBM by CubeGarden Studio, READY".to_owned(),
-            max_players: 182,
+            max_players: 183,
             view_distance: 8,
             simulation_distance: 8,
             compression_threshold: 256,

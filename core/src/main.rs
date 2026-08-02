@@ -10,6 +10,9 @@ use tracing::{error, info, warn};
 
 use icbm_region::{RegionConfig, RegionId};
 
+/// 缺省 datarouter 共享内存对象名（可用 `--shm` 覆盖；POSIX shm 名以 `/` 开头）。
+const DEFAULT_SHM_NAME: &str = "/icbm";
+
 fn parse_args() -> Result<Launch, String> {
     let mut args = std::env::args().skip(1);
     let mut world: Option<PathBuf> = None;
@@ -56,7 +59,7 @@ fn parse_args() -> Result<Launch, String> {
         Launch::Region(RegionLaunchArgs {
             id: RegionId { rx, rz },
             world_dir: world.ok_or_else(|| "region 模式需要 --world".to_owned())?,
-            shm_name: shm.unwrap_or_else(|| "/datarouter".to_owned()),
+            shm_name: shm.unwrap_or_else(|| DEFAULT_SHM_NAME.to_owned()),
         })
     } else {
         Launch::Core(ServerLaunchArgs {
@@ -65,7 +68,7 @@ fn parse_args() -> Result<Launch, String> {
                 |port| format!("0.0.0.0:{port}"),
             ),
             world_dir: world.unwrap_or_else(|| PathBuf::from("world")),
-            shm_name: shm.unwrap_or_else(|| "/datarouter".to_owned()),
+            shm_name: shm.unwrap_or_else(|| DEFAULT_SHM_NAME.to_owned()),
         })
     };
     Ok(mode)
@@ -91,7 +94,7 @@ impl Default for ServerLaunchArgs {
         Self {
             address: "0.0.0.0:25565".to_owned(),
             world_dir: PathBuf::from("world"),
-            shm_name: "/datarouter".to_owned(),
+            shm_name: DEFAULT_SHM_NAME.to_owned(),
         }
     }
 }
