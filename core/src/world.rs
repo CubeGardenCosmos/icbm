@@ -6,7 +6,7 @@ use std::sync::Arc;
 
 use icbm_gameplay_minecraft::gamerules::GameRuleStore;
 use icbm_mc_767::packets::play::BlockPos;
-use icbm_region::RegionId;
+use icbm_region::{OVERWORLD_SURFACE_FEET_Y, RegionId};
 use uuid::Uuid;
 
 use crate::client::Client;
@@ -67,7 +67,7 @@ impl WorldState {
             chunk_pending: None,
             player_regions: HashMap::new(),
             world_dir,
-            spawn: BlockPos::new(0, 4, 0),
+            spawn: BlockPos::new(0, icbm_region::OVERWORLD_SURFACE_FEET_Y, 0),
         }
     }
 }

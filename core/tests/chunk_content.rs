@@ -300,25 +300,20 @@ fn chunk_terrain_matches_vanilla_flat() {
     }
 
     let palettes = center_palettes.expect("center chunk (0,0) not received");
-    // section 索引 4 = 世界 y 0..15：底部 bedrock(y=0)，上方 dirt×2，顶层非 snowy 草(y=3)
-    let surface = &palettes[4];
+    // superflat 自世界底 Y=-64 起铺设：section 0（世界 y -64..-49）含底部
+    // bedrock(y=-64)、dirt×2（-63..-62）、顶层非 snowy 草（-61）。
+    let surface = &palettes[0];
     for id in [79, 10, 9, 0] {
         assert!(
             surface.contains(&id),
             "surface palette {surface:?} missing block id {id} (bedrock=79 dirt=10 grass=9 air=0)"
         );
     }
-    // 世界底部的 4 个 section（y -64..0）全部为空气，不含水
-    for section in &palettes[0..4] {
-        assert_eq!(
-            section,
-            &vec![0],
-            "bottom section {section:?} must be air only (no water)"
-        );
-    }
-    // 草方块必须是非 snowy 的全局 ID 9（8 是 snowy=true）
+    // section 0 之下不存在（首个即世界底部）；section 0 内不得有雪草（8）
+    assert!(!surface.contains(&8), "snowy grass_block (id 8) must not be generated");
+    // 草方块必须是非 snowy 的全局 ID 9（8 是 snowy=true），且只出现在 section 0
     let mut grass_found = false;
-    for section in &palettes {
+    for (index, section) in palettes.iter().enumerate() {
         if section.contains(&9) {
             grass_found = true;
         }
@@ -326,6 +321,12 @@ fn chunk_terrain_matches_vanilla_flat() {
             !section.contains(&8),
             "snowy grass_block (id 8) must not be generated: {section:?}"
         );
+        if index > 0 {
+            assert!(
+                section == &vec![0],
+                "above-surface sections must be air only, section {index}: {section:?}"
+            );
+        }
     }
     assert!(grass_found, "non-snowy grass_block (id 9) not found");
 }
@@ -582,7 +583,7 @@ fn creeper_spawns_in_region() {
     let _x = r.read_f64_be().unwrap();
     let y = r.read_f64_be().unwrap();
     let _z = r.read_f64_be().unwrap();
-    assert_eq!(y, 4.0, "creeper spawns on flat surface");
+    assert_eq!(y, -60.0, "creeper spawns on flat surface (superflat at Y=-64)");
     assert!(entity_id >= 1000, "region entity ids start at 1000");
 }
 
@@ -957,10 +958,10 @@ fn negative_coordinates_terrain_is_generated() {
     }
     assert_eq!(batch_size, Some(289), "(2*8+1)^2 chunks");
     assert!(saw_negative_chunk, "no negative-coordinate chunk delivered");
-    // 负数区块必须有真实的超平坦地形：section 4 = 世界 y 0..15 含
+    // 负数区块必须有真实的超平坦地形：section 0 = 世界 y -64..-49 含
     // 基岩(79)/泥土(10)/非雪草(9)。
     let palettes = negative_palettes.expect("negative chunk palettes");
-    let surface = &palettes[4];
+    let surface = &palettes[0];
     for id in [79, 10, 9] {
         assert!(
             surface.contains(&id),
@@ -968,8 +969,8 @@ fn negative_coordinates_terrain_is_generated() {
         );
     }
     assert!(
-        palettes[0..4].iter().all(|section| section == &vec![0]),
-        "negative chunk bottom sections must be air only"
+        palettes[1..].iter().all(|section| section == &vec![0]),
+        "negative chunk above-surface sections must be air only"
     );
 }
 
@@ -1002,7 +1003,7 @@ fn void_fall_rescued_to_spawn() {
             break (x, y, z);
         }
     };
-    assert_eq!((x, y, z), (0.0, 4.0, 0.0), "rescued to world spawn");
+    assert_eq!((x, y, z), (0.0, -60.0, 0.0), "rescued to world spawn (superflat top)");
 }
 
 /// 玩家放置与破坏方块：`give` 石头 → 右键（USE_ITEM_ON）在脚下放置 →
@@ -1022,10 +1023,11 @@ fn player_places_and_breaks_blocks() {
     recv_chat_until(&mut client, "已给");
 
     // 模拟右键点击脚下地面（面=1 上 → 放置到 y+1）
-    // 玩家在 y≈64 站立，点击 y=63 的方块顶面 → 放置到 (8, 64, 8)
+    // 玩家在 y=-60 站立（superflat 地表 -61 之上），点击 y=-61 的草方块顶面
+    // → 放置到 (0, -60, 0)
     let mut w = Writer::new();
     w.write_var_int(0); // hand = main
-    w.write_i64_be(icbm_mc_767::packets::play::BlockPos::new(8, 63, 8).as_long());
+    w.write_i64_be(icbm_mc_767::packets::play::BlockPos::new(0, -61, 0).as_long());
     w.write_var_int(1); // face = UP
     w.write_f32_be(0.5);
     w.write_f32_be(1.0);
@@ -1034,7 +1036,7 @@ fn player_places_and_breaks_blocks() {
     w.write_var_int(0); // sequence
     client.send(play_ids::SERVERBOUND_USE_ITEM_ON, &w.into_bytes());
 
-    // 等待 CBlockUpdate：位置 (8, 64, 8) 变石头
+    // 等待 CBlockUpdate：位置 (0, -60, 0) 变石头
     let deadline = Instant::now() + Duration::from_secs(15);
     let placed = loop {
         assert!(Instant::now() < deadline, "no block update for placement");
@@ -1043,7 +1045,7 @@ fn player_places_and_breaks_blocks() {
             let mut r = Reader::new(&payload);
             let pos = icbm_mc_767::packets::play::BlockPos::from_long(r.read_i64_be().unwrap());
             let state = r.read_var_int().unwrap();
-            if pos == icbm_mc_767::packets::play::BlockPos::new(8, 64, 8) {
+            if pos == icbm_mc_767::packets::play::BlockPos::new(0, -60, 0) {
                 break state;
             }
         }
@@ -1053,12 +1055,12 @@ fn player_places_and_breaks_blocks() {
     // 破坏该方块：PLAYER_ACTION status=0（开始破坏）
     let mut w = Writer::new();
     w.write_var_int(0); // start digging
-    w.write_i64_be(icbm_mc_767::packets::play::BlockPos::new(8, 64, 8).as_long());
+    w.write_i64_be(icbm_mc_767::packets::play::BlockPos::new(0, -60, 0).as_long());
     w.write_var_int(1); // face
     w.write_var_int(0); // sequence
     client.send(play_ids::SERVERBOUND_PLAYER_ACTION, &w.into_bytes());
 
-    // 等待 CBlockUpdate：位置 (8, 64, 8) 变空气
+    // 等待 CBlockUpdate：位置 (0, -60, 0) 变空气
     let deadline = Instant::now() + Duration::from_secs(15);
     let broken = loop {
         assert!(Instant::now() < deadline, "no block update for breaking");
@@ -1067,7 +1069,7 @@ fn player_places_and_breaks_blocks() {
             let mut r = Reader::new(&payload);
             let pos = icbm_mc_767::packets::play::BlockPos::from_long(r.read_i64_be().unwrap());
             let state = r.read_var_int().unwrap();
-            if pos == icbm_mc_767::packets::play::BlockPos::new(8, 64, 8) {
+            if pos == icbm_mc_767::packets::play::BlockPos::new(0, -60, 0) {
                 break state;
             }
         }

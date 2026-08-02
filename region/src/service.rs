@@ -160,7 +160,7 @@ const MAX_CREEPERS: usize = 12;
 /// 每 tick 生成 Creeper 的概率（约 6 秒一只）。
 const SPAWN_CHANCE: f64 = 1.0 / 120.0;
 /// Creeper 出生高度（flat 地表 y=3 之上）。
-const CREEPER_SPAWN_Y: f64 = 4.0;
+const CREEPER_SPAWN_Y: f64 = crate::OVERWORLD_SURFACE_FEET_Y as f64;
 
 /// 区域内一只漫游 Creeper（不攻击，仅作 region 存活/卸载信号）。
 struct Creeper {
@@ -661,15 +661,16 @@ impl RegionService {
                 // 重力：速度积累 + 位置更新
                 let gravity = 0.04;
                 item.vy = (item.vy - gravity).max(-0.6);
-                // 简单地面碰撞：y < 世界最低 + 1 时停止
+                // 简单地面碰撞：落到 superflat 地表（-61）上方时停止
                 let old_x = item.x;
                 let old_y = item.y;
                 let old_z = item.z;
                 item.x += item.vx;
                 item.y += item.vy;
                 item.z += item.vz;
-                if item.y < 0.0 {
-                    item.y = 0.0;
+                let surface_top = f64::from(crate::OVERWORLD_SURFACE_FEET_Y) - 1.0;
+                if item.y < surface_top {
+                    item.y = surface_top;
                     item.vy = 0.0;
                     item.vx = 0.0;
                     item.vz = 0.0;

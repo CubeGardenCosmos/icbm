@@ -63,7 +63,9 @@ impl Dimension {
     #[must_use]
     pub fn flat_config(&self) -> FlatConfig {
         match self {
-            // 原版 superflat 默认预设：bedrock / dirt×2 / grass，y 0..3
+            // 原版 superflat 默认预设（bedrock / dirt×2 / grass），自洞穴更新
+            // （1.18）后的世界最低建筑点 Y=-64 开始铺设（surface 在 -61，
+            // 玩家出生点 -60），不再在表面下方留 68 格虚空。
             Self::Overworld => FlatConfig {
                 layers: vec![
                     Layer {
@@ -155,8 +157,9 @@ pub struct ChunkColumn {
     pub sections: Vec<[i32; 4096]>,
     /// 生物群系网络 ID。
     pub biome_id: i32,
-    /// 地表高度（最高非空气方块 y + 1）。
-    pub surface_height: u16,
+    /// 地表高度（最高非空气方块 y + 1，**绝对 Y**；superflat 自世界底
+    /// Y=-64 起铺设后可为负数，如 -60）。
+    pub surface_height: i32,
 }
 
 impl ChunkColumn {
@@ -190,10 +193,10 @@ impl ChunkColumn {
         self.sections[section][((local_y << 4 | z as i32) << 4 | x as i32) as usize]
     }
 
-    /// 计算每列高度（最高非空气方块 y + 1），供 heightmap 使用。
+    /// 计算每列高度（最高非空气方块 y + 1，**绝对 Y**），供 heightmap 使用。
     #[must_use]
-    pub fn heightmap_heights(&self) -> [u16; 256] {
-        let mut heights = [0u16; 256];
+    pub fn heightmap_heights(&self) -> [i32; 256] {
+        let mut heights = [0i32; 256];
         for (column, height) in heights.iter_mut().enumerate() {
             let x = (column & 0xF) as u32;
             let z = (column >> 4) as u32;
@@ -205,7 +208,7 @@ impl ChunkColumn {
                     top = y;
                 }
             }
-            *height = u16::try_from(top + 1).unwrap_or(0);
+            *height = top + 1;
         }
         heights
     }
@@ -244,7 +247,9 @@ pub fn generate_chunk(dimension: Dimension, x: i32, z: i32) -> ChunkColumn {
     let section_count = config.world_height.section_count();
     let mut sections = vec![[0i32; 4096]; section_count];
 
-    let mut layer_start_y = 0i32;
+    // 层从世界最低 Y 开始铺设（superflat 自洞穴更新后的最低建筑点
+    // Y=-64 起生成，不再从 y=0 开始、表面下方不留虚空）。
+    let mut layer_start_y = config.world_height.min_y;
     for layer in &config.layers {
         for offset in 0..layer.height {
             let world_y = layer_start_y + offset as i32;
@@ -289,15 +294,16 @@ mod tests {
         let chunk = generate_chunk(Dimension::Overworld, 0, 0);
         assert_eq!(chunk.bottom_section_y, -4);
         assert_eq!(chunk.sections.len(), 24);
-        assert_eq!(chunk.block_at(0, 0, 0), ids::BEDROCK);
-        assert_eq!(chunk.block_at(0, 1, 0), ids::DIRT);
-        assert_eq!(chunk.block_at(0, 2, 0), ids::DIRT);
-        assert_eq!(chunk.block_at(0, 3, 0), ids::GRASS_BLOCK);
-        assert_eq!(chunk.block_at(0, 4, 0), ids::AIR);
-        assert_eq!(chunk.block_at(0, -1, 0), ids::AIR);
-        assert_eq!(chunk.surface_height, 4);
+        // superflat 自世界最低 Y=-64 起铺设（洞穴更新后的最低建筑点）
+        assert_eq!(chunk.block_at(0, -64, 0), ids::BEDROCK);
+        assert_eq!(chunk.block_at(0, -63, 0), ids::DIRT);
+        assert_eq!(chunk.block_at(0, -62, 0), ids::DIRT);
+        assert_eq!(chunk.block_at(0, -61, 0), ids::GRASS_BLOCK);
+        assert_eq!(chunk.block_at(0, -60, 0), ids::AIR);
+        assert_eq!(chunk.block_at(0, 0, 0), ids::AIR);
+        assert_eq!(chunk.surface_height, -60);
         let heights = chunk.heightmap_heights();
-        assert!(heights.iter().all(|&h| h == 4));
+        assert!(heights.iter().all(|&h| h == -60));
     }
 
     #[test]
@@ -331,8 +337,8 @@ mod tests {
     fn negative_region_chunks() {
         let chunk = generate_chunk(Dimension::Overworld, -1, -1);
         assert_eq!(chunk.x, -1);
-        assert_eq!(chunk.block_at(15, 3, 15), ids::GRASS_BLOCK);
-        assert_eq!(chunk.heightmap_heights()[255], 4);
+        assert_eq!(chunk.block_at(15, -61, 15), ids::GRASS_BLOCK);
+        assert_eq!(chunk.heightmap_heights()[255], -60);
     }
 
     #[test]
@@ -345,18 +351,18 @@ mod tests {
         for y in [-1000, -320, -95, -80, -65] {
             assert_eq!(chunk.block_at(7, y, 7), ids::AIR, "y={y}");
         }
-        // 范围内未铺层处（-64..-1）仍为空气
-        for y in [-64, -1] {
+        // 未铺层处（-63..-61 是泥土/草，其余底部段仍为空气）
+        for y in [-63 + 16, -60] {
             assert_eq!(chunk.block_at(7, y, 7), ids::AIR, "y={y}");
         }
         // 顶部之上：min_y(-64) + 384 = 320
         for y in [320, 321, 1000] {
             assert_eq!(chunk.block_at(7, y, 7), ids::AIR, "y={y}");
         }
-        // 范围内不受影响
-        assert_eq!(chunk.block_at(7, 0, 7), ids::BEDROCK);
-        assert_eq!(chunk.block_at(7, 1, 7), ids::DIRT);
-        assert_eq!(chunk.block_at(7, 3, 7), ids::GRASS_BLOCK);
+        // 范围内不受影响（superflat 自 -64 铺设）
+        assert_eq!(chunk.block_at(7, -64, 7), ids::BEDROCK);
+        assert_eq!(chunk.block_at(7, -63, 7), ids::DIRT);
+        assert_eq!(chunk.block_at(7, -61, 7), ids::GRASS_BLOCK);
     }
 
     #[test]

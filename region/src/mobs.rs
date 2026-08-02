@@ -103,7 +103,7 @@ impl FriendlyMob {
     /// 生物在地面的 Y（flat 地表 y=3 上方站立）。
     #[must_use]
     pub const fn ground_y(&self) -> f64 {
-        4.0
+        crate::OVERWORLD_SURFACE_FEET_Y as f64
     }
 }
 

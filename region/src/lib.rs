@@ -22,6 +22,10 @@ pub enum Face {
     Nether,
 }
 
+/// 主世界 superflat 地表站立 Y（地表顶 -61 + 1；superflat 自洞穴更新后的
+/// 最低建筑点 Y=-64 起铺设，见 `icbm_terrain_gen` 的 Overworld flat 配置）。
+pub const OVERWORLD_SURFACE_FEET_Y: i32 = -60;
+
 impl Face {
     /// IPC 维度字节。
     #[must_use]

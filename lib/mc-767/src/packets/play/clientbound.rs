@@ -220,7 +220,7 @@ pub struct CLevelChunkWithLight {
     /// 维度最低 Y（heightmap 存储值 = 列高 − `min_y`）。
     pub min_y: i32,
     /// 列高（256 列，值 = 最高非空气方块 y + 1，绝对 Y）。
-    pub world_surface_heights: [u16; HEIGHTMAP_COLUMNS],
+    pub world_surface_heights: [i32; HEIGHTMAP_COLUMNS],
     /// 自底向上的 section 列表。
     pub sections: Vec<ChunkSection>,
     /// 每世界 section 的天空光（2048 字节全 0xF；空表示无）。
@@ -236,7 +236,7 @@ impl CLevelChunkWithLight {
         x: i32,
         z: i32,
         min_y: i32,
-        heights: [u16; HEIGHTMAP_COLUMNS],
+        heights: [i32; HEIGHTMAP_COLUMNS],
         sections: Vec<ChunkSection>,
     ) -> Self {
         let full = vec![0xFFu8; 2048];
@@ -1692,7 +1692,7 @@ mod tests {
                 sections.push(ChunkSection::air(flat_biomes::OVERWORLD));
             }
         }
-        let heights = [4u16; 256];
+        let heights = [4i32; 256];
         let packet = CLevelChunkWithLight::flat(0, 0, -64, heights, sections);
         let mut w = Writer::new();
         packet.encode(&mut w);

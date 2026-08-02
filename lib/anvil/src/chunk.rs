@@ -392,7 +392,7 @@ mod tests {
             });
         }
         let mut chunk = ChunkNbt::new(x, z, -4, sections);
-        let heights = [4u16; 256];
+        let heights = [4i32; 256];
         // sample_chunk 底部 section -4 → min_y=-64
         chunk.heightmaps.push((
             "WORLD_SURFACE".to_owned(),

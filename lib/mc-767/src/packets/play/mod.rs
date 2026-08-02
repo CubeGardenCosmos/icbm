@@ -153,10 +153,10 @@ pub const HEIGHTMAP_LONGS: usize = 37;
 /// `height - chunk.getBottomY()`（`height = 最高方块 y + 1`）；`heights` 传入
 /// 绝对列高（最高非空气方块 y + 1）。
 #[must_use]
-pub fn encode_heightmap(heights: &[u16; HEIGHTMAP_COLUMNS], min_y: i32) -> [i64; HEIGHTMAP_LONGS] {
+pub fn encode_heightmap(heights: &[i32; HEIGHTMAP_COLUMNS], min_y: i32) -> [i64; HEIGHTMAP_LONGS] {
     let mut longs = [0i64; HEIGHTMAP_LONGS];
     for (column, &height) in heights.iter().enumerate() {
-        let stored = i32::from(height) - min_y;
+        let stored = height - min_y;
         let long_index = column / HEIGHTMAP_COLUMNS_PER_LONG;
         let offset = (column % HEIGHTMAP_COLUMNS_PER_LONG) * HEIGHTMAP_BITS as usize;
         longs[long_index] |= i64::from(stored) << offset;
@@ -385,7 +385,7 @@ mod tests {
     #[test]
     fn heightmap_encoding() {
         // overworld min_y=-64，列高 4 → 存储值 4-(-64)=68
-        let heights = [4u16; 256];
+        let heights = [4i32; 256];
         let longs = encode_heightmap(&heights, -64);
         assert_eq!(longs.len(), 37); // 256/7 → 37（非 36）
         // 列 0..6 位于长整型 0；每长整型 7 列
@@ -401,7 +401,7 @@ mod tests {
             (0x44i64) | (0x44i64 << 9) | (0x44i64 << 18) | (0x44i64 << 27)
         );
         // 单列非零：列 7 值 1（min_y=0 → 存储 1）只落在长整型 1 位 0
-        let mut sparse = [0u16; 256];
+        let mut sparse = [0i32; 256];
         sparse[7] = 1;
         let longs = encode_heightmap(&sparse, 0);
         assert_eq!(longs[0], 0);
@@ -411,14 +411,14 @@ mod tests {
 
     #[test]
     fn heightmap_round_trip() {
-        let mut heights = [0u16; 256];
+        let mut heights = [0i32; 256];
         for (i, h) in heights.iter_mut().enumerate() {
-            *h = u16::try_from((i * 37) % 385 + 1).unwrap();
+            *h = i32::try_from((i * 37) % 385 + 1).unwrap();
         }
         let longs = encode_heightmap(&heights, -64);
         let unpacked = unpack_indices(&longs, 9, 256);
         for (column, &h) in heights.iter().enumerate() {
-            assert_eq!(unpacked[column], u32::from(h) + 64, "column {column}");
+            assert_eq!(unpacked[column], u32::try_from(h + 64).unwrap(), "column {column}");
         }
     }
 
