@@ -84,10 +84,18 @@ pub struct Ipc {
 
 impl Ipc {
     /// 连接 datarouter 并注册服务名。
-    pub fn connect(shm_name: &str, service_name: &str) -> Result<Self, IpcError> {
+    ///
+    /// `auth_token`：switch 以 `--token` 启动时的共享密钥（core 通过环境变量
+    /// `ICBM_DATAROUTER_TOKEN` 传给 region 子进程）；未启用鉴权时传 `None`。
+    pub fn connect(
+        shm_name: &str,
+        service_name: &str,
+        auth_token: Option<String>,
+    ) -> Result<Self, IpcError> {
         let options = FrontendOptions {
             shm_name: shm_name.to_owned(),
             service_name: service_name.to_owned(),
+            auth_token,
             ..FrontendOptions::default()
         };
         let frontend = Frontend::connect(options).map_err(IpcError::Datarouter)?;

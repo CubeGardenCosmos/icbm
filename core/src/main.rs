@@ -120,10 +120,15 @@ fn main() {
                 id = %args.id.service_name(),
                 "starting region worker mode"
             );
+            // switch 鉴权令牌经环境变量传递（core 与 region 子进程共享同一环境）。
+            let auth_token = std::env::var("ICBM_DATAROUTER_TOKEN")
+                .ok()
+                .filter(|token| !token.is_empty());
             let config = RegionConfig {
                 id: args.id,
                 world_dir: args.world_dir,
                 shm_name: args.shm_name,
+                auth_token,
             };
             if let Err(err) = icbm_region::run_region(config) {
                 error!(%err, "region worker exited with error");

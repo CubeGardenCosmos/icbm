@@ -5,7 +5,16 @@ JSON / TLV 上下文，直接使用紧凑二进制帧，最大程度降低每消
 
 ## 传输
 
-- 共享内存由 `datarouter-switch` 创建，core 启动前必须先运行 switch。
+- 共享内存由 `datarouter-switch` 创建；datarouter 子模块把 switch 二进制
+  `include_bytes!` 嵌入 icbm 可执行文件，**core 启动时自动拉起 switch**
+  （`SwitchHandle`，memfd 内存执行），不再需要预先运行外部 switch。
+- 简单鉴权（可选）：设置环境变量 `ICBM_DATAROUTER_TOKEN` 后，core 以
+  `--token` 启动 switch（控制面只存 FNV-1a 指纹），core 与 region 连接时携带
+  同一 token；未设置则不启用（shm 权限 0600 已限制为同用户）。
+- 单帧容量：ring 为 512KiB，`MAX_APP_PAYLOAD` = 512KiB − 16B；≤512KiB 消息
+  单帧传输，不再强制分块（旧 60KiB 上限与 4MiB 重编约定已废弃）。
+- 接收轮询约定：`Frontend::recv` 会把超时 0 归一化为 `recv_timeout_ms`
+  （默认 3000ms），**禁止用 `recv(0)` 实现非阻塞**；region 排空用 `recv(1)`。
 - core 注册服务名：`icbm.core`
 - region 注册服务名：`icbm.region.<id>`，其中 `<id>` 为紧凑区域标识（见下）。
 - 消息类型使用 datarouter `MSG_CONTROL`（0x8B），payload 放入 body；var_data 留空。
@@ -56,14 +65,23 @@ offset 1: 载荷（按 kind 定义，全部小端）
 
 ## 生命周期
 
-1. core 启动后连接 datarouter，注册 `icbm.core`；读取配置，为出生点区域拉起第一个 region 子进程（同一二进制 `--region` 模式）。
+1. core 启动 → `SwitchHandle` 拉起嵌入式 switch（`--allow-any --ttl-ms 5000
+   --max-ports 8 [--token …]`）→ 连接并注册 `icbm.core`；读取配置，为出生点
+   区域拉起第一个 region 子进程（同一二进制 `--region` 模式，继承环境变量
+   `ICBM_DATAROUTER_TOKEN`）。
 2. region 启动 → 连接 datarouter → 注册 `icbm.region.<id>` → 发送 `REGION_REGISTER`。
-3. core 回复 `REGISTER_ACK` 后，region 进入正常模拟；每 1 秒发送一次 `REGION_HEARTBEAT`（含 TPS 与沉睡状态）。
+3. core 回复 `REGISTER_ACK` 后，region 进入正常模拟；每 1 秒发送一次
+   `REGION_HEARTBEAT`（含 TPS 与沉睡状态）。
 4. 玩家进出：core 发送 `PLAYER_ENTER` / `PLAYER_LEAVE`；region 在无玩家时进入沉睡（停止 tick），持续 30 秒后由 core 发送 `REGION_UNLOAD` 卸载。
 5. 区块数据：core 收到客户端进入时向所在 region 发 `CHUNK_REQUEST`，region 从 `lib/anvil` 读取或 flat 生成后返回 `CHUNK_DATA`（网络序列化），core 转发给客户端；改动经 `lib/anvil` 写回 `.mca`。
+6. switch 异常退出/扩容重启时，既有 Frontend 在下一次 touch/send 时自动重注册；region 侧由 `send_retry` 对 BUSY/FULL/AGAIN 短退避重试。
 
 ## 错误处理
 
 - 帧长度不符 / 未知 kind：接收方丢弃并记录计数。
 - 心跳超时（默认 5 秒）：core 视 region 失联，回收其租约并重启 region 进程。
 - region 非正常退出：core 从注册表摘除并告警，不自动重启（避免风暴）；由显式操作或玩家需求重新拉起。
+- switch 残留：交互式 `Ctrl+C`（SIGINT 到整个前台进程组）会同时终止 core 与
+  switch；若单独 `kill <core_pid>`（SIGTERM），switch 会成为孤儿进程并持有
+  共享内存，需 `pkill -f datarouter-switch` 清理（下一次 core 启动会探测到
+  同名 switch 并复用，或按 `AlreadyRunning` 处理）。

@@ -25,6 +25,8 @@ pub struct RegionConfig {
     pub world_dir: PathBuf,
     /// datarouter 共享内存名。
     pub shm_name: String,
+    /// switch 鉴权令牌（`ICBM_DATAROUTER_TOKEN`），未启用时为 `None`。
+    pub auth_token: Option<String>,
 }
 
 /// region 服务错误。
@@ -161,11 +163,16 @@ pub struct RegionService {
 }
 
 impl RegionService {
-    /// 每 tick 最多发送的区块数（约 416KB/批，远小于 channel 容量）。
+    /// 每 tick 最多发送的区块数（8 × 约 42KB ≈ 336KB < 512KiB 单帧上限；
+    /// 仍保留分批发送作流控，避免瞬时占满 channel 影响心跳）。
     const CHUNKS_PER_TICK: usize = 8;
     /// 新建服务（连接 datarouter、打开存档）。
     pub fn new(config: RegionConfig) -> Result<Self, RegionError> {
-        let ipc = Ipc::connect(&config.shm_name, &config.id.service_name())?;
+        let ipc = Ipc::connect(
+            &config.shm_name,
+            &config.id.service_name(),
+            config.auth_token.clone(),
+        )?;
         let store = ChunkStore::open(&config.world_dir, config.id)?;
         Ok(Self {
             config,
@@ -289,8 +296,11 @@ impl RegionService {
     }
 
     /// 排空 IPC 消息队列并处理。
+    ///
+    /// 注意：`Frontend::recv` 会把超时 0 归一化为 `recv_timeout_ms`（默认 3000ms），
+    /// `recv(0)` 会阻塞 3 秒并拖垮 20 TPS 循环；此处用 1ms 实现真正的非阻塞轮询。
     fn drain_messages(&mut self) -> Result<(), RegionError> {
-        while let Some(message) = self.ipc.recv(0)? {
+        while let Some(message) = self.ipc.recv(1)? {
             self.handle_message(&message)?;
             if !self.running {
                 return Ok(());

@@ -5,6 +5,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
+use blinkcms_datarouter::switch_frontend::{SwitchConfig, SwitchError, SwitchHandle};
 use icbm_anvil::level::{LevelData, write_level_dat};
 use icbm_mc_767::packets::play::clientbound::{CChunkBatchFinished, CChunkBatchStart};
 use icbm_mc_767::packets::play_ids;
@@ -27,6 +28,8 @@ pub enum ServerError {
     Io(std::io::Error),
     /// datarouter IPC 错误。
     Ipc(IpcError),
+    /// switch 拉起/鉴权失败。
+    Switch(SwitchError),
     /// level.dat 错误。
     Level(icbm_anvil::level::LevelError),
 }
@@ -36,6 +39,7 @@ impl std::fmt::Display for ServerError {
         match self {
             Self::Io(err) => write!(f, "io: {err}"),
             Self::Ipc(err) => write!(f, "ipc: {err}"),
+            Self::Switch(err) => write!(f, "switch: {err}"),
             Self::Level(err) => write!(f, "level: {err}"),
         }
     }
@@ -55,6 +59,12 @@ impl From<IpcError> for ServerError {
     }
 }
 
+impl From<SwitchError> for ServerError {
+    fn from(value: SwitchError) -> Self {
+        Self::Switch(value)
+    }
+}
+
 impl From<icbm_anvil::level::LevelError> for ServerError {
     fn from(value: icbm_anvil::level::LevelError) -> Self {
         Self::Level(value)
@@ -67,6 +77,10 @@ pub struct ServerInner {
     pub config: ServerConfig,
     /// core 的 datarouter 前端。
     pub ipc: Ipc,
+    /// 嵌入式 `datarouter-switch`（core 拉起并持有；外部 switch 时为空）。
+    /// 仅靠 Drop 终止 switch 进程，故无读取点，标记为 allowed。
+    #[allow(dead_code)]
+    switch: Option<SwitchHandle>,
     /// 世界状态。
     pub world: Mutex<WorldState>,
     /// 运行标志。
@@ -97,13 +111,18 @@ impl Server {
             )?;
             info!("created level.dat");
         }
-        let ipc = Ipc::connect(&config.shm_name, "icbm.core")?;
+        let auth_token = std::env::var("ICBM_DATAROUTER_TOKEN")
+            .ok()
+            .filter(|token| !token.is_empty());
+        let switch = start_switch(&config, auth_token.clone())?;
+        let ipc = Ipc::connect(&config.shm_name, "icbm.core", auth_token)?;
         info!("connected to datarouter {}", config.shm_name);
         let world = Mutex::new(WorldState::new(config.world_dir.clone()));
         Ok(Self {
             inner: Arc::new(ServerInner {
                 config,
                 ipc,
+                switch,
                 world,
                 running: AtomicBool::new(true),
                 chunk_diag: std::sync::atomic::AtomicU64::new(0),
@@ -206,6 +225,43 @@ impl std::ops::Deref for Server {
 
     fn deref(&self) -> &Self::Target {
         &self.inner
+    }
+}
+
+/// 拉起嵌入式 `datarouter-switch`。
+///
+/// 新 datarouter 把 switch 二进制以 `include_bytes!` 嵌入本可执行文件；core 启动时
+/// 直接 spawn（memfd 内存执行），不再需要操作者预先运行 switch。若同名 switch 已在
+/// 运行（外部部署的旧工作流），则复用它并继续（不持有句柄）。
+fn start_switch(
+    config: &ServerConfig,
+    auth_token: Option<String>,
+) -> Result<Option<SwitchHandle>, ServerError> {
+    let switch_config = SwitchConfig {
+        shm_name: config.shm_name.clone(),
+        mode: 0o600,
+        ttl_ms: 5000,
+        // core + 若干 region（Phase 1 预计 1-2 个），留出扩容余量。
+        max_ports: 8,
+        // region 服务名动态（`icbm.region.<id>`），allowlist 无法穷举。
+        allow_any: true,
+        token: auth_token,
+        reap_dead_processes: true,
+        ..SwitchConfig::default()
+    };
+    match SwitchHandle::start(switch_config) {
+        Ok(switch) => {
+            info!("embedded datarouter-switch started on {}", config.shm_name);
+            Ok(Some(switch))
+        }
+        Err(SwitchError::AlreadyRunning(name)) => {
+            warn!(
+                %name,
+                "switch already running externally, reusing it"
+            );
+            Ok(None)
+        }
+        Err(err) => Err(ServerError::Switch(err)),
     }
 }
 
