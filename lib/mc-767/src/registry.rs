@@ -37,6 +37,8 @@ pub mod names {
     pub const OAK_PLANKS: &str = "minecraft:oak_planks";
     /// 圆石。
     pub const COBBLESTONE: &str = "minecraft:cobblestone";
+    /// 下界传送门方块。
+    pub const NETHER_PORTAL: &str = "minecraft:nether_portal";
 }
 
 use crate::packets::play::block_state_ids as ids;
@@ -60,6 +62,7 @@ pub const fn state_id_to_name(id: i32) -> Option<&'static str> {
         ids::OAK_LOG => Some(names::OAK_LOG),
         ids::OAK_PLANKS => Some(names::OAK_PLANKS),
         ids::COBBLESTONE => Some(names::COBBLESTONE),
+        ids::NETHER_PORTAL => Some(names::NETHER_PORTAL),
         _ => None,
     }
 }
@@ -83,6 +86,7 @@ pub fn name_to_state_id(name: &str) -> Option<i32> {
         names::OAK_LOG => Some(ids::OAK_LOG),
         names::OAK_PLANKS => Some(ids::OAK_PLANKS),
         names::COBBLESTONE => Some(ids::COBBLESTONE),
+        names::NETHER_PORTAL => Some(ids::NETHER_PORTAL),
         _ => None,
     }
 }

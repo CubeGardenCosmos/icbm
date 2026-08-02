@@ -45,6 +45,12 @@ pub mod kind {
     pub const ENTITY_DATA: u8 = 0x0A;
     /// C→R：方块修改（`setblock`/`fill`：`[u8 dim][i32 x][i32 y][i32 z][i32 state_id]`）。
     pub const BLOCK_UPDATE: u8 = 0x0B;
+    /// R→C：玩家进入传送门（`[uuid 16B][u8 dim][i32 x][i32 y][i32 z]`）。
+    pub const PORTAL_ENTER: u8 = 0x0C;
+    /// C→R：方块查询（`[u8 dim][i32 x][i32 y][i32 z]` → `BLOCK_QUERY_RESP`）。
+    pub const BLOCK_QUERY: u8 = 0x0D;
+    /// R→C：方块查询响应（`[u8 dim][i32 x][i32 y][i32 z][i32 state_id]`）。
+    pub const BLOCK_QUERY_RESP: u8 = 0x8D;
 }
 
 /// IPC 错误。
@@ -426,6 +432,81 @@ pub fn decode_block_update(body: &[u8]) -> Result<(u8, i32, i32, i32, i32), IpcE
     ))
 }
 
+/// `PORTAL_ENTER` 载荷：`[uuid 16B][u8 dim][i32 x][i32 y][i32 z]`。
+#[must_use]
+pub fn encode_portal_enter(uuid: &Uuid, dim: u8, x: i32, y: i32, z: i32) -> Vec<u8> {
+    let mut out = Vec::with_capacity(29);
+    out.extend_from_slice(uuid.as_bytes());
+    out.push(dim);
+    out.extend_from_slice(&x.to_le_bytes());
+    out.extend_from_slice(&y.to_le_bytes());
+    out.extend_from_slice(&z.to_le_bytes());
+    out
+}
+
+/// 解析 `PORTAL_ENTER` 载荷。
+pub fn decode_portal_enter(body: &[u8]) -> Result<(Uuid, u8, i32, i32, i32), IpcError> {
+    if body.len() < 29 {
+        return Err(IpcError::Length("portal enter", body.len()));
+    }
+    let mut uuid_bytes = [0u8; 16];
+    uuid_bytes.copy_from_slice(&body[0..16]);
+    Ok((
+        Uuid::from_bytes(uuid_bytes),
+        body[16],
+        i32::from_le_bytes(body[17..21].try_into().expect("slice")),
+        i32::from_le_bytes(body[21..25].try_into().expect("slice")),
+        i32::from_le_bytes(body[25..29].try_into().expect("slice")),
+    ))
+}
+
+/// `BLOCK_QUERY` 载荷：`[u8 dim][i32 x][i32 y][i32 z]`。
+#[must_use]
+pub fn encode_block_query(dim: u8, x: i32, y: i32, z: i32) -> Vec<u8> {
+    let mut out = Vec::with_capacity(13);
+    out.push(dim);
+    out.extend_from_slice(&x.to_le_bytes());
+    out.extend_from_slice(&y.to_le_bytes());
+    out.extend_from_slice(&z.to_le_bytes());
+    out
+}
+
+/// 解析 `BLOCK_QUERY` 载荷。
+pub fn decode_block_query(body: &[u8]) -> Result<(u8, i32, i32, i32), IpcError> {
+    if body.len() < 13 {
+        return Err(IpcError::Length("block query", body.len()));
+    }
+    Ok((
+        body[0],
+        i32::from_le_bytes(body[1..5].try_into().expect("slice")),
+        i32::from_le_bytes(body[5..9].try_into().expect("slice")),
+        i32::from_le_bytes(body[9..13].try_into().expect("slice")),
+    ))
+}
+
+/// `BLOCK_QUERY_RESP` 载荷：`[u8 dim][i32 x][i32 y][i32 z][i32 state_id]`。
+#[must_use]
+pub fn encode_block_query_resp(dim: u8, x: i32, y: i32, z: i32, state_id: i32) -> Vec<u8> {
+    let mut out = encode_block_query(dim, x, y, z);
+    out.extend_from_slice(&state_id.to_le_bytes());
+    out
+}
+
+/// 解析 `BLOCK_QUERY_RESP` 载荷。
+pub fn decode_block_query_resp(body: &[u8]) -> Result<(u8, i32, i32, i32, i32), IpcError> {
+    let (dim, x, y, z) = decode_block_query(body)?;
+    if body.len() < 17 {
+        return Err(IpcError::Length("block query resp", body.len()));
+    }
+    Ok((
+        dim,
+        x,
+        y,
+        z,
+        i32::from_le_bytes(body[13..17].try_into().expect("slice")),
+    ))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -493,6 +574,15 @@ mod tests {
         let body = encode_block_update(DIM_OVERWORLD, 12, 64, -8, 9);
         let (dim, x, y, z, state) = decode_block_update(&body).unwrap();
         assert_eq!((dim, x, y, z, state), (DIM_OVERWORLD, 12, 64, -8, 9));
+    }
+
+    #[test]
+    fn portal_enter_round_trip() {
+        let uuid = Uuid::from_u128(0x1122_3344_5566_7788_99aa_bbcc_ddee_ff00);
+        let body = encode_portal_enter(&uuid, DIM_NETHER, 3, 64, -8);
+        let (decoded, dim, x, y, z) = decode_portal_enter(&body).unwrap();
+        assert_eq!(decoded, uuid);
+        assert_eq!((dim, x, y, z), (DIM_NETHER, 3, 64, -8));
     }
 
     #[test]

@@ -393,7 +393,76 @@ fn update_position(
             }
         }
     }
+    // 传送门检测（节流：约每 0.5 秒一次，避免每 tick 查询 region）
+    check_portal_entry(server, client)?;
     Ok(())
+}
+
+/// 检测玩家是否站在下界传送门方块上；是则执行维度切换。
+///
+/// 查询玩家脚下方块（经 IPC 到所在 region）；传送门方块触发 1:8 缩放传送。
+fn check_portal_entry(server: &Server, client: &Arc<Client>) -> Result<(), NetError> {
+    // 节流：每 10 tick（0.5 秒）查询一次
+    if client.last_portal_check.lock().expect("portal check").elapsed()
+        < Duration::from_millis(500)
+    {
+        return Ok(());
+    }
+    let uuid = *client.uuid.lock().expect("uuid");
+    let in_region = server
+        .world
+        .lock()
+        .expect("world lock")
+        .player_regions
+        .contains_key(&uuid);
+    if !in_region {
+        return Ok(()); // 虚拟区（Y>400）不检测
+    }
+    let (bx, by, bz) = {
+        let position = client.position.lock().expect("position");
+        (position.x.floor() as i32, position.y.floor() as i32, position.z.floor() as i32)
+    };
+    let region_id = RegionId::from_overworld_chunk(bx.div_euclid(16), bz.div_euclid(16));
+    // 查询脚下与脚下-1 方块
+    for probe_y in [by, by - 1] {
+        server.ipc.send(
+            &region_id.service_name(),
+            icbm_region::protocol::kind::BLOCK_QUERY,
+            &icbm_region::protocol::encode_block_query(
+                icbm_region::protocol::DIM_OVERWORLD,
+                bx,
+                probe_y,
+                bz,
+            ),
+        )?;
+    }
+    // 等待响应（receiver 线程处理 BLOCK_QUERY_RESP 后设置标记）
+    let deadline = Instant::now() + Duration::from_millis(200);
+    let mut found = false;
+    while Instant::now() < deadline {
+        let pending = client.pending_portal_block.load(Ordering::Relaxed);
+        if pending != -1 {
+            found = pending == 5864 || pending == 5865; // nether_portal axis=x/z
+            client.pending_portal_block.store(-1, Ordering::Relaxed);
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(5));
+    }
+    if !found {
+        *client.last_portal_check.lock().expect("portal check") = Instant::now();
+        return Ok(());
+    }
+    // 触发维度切换：主世界 → 地狱（1:8 缩放），地狱 → 主世界
+    let dimension = client.dimension.load(Ordering::Relaxed);
+    let (nx, ny, nz) = if dimension == 0 {
+        (bx as f64 / 8.0, by as f64, bz as f64 / 8.0)
+    } else {
+        (bx as f64 * 8.0, by as f64, bz as f64 * 8.0)
+    };
+    let target = u8::from(dimension == 0);
+    let result = switch_dimension(server, client, target, nx, ny, nz);
+    *client.last_portal_check.lock().expect("portal check") = Instant::now();
+    result
 }
 
 /// 玩家传送：设置新位置并处理跨 region 迁移（`/tp` 命令用）。
@@ -427,6 +496,125 @@ pub fn update_position_for_teleport(
         .encode(w);
     })?;
     client.reset_move_baseline();
+    Ok(())
+}
+
+/// 维度切换（下界传送门）：`CRespawn` + 更新位置 + 重请求视野区块。
+///
+/// 目标坐标按 1:8 缩放（主世界 ↔ 地狱）；`dimension` 为 0（主世界）或 1（地狱）。
+pub fn switch_dimension(
+    server: &Server,
+    client: &Arc<Client>,
+    dimension: u8,
+    x: f64,
+    y: f64,
+    z: f64,
+) -> Result<(), NetError> {
+    use icbm_mc_767::packets::play::clientbound::{CRespawn, PlayerSpawnData};
+    use icbm_mc_767::packets::play::dimension_names;
+    use icbm_mc_767::packets::play::dimension_type_ids;
+    let current = client.dimension.load(Ordering::Relaxed);
+    if current == dimension {
+        return Ok(()); // 已在目标维度
+    }
+    // 更新服务端位置（先处理跨 region 迁移）
+    update_position(server, client, |pos| {
+        pos.x = x;
+        pos.y = y;
+        pos.z = z;
+    })?;
+    // 发送 CRespawn（维度切换）
+    let spawn_data = PlayerSpawnData {
+        dimension_type: if dimension == 1 {
+            dimension_type_ids::THE_NETHER
+        } else {
+            dimension_type_ids::OVERWORLD
+        },
+        dimension_name: if dimension == 1 {
+            dimension_names::THE_NETHER.to_owned()
+        } else {
+            dimension_names::OVERWORLD.to_owned()
+        },
+        hashed_seed: 0,
+        game_mode: client.gamemode.lock().expect("gamemode").id(),
+        previous_gamemode: -1,
+        is_debug: false,
+        is_flat: true,
+        death_dimension: None,
+        portal_cooldown: 10,
+    };
+    let respawn = CRespawn {
+        spawn_data,
+        data_kept: CRespawn::KEEP_ATTRIBUTES | CRespawn::KEEP_TRACKED_DATA,
+    };
+    client.send_encoded(CRespawn::packet_id(), |w| {
+        respawn.encode(w);
+    })?;
+    client.dimension.store(dimension, Ordering::Relaxed);
+    // 位置同步
+    let teleport_id = client.next_teleport_id();
+    client.send_encoded(CPlayerPosition::packet_id(), |w| {
+        CPlayerPosition {
+            x,
+            y,
+            z,
+            yaw: client.position.lock().expect("position").yaw,
+            pitch: client.position.lock().expect("position").pitch,
+            flags: 0,
+            teleport_id,
+        }
+        .encode(w);
+    })?;
+    // 重请求视野区块（地狱维度：请求地狱区块）
+    request_dimension_chunks(server, client, dimension)?;
+    client.reset_move_baseline();
+    Ok(())
+}
+
+/// 请求当前维度的视野区块（维度切换后重发）。
+fn request_dimension_chunks(
+    server: &Server,
+    client: &Arc<Client>,
+    dimension: u8,
+) -> Result<(), NetError> {
+    let (chunk_x, chunk_z) = {
+        let position = client.position.lock().expect("position");
+        (position.chunk_x(), position.chunk_z())
+    };
+    let radius = effective_view_distance(server);
+    let side = 2 * radius + 1;
+    let total = usize::try_from(side).expect("radius").pow(2);
+    {
+        let mut world = server.world.lock().expect("world lock");
+        let _ = world.chunk_pending.insert(ChunkPending {
+            player: *client.uuid.lock().expect("uuid"),
+            total,
+            received: 0,
+            in_batch: false,
+            min_x: chunk_x - radius,
+            max_x: chunk_x + radius,
+            min_z: chunk_z - radius,
+            max_z: chunk_z + radius,
+        });
+    }
+    // 地狱维度：请求所属 region 的地狱面区块
+    if dimension == 1 {
+        let region_id = icbm_region::RegionId::from_nether_chunk(chunk_x, chunk_z);
+        server.ensure_region(region_id)?;
+        server.ipc.send(
+            &region_id.service_name(),
+            icbm_region::protocol::kind::CHUNK_REQUEST,
+            &icbm_region::protocol::encode_chunk_request(
+                icbm_region::protocol::DIM_NETHER,
+                chunk_x,
+                chunk_z,
+                radius,
+            ),
+        )?;
+    } else {
+        // 主世界：现有请求路径
+        request_chunks_around(server, client, chunk_x, chunk_z)?;
+    }
     Ok(())
 }
 

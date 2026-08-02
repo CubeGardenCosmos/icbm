@@ -12,9 +12,10 @@ use tracing::{debug, error, info, warn};
 use uuid::Uuid;
 
 use crate::protocol::{
-    CORE_SERVICE, DIM_OVERWORLD, Ipc, IpcError, IpcMessage, decode_block_update,
-    decode_chunk_request, decode_player_enter, decode_player_leave, decode_register_ack,
-    encode_chunk_data, encode_entity_data, encode_heartbeat, encode_register, encode_stats, kind,
+    CORE_SERVICE, DIM_OVERWORLD, Ipc, IpcError, IpcMessage, decode_block_query,
+    decode_block_query_resp, decode_block_update, decode_chunk_request, decode_player_enter,
+    decode_player_leave, decode_register_ack, encode_block_query_resp, encode_chunk_data,
+    encode_entity_data, encode_heartbeat, encode_register, encode_stats, kind,
 };
 use crate::store::ChunkStore;
 use crate::{Face, RegionId};
@@ -215,7 +216,12 @@ impl RegionService {
         z: i32,
         state_id: i32,
     ) -> Result<(), RegionError> {
+        use icbm_mc_767::packets::play::block_state_ids;
         self.store.set_block(face, x, y, z, state_id)?;
+        // 放置黑曜石：检测是否构成 4×5 传送门框架，构成则填充传送门方块
+        if face == Face::Overworld && state_id == block_state_ids::OBSIDIAN {
+            self.try_build_portal(x, y, z)?;
+        }
         // TNT 方块放置：生成 TNT 实体（`minecraft:tnt`），不保留方块（vanilla
         // 放置即点火；此处放置即视为已放置方块并生成实体）
         if face == Face::Overworld && state_id == 2095 {
@@ -249,12 +255,75 @@ impl RegionService {
         Ok(())
     }
 
+    /// 黑曜石放置后检查 4×5 传送门框架（两种朝向），构成则填充传送门方块并广播。
+    fn try_build_portal(&mut self, x: i32, y: i32, z: i32) -> Result<(), RegionError> {
+        use crate::portal::{PortalAxis, detect_portal_frame, portal_state};
+        use icbm_mc_767::packets::play::block_state_ids;
+        // 先快照检测窗口内方块（避免闭包持 &mut store 与 set_block 冲突）
+        let snapshot: std::collections::HashMap<(i32, i32, i32), i32> = {
+            let mut map = std::collections::HashMap::new();
+            for by in (y - 4)..=(y + 4) {
+                for bx in (x - 4)..=(x + 4) {
+                    for bz in (z - 4)..=(z + 4) {
+                        let state = self
+                            .store
+                            .block_at(Face::Overworld, bx, by, bz)
+                            .unwrap_or(0);
+                        map.insert((bx, by, bz), state);
+                    }
+                }
+            }
+            map
+        };
+        let lookup = |bx: i32, by: i32, bz: i32| {
+            snapshot.get(&(bx, by, bz)).copied().unwrap_or(0)
+        };
+        // 该黑曜石可能属于两种朝向的框架左下角/右下角等位置；简化：从放置点
+        // 作为左下角检测两种朝向，并向上/向左平移若干格再试（覆盖柱位）
+        for (axis, dx, dz) in [
+            (PortalAxis::X, 0, 0),
+            (PortalAxis::Z, 0, 0),
+            (PortalAxis::X, -1, 0),
+            (PortalAxis::Z, 0, -1),
+        ] {
+            let base_x = x + dx;
+            let base_z = z + dz;
+            for bottom in (y - 4)..=y {
+                let Some(fill) = detect_portal_frame(base_x, base_z, bottom, axis, &lookup)
+                else {
+                    continue;
+                };
+                // 填充传送门方块
+                let state = portal_state(axis);
+                for (fx, fy, fz) in &fill {
+                    if self
+                        .store
+                        .set_block(Face::Overworld, *fx, *fy, *fz, state)
+                        .is_ok()
+                    {
+                        let packet =
+                            icbm_mc_767::packets::play::clientbound::CBlockUpdate {
+                                position: icbm_mc_767::packets::play::BlockPos::new(*fx, *fy, *fz),
+                                state_id: state,
+                            };
+                        self.send_entity_packet(play_ids::CLIENTBOUND_BLOCK_UPDATE, |w| {
+                            packet.encode(w);
+                        })?;
+                    }
+                }
+                return Ok(());
+            }
+        }
+        Ok(())
+    }
+
     /// 流体 tick：对已加载区块内水/岩浆执行扩散（简化模型），更新与广播。
     ///
     /// 每 tick 检查已加载区块列（高度范围），收集扩散更新后统一写入并广播
     /// `CBlockUpdate`（避免 tick 中多次借锁）。
     fn tick_fluids(&mut self) -> Result<(), RegionError> {
-        let chunks = self.store.loaded_overworld_chunks();
+        // 只遍历含流体的区块（脏区块跟踪，避免每 tick 全量扫描 384 高度）
+        let chunks = self.store.dirty_overworld_chunks();
         if chunks.is_empty() {
             return Ok(());
         }
@@ -262,7 +331,6 @@ impl RegionService {
         for (cx, cz) in chunks {
             let min_x = cx * 16;
             let min_z = cz * 16;
-            // flat 世界高度范围（-64..319，与生成一致）；只查非空气层（地表附近）
             let mut pending: Vec<(i32, i32, i32, i32)> = Vec::new();
             let store = &mut self.store;
             crate::fluids::tick_fluid(
@@ -479,6 +547,18 @@ impl RegionService {
                 info!(id = %self.config.id.service_name(), "unload requested, flushing");
                 self.store.flush()?;
                 self.running = false;
+            }
+            kind::BLOCK_QUERY => {
+                let (dim, x, y, z) = decode_block_query(&message.body)?;
+                let Some(face) = Face::from_byte(dim) else {
+                    return Err(RegionError::InvalidMessage(format!("bad dim {dim}")));
+                };
+                let state = self.store.block_at(face, x, y, z).unwrap_or(0);
+                self.ipc.send(
+                    CORE_SERVICE,
+                    kind::BLOCK_QUERY_RESP,
+                    &encode_block_query_resp(dim, x, y, z, state),
+                )?;
             }
             kind::BLOCK_UPDATE => {
                 let (dim, x, y, z, state_id) = decode_block_update(&message.body)?;

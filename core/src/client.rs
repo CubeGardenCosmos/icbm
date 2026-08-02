@@ -148,6 +148,8 @@ pub struct Client {
     pub chunk_center: Mutex<(i32, i32)>,
     /// 可视距离。
     pub view_distance: AtomicI32,
+    /// 当前维度（0=主世界，1=地狱，2=末地）。
+    pub dimension: AtomicU8,
     /// 是否存活（连接可继续）。
     pub alive: AtomicBool,
     /// 待确认的 keep alive。
@@ -170,6 +172,10 @@ pub struct Client {
     write_cipher: Mutex<Option<AesCfb8>>,
     /// 登录 verify token（`CEncryptionRequest` 发出时生成，回包时比对）。
     verify_token: Mutex<Option<Vec<u8>>>,
+    /// 上次传送门检测时间（节流用）。
+    pub last_portal_check: Mutex<Instant>,
+    /// 待消费的传送门检测结果（`BLOCK_QUERY_RESP` 写入；-1 = 无）。
+    pub pending_portal_block: std::sync::atomic::AtomicI32,
 }
 
 const STATE_HANDSHAKE: u8 = 0;
@@ -209,6 +215,7 @@ impl Client {
             )),
             chunk_center: Mutex::new((0, 0)),
             view_distance: AtomicI32::new(8),
+            dimension: AtomicU8::new(0),
             alive: AtomicBool::new(true),
             keep_alive: Mutex::new(None),
             teleport_id: AtomicI32::new(0),
@@ -220,6 +227,8 @@ impl Client {
             encryption_key: Mutex::new(None),
             write_cipher: Mutex::new(None),
             verify_token: Mutex::new(None),
+            last_portal_check: Mutex::new(Instant::now()),
+            pending_portal_block: std::sync::atomic::AtomicI32::new(-1),
         })
     }
 

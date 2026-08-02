@@ -7,6 +7,7 @@
 pub mod entities;
 pub mod fluids;
 pub mod mobs;
+pub mod portal;
 pub mod protocol;
 pub mod service;
 pub mod store;

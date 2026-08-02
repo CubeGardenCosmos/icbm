@@ -82,6 +82,8 @@ pub mod block_state_ids {
     pub const OAK_PLANKS: i32 = 15;
     /// 圆石。
     pub const COBBLESTONE: i32 = 14;
+    /// 下界传送门方块（axis=x，默认态）。
+    pub const NETHER_PORTAL: i32 = 5864;
 }
 
 /// 1.21.1 生物群系网络 ID（icbm 服务器自定义注册表顺序）。

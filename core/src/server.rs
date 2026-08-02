@@ -13,8 +13,9 @@ use icbm_mc_767::packets::play::clientbound::{
 use icbm_mc_767::packets::play_ids;
 use icbm_region::RegionId;
 use icbm_region::protocol::{
-    DIM_OVERWORLD, Ipc, IpcError, decode_chunk_data, decode_entity_data, decode_heartbeat,
-    decode_register, encode_register_ack, encode_unload, kind,
+    DIM_OVERWORLD, Ipc, IpcError, decode_block_query_resp, decode_chunk_data,
+    decode_entity_data, decode_heartbeat, decode_register, encode_register_ack, encode_unload,
+    kind,
 };
 use tracing::{info, trace, warn};
 
@@ -523,6 +524,28 @@ fn handle_core_message(server: &Server, message: &icbm_region::protocol::IpcMess
         }
         kind::CHUNK_DATA => forward_chunk_data(server, &message.body),
         kind::ENTITY_DATA => forward_entity_data(server, &message.body),
+        kind::BLOCK_QUERY_RESP => {
+            if let Ok((_dim, x, y, z, state)) = decode_block_query_resp(&message.body) {
+                // 找到查询该位置的玩家（简化：仅限最近查询传送门的玩家——
+                // 通过遍历玩家位置匹配）
+                let players: Vec<Arc<crate::client::Client>> = {
+                    let world = server.world.lock().expect("world lock");
+                    world.players.values().cloned().collect()
+                };
+                for player in players {
+                    let pos = player.position.lock().expect("position");
+                    let px = pos.x.floor() as i32;
+                    let py = pos.y.floor() as i32;
+                    let pz = pos.z.floor() as i32;
+                    let matches = (px == x && pz == z) && (py == y || py - 1 == y);
+                    drop(pos);
+                    if matches {
+                        player.pending_portal_block.store(state, Ordering::Relaxed);
+                        break;
+                    }
+                }
+            }
+        }
         kind::REGION_STATS_RESP => {
             // Phase 1：心跳已含统计；统计响应暂不消费
         }

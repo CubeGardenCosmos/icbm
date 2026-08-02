@@ -66,6 +66,8 @@ pub struct ChunkStore {
     overworld: HashMap<(i32, i32), ChunkColumn>,
     nether: HashMap<(i32, i32), ChunkColumn>,
     loaded: u32,
+    /// 被 `set_block` 修改的主世界区块（流体 tick 用，处理后清空）。
+    dirty: std::collections::HashSet<(i32, i32)>,
 }
 
 impl ChunkStore {
@@ -81,6 +83,7 @@ impl ChunkStore {
             overworld: HashMap::new(),
             nether: HashMap::new(),
             loaded: 0,
+            dirty: std::collections::HashSet::new(),
         })
     }
 
@@ -231,6 +234,9 @@ impl ChunkStore {
         if !ok {
             return Err(StoreError::NotOwned("set_block out of range", cx, cz));
         }
+        if face == Face::Overworld {
+            self.dirty.insert((cx, cz));
+        }
         Ok((cx, cz))
     }
 
@@ -251,6 +257,13 @@ impl ChunkStore {
     #[must_use]
     pub fn loaded_overworld_chunks(&self) -> Vec<(i32, i32)> {
         self.overworld.keys().copied().collect()
+    }
+
+    /// 被 `set_block` 修改的主世界区块（流体 tick 用），并清空脏标记。
+    pub fn dirty_overworld_chunks(&mut self) -> Vec<(i32, i32)> {
+        let chunks: Vec<(i32, i32)> = self.dirty.iter().copied().collect();
+        self.dirty.clear();
+        chunks
     }
 }
 

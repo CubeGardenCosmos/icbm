@@ -558,13 +558,20 @@ fn creeper_spawns_in_region() {
     join_to_play(&mut client);
     client.recv_until(play_ids::CLIENTBOUND_CHUNK_BATCH_FINISHED, "initial batch");
 
-    // 每 tick 1/120 概率，30 秒内生成概率 >99%；超时视为失败
+    // 每 tick 1/120 概率，30 秒内生成概率 >99%；超时视为失败。
+    // 友好生物也可能先于 Creeper 生成：跳过非 Creeper 的 ADD_ENTITY。
     let deadline = Instant::now() + Duration::from_secs(30);
     let add = loop {
         assert!(Instant::now() < deadline, "no creeper spawned within 30s");
         let (id, payload) = client.recv();
         if id == play_ids::CLIENTBOUND_ADD_ENTITY {
-            break payload;
+            let mut probe = Reader::new(&payload);
+            let _entity_id = probe.read_var_int().unwrap();
+            let _uuid = probe.read_uuid().unwrap();
+            let entity_type = probe.read_var_int().unwrap();
+            if entity_type == 23 {
+                break payload;
+            }
         }
     };
     let mut r = Reader::new(&add);
