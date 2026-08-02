@@ -161,16 +161,14 @@ impl ChunkStore {
         cx: i32,
         cz: i32,
     ) -> Result<Vec<u8>, StoreError> {
-        let column = self.get_chunk(face, cx, cz)?;
-        let heights = column.heightmap_heights();
-        let mut sections = Vec::with_capacity(column.sections.len());
-        for section in &column.sections {
-            sections.push(ChunkSection::from_block_ids(section, column.biome_id));
-        }
-        let packet = CLevelChunkWithLight::flat(cx, cz, heights, sections);
-        let mut writer = Writer::new();
-        packet.encode(&mut writer);
-        Ok(writer.into_bytes())
+        let column = match self.check_owned(face, cx, cz) {
+            Ok(()) => self.get_chunk(face, cx, cz)?.clone(),
+            Err(_) => match face {
+                Face::Overworld => generate_chunk(GenDimension::Overworld, cx, cz),
+                Face::Nether => generate_chunk(GenDimension::Nether, cx, cz),
+            },
+        };
+        Ok(build_network_chunk(&column))
     }
 
     /// 落盘主世界 .mca（卸载前调用）。
@@ -288,6 +286,19 @@ pub fn biome_id(name: &str) -> i32 {
     }
 }
 
+/// 构建网络区块载荷。
+fn build_network_chunk(column: &ChunkColumn) -> Vec<u8> {
+    let heights = column.heightmap_heights();
+    let mut sections = Vec::with_capacity(column.sections.len());
+    for section in &column.sections {
+        sections.push(ChunkSection::from_block_ids(section, column.biome_id));
+    }
+    let packet = CLevelChunkWithLight::flat(column.x, column.z, heights, sections);
+    let mut writer = Writer::new();
+    packet.encode(&mut writer);
+    writer.into_bytes()
+}
+
 /// 维度字节 → 生成维度。
 #[must_use]
 pub const fn gen_dimension(dim_byte: u8) -> GenDimension {
@@ -332,15 +343,16 @@ mod tests {
     }
 
     #[test]
-    fn store_rejects_unowned_chunk() {
+    fn store_serves_unowned_chunk_without_caching() {
         let dir = temp_world("reject");
         let id = RegionId { rx: 0, rz: 0 };
         let mut store = ChunkStore::open(&dir, id).unwrap();
-        assert!(
-            store
-                .network_chunk_payload(Face::Overworld, 100, 100)
-                .is_err()
-        );
+        // 区域外区块可临时生成读取（不缓存、不计数）
+        let payload = store
+            .network_chunk_payload(Face::Overworld, 100, 100)
+            .unwrap();
+        assert!(payload.len() > 100);
+        assert_eq!(store.loaded_count(), 0);
         std::fs::remove_dir_all(&dir).unwrap();
     }
 

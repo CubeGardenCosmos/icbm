@@ -449,7 +449,7 @@ fn now_epoch_seconds() -> u32 {
 
 #[cfg(test)]
 mod tests {
-    use super::{CHUNK_COUNT, Compression, RegionFile, chunk_index, local_coord};
+    use super::{Compression, RegionFile, chunk_index, local_coord};
     use crate::chunk::{ChunkNbt, SectionNbt};
 
     fn sample_chunk(x: i32, z: i32) -> ChunkNbt {

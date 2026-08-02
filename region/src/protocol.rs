@@ -381,7 +381,6 @@ mod tests {
     }
 
     #[test]
-    #[test]
     fn player_enter_leave_round_trip() {
         let uuid = Uuid::from_u128(0x1122_3344_5566_7788_99aa_bbcc_ddee_ff00);
         let body = encode_player_enter(&uuid, [1.5, 64.0, -3.25], [90.0, 45.0]);
@@ -393,12 +392,14 @@ mod tests {
         assert_eq!(decode_player_leave(&leave).unwrap(), uuid);
     }
 
+    #[test]
     fn heartbeat_round_trip() {
         let body = encode_heartbeat(19.5, true, 7, 999);
         let (tps, sleeping, loaded, tick) = decode_heartbeat(&body).unwrap();
         assert_eq!((tps, sleeping, loaded, tick), (19.5, true, 7, 999));
     }
 
+    #[test]
     fn region_id_mapping() {
         let id = RegionId::from_overworld_chunk(100, -50);
         assert_eq!((id.rx, id.rz), (3, -2));
