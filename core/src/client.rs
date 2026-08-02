@@ -645,6 +645,7 @@ fn send_join_sequence(server: &Server, client: &Arc<Client>) -> Result<(), NetEr
         enable_respawn_screen: true,
         limited_crafting: false,
         spawn_data,
+        enforces_secure_chat: false,
     };
     client.send_encoded(
         icbm_mc_767::packets::play::clientbound::CLogin::packet_id(),

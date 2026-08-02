@@ -222,6 +222,8 @@ pub struct CLogin {
     pub limited_crafting: bool,
     /// 出生信息。
     pub spawn_data: PlayerSpawnData,
+    /// 强制安全聊天（开发约束：永不支持安全聊天，恒为 false）。
+    pub enforces_secure_chat: bool,
 }
 
 impl CLogin {
@@ -257,6 +259,7 @@ impl CLogin {
             None => writer.write_bool(false),
         }
         writer.write_var_int(self.spawn_data.portal_cooldown);
+        writer.write_bool(self.enforces_secure_chat);
     }
 
     /// 包 ID。
@@ -830,6 +833,7 @@ mod tests {
             reduced_debug_info: false,
             enable_respawn_screen: true,
             limited_crafting: false,
+            enforces_secure_chat: false,
             spawn_data: PlayerSpawnData {
                 dimension_type: 0,
                 dimension_name: "minecraft:overworld".to_owned(),
