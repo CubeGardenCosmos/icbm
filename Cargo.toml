@@ -1,0 +1,78 @@
+[workspace]
+resolver = "3"
+members = [
+    "core",
+    "region",
+    "gameplay/minecraft",
+    "gameplay/icbm",
+    "lib/anvil",
+    "lib/datarouter",
+    "lib/i18n",
+    "lib/mc-767",
+    "lib/terrain-gen",
+]
+
+[workspace.package]
+version = "0.1.0-dev+1.21.1"
+edition = "2024"
+license = "Proprietary"
+
+[workspace.lints.clippy]
+# 参考 master 分支收敛的 Clippy 基线
+all = { level = "deny", priority = -1 }
+nursery = { level = "deny", priority = -1 }
+pedantic = { level = "deny", priority = -1 }
+cargo = { level = "deny", priority = -1 }
+
+if_then_some_else_none = "deny"
+empty_enum_variants_with_brackets = "deny"
+empty_structs_with_brackets = "deny"
+separated_literal_suffix = "deny"
+semicolon_outside_block = "deny"
+redundant_test_prefix = "deny"
+non_zero_suggestions = "deny"
+dbg_macro = "deny"
+rc_buffer = "deny"
+verbose_file_reads = "deny"
+string_lit_chars_any = "deny"
+use_self = "deny"
+useless_let_if_seq = "deny"
+branches_sharing_code = "deny"
+equatable_if_let = "deny"
+option_if_let_else = "deny"
+needless_pass_by_ref_mut = "deny"
+needless_collect = "deny"
+redundant_clone = "deny"
+set_contains_or_insert = "deny"
+significant_drop_in_scrutinee = "deny"
+print_stdout = "deny"
+print_stderr = "deny"
+
+todo = "deny"
+unreachable = "deny"
+unimplemented = "deny"
+
+# Expected/Allowed（与 master 一致）
+cargo_common_metadata = "allow"
+cast_precision_loss = "allow"
+multiple_crate_versions = "allow"
+single_call_fn = "allow"
+similar_names = "allow"
+unreadable_literal = "allow"
+many_single_char_names = "allow"
+suboptimal_flops = "allow"
+cast_lossless = "allow"
+while_float = "allow"
+or_fun_call = "allow"
+significant_drop_tightening = "allow"
+suspicious_operation_groupings = "allow"
+literal_string_with_formatting_args = "allow"
+future_not_send = "allow"
+cast_sign_loss = "allow"
+float_cmp = "allow"
+cast_possible_truncation = "allow"
+cast_possible_wrap = "allow"
+missing_panics_doc = "allow"
+missing_errors_doc = "allow"
+module_name_repetitions = "allow"
+struct_excessive_bools = "allow"

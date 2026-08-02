@@ -1,0 +1,27 @@
+# === Rust ===
+target/
+debug/
+**/*.rs.bk
+*.pdb
+
+# === 运行时数据（不提交） ===
+run/
+world/
+logs/
+crash-reports/
+*.local.nbt
+icbm.toml
+
+# === Vanilla 服务器产物 ===
+ops.json
+whitelist.json
+banned-ips.json
+banned-players.json
+eula.txt
+server.properties
+usercache.json
+
+# === 编辑器/OS ===
+.vscode/settings.json
+.idea
+.DS_Store
