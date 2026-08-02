@@ -29,6 +29,14 @@ pub mod names {
     pub const NETHERRACK: &str = "minecraft:netherrack";
     /// 末地石。
     pub const END_STONE: &str = "minecraft:end_stone";
+    /// TNT（默认态 unstable=false）。
+    pub const TNT: &str = "minecraft:tnt";
+    /// 橡木原木。
+    pub const OAK_LOG: &str = "minecraft:oak_log";
+    /// 橡木木板。
+    pub const OAK_PLANKS: &str = "minecraft:oak_planks";
+    /// 圆石。
+    pub const COBBLESTONE: &str = "minecraft:cobblestone";
 }
 
 use crate::packets::play::block_state_ids as ids;
@@ -48,6 +56,10 @@ pub const fn state_id_to_name(id: i32) -> Option<&'static str> {
         ids::OBSIDIAN => Some(names::OBSIDIAN),
         ids::NETHERRACK => Some(names::NETHERRACK),
         ids::END_STONE => Some(names::END_STONE),
+        ids::TNT => Some(names::TNT),
+        ids::OAK_LOG => Some(names::OAK_LOG),
+        ids::OAK_PLANKS => Some(names::OAK_PLANKS),
+        ids::COBBLESTONE => Some(names::COBBLESTONE),
         _ => None,
     }
 }
@@ -67,6 +79,10 @@ pub fn name_to_state_id(name: &str) -> Option<i32> {
         names::OBSIDIAN => Some(ids::OBSIDIAN),
         names::NETHERRACK => Some(ids::NETHERRACK),
         names::END_STONE => Some(ids::END_STONE),
+        names::TNT => Some(ids::TNT),
+        names::OAK_LOG => Some(ids::OAK_LOG),
+        names::OAK_PLANKS => Some(ids::OAK_PLANKS),
+        names::COBBLESTONE => Some(ids::COBBLESTONE),
         _ => None,
     }
 }

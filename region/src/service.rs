@@ -191,6 +191,8 @@ pub struct RegionService {
     pending_chunks: std::collections::VecDeque<(Face, i32, i32)>,
     /// core 分配的实体 ID 基址（`REGISTER_ACK`）。
     entity_base: i32,
+    /// 区域内非玩家实体（掉落物/TNT）。
+    entities: crate::entities::EntityManager,
     /// 区域内漫游 Creeper（region 存活信号）。
     creepers: Vec<Creeper>,
     /// xorshift64 状态（种子取自区域坐标，固定种子可复现）。
@@ -212,6 +214,29 @@ impl RegionService {
         state_id: i32,
     ) -> Result<(), RegionError> {
         self.store.set_block(face, x, y, z, state_id)?;
+        // TNT 方块放置：生成 TNT 实体（`minecraft:tnt`），不保留方块（vanilla
+        // 放置即点火；此处放置即视为已放置方块并生成实体）
+        if face == Face::Overworld && state_id == 2095 {
+            let entity_id = self.entity_base + 1000 + i32::try_from(self.entities.tnts.len())
+                .unwrap_or(i32::MAX);
+            self.entities
+                .spawn_tnt(entity_id, f64::from(x) + 0.5, f64::from(y) + 0.5, f64::from(z) + 0.5);
+            let tnt = self.entities.tnts.last().expect("just spawned").clone();
+            let add = icbm_mc_767::packets::play::clientbound::CAddEntity {
+                entity_id: tnt.entity_id,
+                uuid: tnt.uuid,
+                entity_type: crate::entities::entity_type_ids::TNT,
+                x: tnt.x,
+                y: tnt.y,
+                z: tnt.z,
+                pitch: 0.0,
+                yaw: 0.0,
+            };
+            self.send_entity_packet(play_ids::CLIENTBOUND_ADD_ENTITY, |w| {
+                add.encode(w);
+            })?;
+            return Ok(());
+        }
         let packet = icbm_mc_767::packets::play::clientbound::CBlockUpdate {
             position: icbm_mc_767::packets::play::BlockPos::new(x, y, z),
             state_id,
@@ -293,6 +318,7 @@ impl RegionService {
             unknown_messages: 0,
             pending_chunks: std::collections::VecDeque::new(),
             entity_base: 0,
+            entities: crate::entities::EntityManager::new(),
             creepers: Vec::new(),
             rng: rng | 1,
         })
@@ -360,6 +386,7 @@ impl RegionService {
         self.drain_messages()?;
         self.flush_chunks()?;
         self.tick_fluids()?;
+        self.tick_entities()?;
         // Phase 1 世界 tick：仅随机漫游 Creeper（region 存活信号）
         self.tick_creepers()?;
         let tps = self.ticker.end();
@@ -503,6 +530,146 @@ impl RegionService {
     /// [0,1) 均匀随机。
     fn rand_f64(&mut self) -> f64 {
         (self.next_random() >> 11) as f64 / (1u64 << 53) as f64
+    }
+
+    /// 实体 tick：掉落物物理（下落/衰减）+ TNT 引信与爆炸。
+    fn tick_entities(&mut self) -> Result<(), RegionError> {
+        // 掉落物：重力下落 + 随机移动，年龄增加（6000 tick 消失，vanilla 行为）
+        let item_moves: Vec<(i32, i16, i16, i16)> = self
+            .entities
+            .items
+            .iter_mut()
+            .filter_map(|item| {
+                item.age = item.age.saturating_add(1);
+                // 1 tick 后变为可拾取
+                if item.age >= 1 {
+                    item.pickable = true;
+                }
+                // 重力：速度积累 + 位置更新
+                let gravity = 0.04;
+                item.vy = (item.vy - gravity).max(-0.6);
+                // 简单地面碰撞：y < 世界最低 + 1 时停止
+                let old_x = item.x;
+                let old_y = item.y;
+                let old_z = item.z;
+                item.x += item.vx;
+                item.y += item.vy;
+                item.z += item.vz;
+                if item.y < 0.0 {
+                    item.y = 0.0;
+                    item.vy = 0.0;
+                    item.vx = 0.0;
+                    item.vz = 0.0;
+                }
+                let dx = ((item.x - old_x) * 4096.0) as i16;
+                let dy = ((item.y - old_y) * 4096.0) as i16;
+                let dz = ((item.z - old_z) * 4096.0) as i16;
+                (dx != 0 || dy != 0 || dz != 0).then_some((item.entity_id, dx, dy, dz))
+            })
+            .collect();
+        for (entity_id, dx, dy, dz) in item_moves {
+            let packet = icbm_mc_767::packets::play::clientbound::CMoveEntityPos {
+                entity_id,
+                delta_x: dx,
+                delta_y: dy,
+                delta_z: dz,
+                on_ground: false,
+            };
+            self.send_entity_packet(play_ids::CLIENTBOUND_MOVE_ENTITY_POS, |w| {
+                packet.encode(w);
+            })?;
+        }
+        // TNT：引信倒计时，归零时爆炸
+        let exploded: Vec<(f64, f64, f64)> = self
+            .entities
+            .tnts
+            .iter_mut()
+            .filter_map(|tnt| {
+                tnt.fuse = tnt.fuse.saturating_sub(1);
+                (tnt.fuse == 0).then_some((tnt.x, tnt.y, tnt.z))
+            })
+            .collect();
+        for (x, y, z) in exploded {
+            self.detonate_tnt(x, y, z)?;
+        }
+        // 清理过期掉落物
+        self.entities.items.retain(|item| item.age < 6000);
+        // 清理已爆炸 TNT
+        self.entities.tnts.retain(|tnt| tnt.fuse > 0);
+        Ok(())
+    }
+
+    /// TNT 爆炸：破坏范围内方块、广播 `CExplosion` 与 `CBlockUpdate`、生成掉落物。
+    fn detonate_tnt(&mut self, x: f64, y: f64, z: f64) -> Result<(), RegionError> {
+        use icbm_mc_767::packets::play::clientbound::{
+            CBlockUpdate, CExplosion, ExplosionDestructionType,
+        };
+        // 计算受影响方块
+        let affected = {
+            let store = &mut self.store;
+            let mut lookup = |bx: i32, by: i32, bz: i32| {
+                store.block_at(Face::Overworld, bx, by, bz).unwrap_or(0)
+            };
+            crate::entities::compute_explosion(x, y, z, 4.0, &mut lookup)
+            .affected_blocks
+        };
+        // 广播 CExplosion（受影响方块 → 客户端渲染爆炸效果）
+        let explosion = CExplosion {
+            x,
+            y,
+            z,
+            radius: 4.0,
+            affected_blocks: affected
+                .iter()
+                .map(|&(bx, by, bz)| icbm_mc_767::packets::play::BlockPos::new(bx, by, bz))
+                .collect(),
+            player_velocity: [0.0, 0.0, 0.0],
+            destruction_type: ExplosionDestructionType::Destroy,
+            particle: "large_smoke".to_owned(),
+            emitter_particle: "explosion_emitter".to_owned(),
+            sound: "entity.generic.explode".to_owned(),
+        };
+        self.send_entity_packet(play_ids::CLIENTBOUND_EXPLOSION, |w| {
+            explosion.encode(w);
+        })?;
+        // 破坏方块并广播更新、掉落物
+        let mut spawns: Vec<(f64, f64, f64, String, i32)> = Vec::new();
+        for (bx, by, bz) in &affected {
+            let state = self.store.block_at(Face::Overworld, *bx, *by, *bz).unwrap_or(0);
+            if let Some(name) = icbm_mc_767::registry::state_id_to_name(state) {
+                let item_name = name.strip_prefix("minecraft:").unwrap_or(name);
+                spawns.push((f64::from(*bx), f64::from(*by), f64::from(*bz), item_name.to_owned(), 1));
+            }
+            self.store.set_block(Face::Overworld, *bx, *by, *bz, 0)?;
+            let packet = CBlockUpdate {
+                position: icbm_mc_767::packets::play::BlockPos::new(*bx, *by, *bz),
+                state_id: 0,
+            };
+            self.send_entity_packet(play_ids::CLIENTBOUND_BLOCK_UPDATE, |w| {
+                packet.encode(w);
+            })?;
+        }
+        // 生成掉落物（方块破坏掉落）
+        for (sx, sy, sz, item, count) in spawns {
+            let entity_id = self.entity_base + 1000 + i32::try_from(self.entities.items.len())
+                .unwrap_or(i32::MAX);
+            self.entities.spawn_item(entity_id, sx, sy + 0.5, sz, &item, count);
+            let item_entity = self.entities.items.last().expect("just spawned").clone();
+            let add = icbm_mc_767::packets::play::clientbound::CAddEntity {
+                entity_id: item_entity.entity_id,
+                uuid: item_entity.uuid,
+                entity_type: crate::entities::entity_type_ids::ITEM,
+                x: item_entity.x,
+                y: item_entity.y,
+                z: item_entity.z,
+                pitch: 0.0,
+                yaw: 0.0,
+            };
+            self.send_entity_packet(play_ids::CLIENTBOUND_ADD_ENTITY, |w| {
+                add.encode(w);
+            })?;
+        }
+        Ok(())
     }
 
     /// 随机漫游 Creeper：随机生成新个体并让已有个体游走。

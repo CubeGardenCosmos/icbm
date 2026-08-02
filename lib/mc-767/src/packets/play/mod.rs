@@ -74,6 +74,14 @@ pub mod block_state_ids {
     pub const NETHERRACK: i32 = 5849;
     /// 末地石。
     pub const END_STONE: i32 = 7415;
+    /// TNT（unstable=false，默认态）。
+    pub const TNT: i32 = 2095;
+    /// 橡木原木（axis=y，默认态）。
+    pub const OAK_LOG: i32 = 131;
+    /// 橡木木板。
+    pub const OAK_PLANKS: i32 = 15;
+    /// 圆石。
+    pub const COBBLESTONE: i32 = 14;
 }
 
 /// 1.21.1 生物群系网络 ID（icbm 服务器自定义注册表顺序）。
