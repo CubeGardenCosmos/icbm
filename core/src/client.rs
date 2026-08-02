@@ -152,6 +152,8 @@ pub struct Client {
     pub icbm_subscribed: AtomicBool,
     /// ICBM 快照单调序号。
     pub icbm_sequence: AtomicU64,
+    /// 最近发送的包（ID, 载荷长度）环形缓冲，断线时 dump 用于定位协议错位。
+    tx_log: Mutex<std::collections::VecDeque<(i32, usize)>>,
 }
 
 const STATE_HANDSHAKE: u8 = 0;
@@ -186,6 +188,7 @@ impl Client {
             icbm_snapshot_ok: AtomicBool::new(false),
             icbm_subscribed: AtomicBool::new(false),
             icbm_sequence: AtomicU64::new(0),
+            tx_log: Mutex::new(std::collections::VecDeque::new()),
         })
     }
 
@@ -216,7 +219,33 @@ impl Client {
             icbm_mc_767::packets::encode_frame(packet_id, payload, self.compression_threshold())?;
         let mut write = self.write.lock().expect("write lock");
         write.write_all(&frame)?;
+        {
+            let mut log = self.tx_log.lock().expect("tx log");
+            log.push_back((packet_id, payload.len()));
+            while log.len() > 256 {
+                log.pop_front();
+            }
+        }
         Ok(())
+    }
+
+    /// 断线时输出最近发送的包序列（诊断协议错位）。
+    fn dump_tx_log(&self) {
+        let log = self.tx_log.lock().expect("tx log");
+        if log.is_empty() {
+            return;
+        }
+        let mut items: Vec<String> = log
+            .iter()
+            .map(|(id, len)| format!("0x{id:02X}({len})"))
+            .collect();
+        // 太长的序列折叠成首尾
+        if items.len() > 48 {
+            let head = items[..24].join(" ");
+            let tail = items[items.len() - 24..].join(" ");
+            items = vec![format!("{head} ... {tail}")];
+        }
+        info!("tx log: {}", items.join(" "));
     }
 
     /// 发送仅由编码函数定义的包。
@@ -775,6 +804,7 @@ fn send_abilities(client: &Arc<Client>) -> Result<(), NetError> {
 
 /// 断线清理。
 fn on_disconnect(server: &Server, client: &Arc<Client>) {
+    client.dump_tx_log();
     let mut world = server.world.lock().expect("world lock");
     if world
         .players
