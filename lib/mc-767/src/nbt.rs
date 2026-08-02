@@ -112,9 +112,14 @@ impl NbtCompound {
         Self::default()
     }
 
-    /// 插入条目。
+    /// 插入条目；键已存在时替换值（保持键的顺序位置）。
     pub fn insert(&mut self, key: impl Into<String>, value: Nbt) {
-        self.entries.push((key.into(), value));
+        let key = key.into();
+        if let Some(entry) = self.entries.iter_mut().find(|(k, _)| *k == key) {
+            entry.1 = value;
+        } else {
+            self.entries.push((key, value));
+        }
     }
 
     /// 按键查找。
@@ -132,20 +137,24 @@ impl NbtCompound {
         }
     }
 
-    /// 取 i64 值。
+    /// 取 i64 值（接受 Byte/Short/Int/Long）。
     #[must_use]
     pub fn get_i64(&self, key: &str) -> Option<i64> {
         match self.get(key) {
-            Some(Nbt::Long(v)) => Some(*v),
+            Some(Nbt::Byte(v)) => Some(i64::from(*v)),
+            Some(Nbt::Short(v)) => Some(i64::from(*v)),
             Some(Nbt::Int(v)) => Some(i64::from(*v)),
+            Some(Nbt::Long(v)) => Some(*v),
             _ => None,
         }
     }
 
-    /// 取 i32 值。
+    /// 取 i32 值（接受 Byte/Short/Int/Long）。
     #[must_use]
     pub fn get_i32(&self, key: &str) -> Option<i32> {
         match self.get(key) {
+            Some(Nbt::Byte(v)) => Some(i32::from(*v)),
+            Some(Nbt::Short(v)) => Some(i32::from(*v)),
             Some(Nbt::Int(v)) => Some(*v),
             Some(Nbt::Long(v)) => i32::try_from(*v).ok(),
             _ => None,

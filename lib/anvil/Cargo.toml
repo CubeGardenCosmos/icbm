@@ -3,6 +3,14 @@ name = "icbm-anvil"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
+description = "Minecraft Java 1.21.1 Anvil save format (.mca / chunk NBT / level.dat / playerdata)"
+
+[dependencies]
+flate2 = { version = "1.1", default-features = false, features = ["rust_backend"] }
+libc = "0.2"
+icbm-mc-767 = { path = "../mc-767" }
+lz4-java-wrc = { version = "0.2.0", default-features = false, features = ["lz4_flex"] }
+uuid = { version = "1", features = ["v4"] }
 
 [lints]
 workspace = true

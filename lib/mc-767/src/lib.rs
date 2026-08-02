@@ -10,6 +10,7 @@
 pub mod codec;
 pub mod nbt;
 pub mod packets;
+pub mod registry;
 
 /// 固定版本快照（对照 `net.minecraft.SharedConstants` 与 master `util/src/version.rs`）。
 pub mod protocol {
