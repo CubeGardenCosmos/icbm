@@ -10,6 +10,12 @@
 - [README.md](README.md) 是架构、阶段顺序与验收条件的当前来源；[docs/ipc.md](docs/ipc.md) 是 core/region 通讯协议的唯一来源。
 - Loom 反编译源码位于仓库外（`~/minecraft-server-1.21.1-src`），只作行为分析参考；不得把 Mojang 源码、注释或资源复制进本仓库。
 
+## 参考基线（最高权重）
+
+- **Minecraft 1.21.1 反编译源码（`~/minecraft-server-1.21.1-src`）是行为一致性的最高权重参考**：协议包字段与编码、NBT 结构、Anvil/ChunkSerializer 格式、PalettedContainer 规则、注册表数据、登录/配置/Play 流转等一切可观察行为，实现时必须以源码为准频繁对照，不得凭记忆或二手资料臆测。
+- 源码与本文档冲突时以源码为准，并同步修订本文档；源码与 master 分支实现冲突时，以源码为准并记录差异。
+- 每个依赖源码结论的实现点应在代码注释中标注对应的源码类/方法（如 `ChunkSerializer.java`、`PalettedContainer.java`）。
+
 ## Git 原子提交
 
 - 一个可独立验证的功能只能出现在一个提交中；不得混入构建产物、格式化噪声或无关改动。
