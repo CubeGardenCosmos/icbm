@@ -206,6 +206,8 @@ pub struct RegionService {
     world_time: i64,
     /// 上次广播时间（节流：每秒一次）。
     last_time_broadcast: Instant,
+    /// 天气状态（雨/雷/梯度）。
+    weather: crate::weather::WeatherState,
 }
 
 impl RegionService {
@@ -400,6 +402,7 @@ impl RegionService {
             rng: rng | 1,
             gamerules: std::collections::HashMap::new(),
             world_time: 0,
+            weather: crate::weather::WeatherState::new(),
             last_time_broadcast: Instant::now(),
         })
     }
@@ -467,7 +470,9 @@ impl RegionService {
         self.flush_chunks()?;
         self.tick_fluids()?;
         self.tick_redstone()?;
+        self.tick_crops()?;
         self.tick_time()?;
+        self.tick_weather()?;
         self.tick_entities()?;
         self.tick_mobs()?;
         // Phase 1 世界 tick：仅随机漫游 Creeper（region 存活信号）
@@ -541,6 +546,8 @@ impl RegionService {
                 debug!(%uuid, "player entered region");
                 // 把已存在的 Creeper 补发给新进入的玩家（客户端需 ADD_ENTITY 才渲染）
                 self.resend_creepers()?;
+                // 同步当前天气梯度（晴雨包只发梯度，客户端据此渲染天气）
+                self.sync_weather_to_players()?;
             }
             kind::PLAYER_LEAVE => {
                 let uuid = decode_player_leave(&message.body)?;
@@ -897,6 +904,110 @@ impl RegionService {
                 packet.encode(w);
             })?;
             self.last_time_broadcast = Instant::now();
+        }
+        Ok(())
+    }
+
+    /// 农作物随机 tick 生长：每个已加载区块按 `randomTickSpeed`（默认 3）次
+    /// 抽查地表顶方块，命中作物且未成熟时以 1/3 概率推进 age（广播 `CBlockUpdate`）。
+    fn tick_crops(&mut self) -> Result<(), RegionError> {
+        let random_ticks = self
+            .gamerules
+            .get("randomTickSpeed")
+            .and_then(|value| value.parse::<usize>().ok())
+            .unwrap_or(3)
+            .clamp(0, 1000);
+        if random_ticks == 0 {
+            return Ok(());
+        }
+        let chunks = self.store.loaded_overworld_chunks();
+        if chunks.is_empty() {
+            return Ok(());
+        }
+        // 先收集生长事件（避免持有 &store 与 set_block 冲突）
+        let mut growth: Vec<(i32, i32, i32, i32)> = Vec::new();
+        for (cx, cz) in chunks {
+            let heights = {
+                let column = self.store.get_chunk(Face::Overworld, cx, cz)?;
+                column.heightmap_heights()
+            };
+            for _ in 0..random_ticks {
+                let local_x = (self.next_random() % 16) as u32;
+                let local_z = (self.next_random() % 16) as u32;
+                let top = heights[(local_z * 16 + local_x) as usize]; // 地表顶 y + 1
+                let world_y = top - 1;
+                if world_y < -64 {
+                    continue;
+                }
+                let state = {
+                    let column = self.store.get_chunk(Face::Overworld, cx, cz)?;
+                    column.block_at(local_x, world_y, local_z)
+                };
+                let Some(crop) = crate::crops::is_crop(state) else {
+                    continue;
+                };
+                let age = state - crop.base;
+                if age >= crop.max_age {
+                    continue; // 已成熟
+                }
+                // 生长概率：可可 2/3，其余 1/3（对照 `CropBlock`/`CocoaBlock`）
+                let chance = if crop.base == icbm_mc_767::packets::play::block_state_ids::COCOA_AGE_0 {
+                    2.0 / 3.0
+                } else {
+                    1.0 / 3.0
+                };
+                if self.rand_f64() < chance {
+                    growth.push((
+                        cx * 16 + i32::try_from(local_x).unwrap_or(0),
+                        world_y,
+                        cz * 16 + i32::try_from(local_z).unwrap_or(0),
+                        crate::crops::crop_state(crop, age + 1),
+                    ));
+                }
+            }
+        }
+        for (x, y, z, state) in growth {
+            self.store.set_block(Face::Overworld, x, y, z, state)?;
+            let packet = icbm_mc_767::packets::play::clientbound::CBlockUpdate {
+                position: icbm_mc_767::packets::play::BlockPos::new(x, y, z),
+                state_id: state,
+            };
+            self.send_entity_packet(play_ids::CLIENTBOUND_BLOCK_UPDATE, |w| {
+                packet.encode(w);
+            })?;
+        }
+        Ok(())
+    }
+
+    /// 天气 tick：晴雨/雷暴切换与梯度插值，广播 `GAME_EVENT`。
+    fn tick_weather(&mut self) -> Result<(), RegionError> {
+        let do_weather_cycle = self.gamerule_bool("doWeatherCycle");
+        let events = self.weather.tick(do_weather_cycle);
+        for (event, value) in events {
+            let packet = icbm_mc_767::packets::play::clientbound::CGameEvent {
+                event,
+                value,
+            };
+            self.send_entity_packet(play_ids::CLIENTBOUND_GAME_EVENT, |w| {
+                packet.encode(w);
+            })?;
+        }
+        Ok(())
+    }
+
+    /// 玩家进入后同步当前天气梯度（对照 `PlayerManager.onPlayerConnect` 的
+    /// `RAIN_GRADIENT_CHANGED`/`THUNDER_GRADIENT_CHANGED`）。
+    fn sync_weather_to_players(&self) -> Result<(), RegionError> {
+        let rain = self.weather.rain_gradient();
+        let thunder = self.weather.thunder_gradient();
+        for (event, value) in [
+            (crate::weather::GAME_EVENT_RAIN_GRADIENT, rain),
+            (crate::weather::GAME_EVENT_THUNDER_GRADIENT, thunder),
+        ] {
+            let packet = icbm_mc_767::packets::play::clientbound::CGameEvent { event, value };
+            self.send_entity_packet(play_ids::CLIENTBOUND_GAME_EVENT, |w| {
+                packet.encode(w);
+            })?;
         }
         Ok(())
     }

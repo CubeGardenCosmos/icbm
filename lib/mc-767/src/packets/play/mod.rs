@@ -90,12 +90,28 @@ pub mod block_state_ids {
     pub const REDSTONE_TORCH_OFF: i32 = 5738;
     /// 红石火把（点亮态）。
     pub const REDSTONE_TORCH_ON: i32 = 5739;
-    /// 红石灯（熄灭态）。
+    /// 红石灯（熄灭态，lit=false；lit=true = 7417）。
     pub const REDSTONE_LAMP: i32 = 7418;
-    /// 红石灯（点亮态）。
-    pub const REDSTONE_LAMP_ON: i32 = 7419;
+    /// 红石灯（点亮态，lit=true）。注：旧值 7419 实为 cocoa[age=0]，已修正。
+    pub const REDSTONE_LAMP_ON: i32 = 7417;
     /// 红石块（强电源）。
     pub const REDSTONE_BLOCK: i32 = 9223;
+    /// 耕地（moisture=0 默认态；moisture 0..7 → 4286..4293）。
+    pub const FARMLAND: i32 = 4286;
+    /// 小麦（age 0..7 → 4278..4285）。
+    pub const WHEAT_AGE_0: i32 = 4278;
+    /// 胡萝卜（age 0..7 → 8595..8602）。
+    pub const CARROTS_AGE_0: i32 = 8595;
+    /// 马铃薯（age 0..7 → 8603..8610）。
+    pub const POTATOES_AGE_0: i32 = 8603;
+    /// 甜菜根（age 0..3 → 12509..12512）。
+    pub const BEETROOTS_AGE_0: i32 = 12509;
+    /// 南瓜茎（age 0..7 → 6821..6828）。
+    pub const PUMPKIN_STEM_AGE_0: i32 = 6821;
+    /// 西瓜茎（age 0..7 → 6829..6836）。
+    pub const MELON_STEM_AGE_0: i32 = 6829;
+    /// 可可果（age 0..2 × 4 朝向 → 7419..7430；facing 顺序 south/west/north/east）。
+    pub const COCOA_AGE_0: i32 = 7419;
 }
 
 /// 1.21.1 生物群系网络 ID（icbm 服务器自定义注册表顺序）。

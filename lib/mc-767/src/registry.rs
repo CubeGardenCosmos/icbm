@@ -47,6 +47,22 @@ pub mod names {
     pub const REDSTONE_LAMP: &str = "minecraft:redstone_lamp";
     /// 红石块。
     pub const REDSTONE_BLOCK: &str = "minecraft:redstone_block";
+    /// 耕地。
+    pub const FARMLAND: &str = "minecraft:farmland";
+    /// 小麦。
+    pub const WHEAT: &str = "minecraft:wheat";
+    /// 胡萝卜。
+    pub const CARROTS: &str = "minecraft:carrots";
+    /// 马铃薯。
+    pub const POTATOES: &str = "minecraft:potatoes";
+    /// 甜菜根。
+    pub const BEETROOTS: &str = "minecraft:beetroots";
+    /// 南瓜茎。
+    pub const PUMPKIN_STEM: &str = "minecraft:pumpkin_stem";
+    /// 西瓜茎。
+    pub const MELON_STEM: &str = "minecraft:melon_stem";
+    /// 可可果。
+    pub const COCOA: &str = "minecraft:cocoa";
 }
 
 use crate::packets::play::block_state_ids as ids;
@@ -75,6 +91,14 @@ pub const fn state_id_to_name(id: i32) -> Option<&'static str> {
         ids::REDSTONE_TORCH_OFF => Some(names::REDSTONE_TORCH),
         ids::REDSTONE_LAMP => Some(names::REDSTONE_LAMP),
         ids::REDSTONE_BLOCK => Some(names::REDSTONE_BLOCK),
+        ids::FARMLAND => Some(names::FARMLAND),
+        ids::WHEAT_AGE_0 => Some(names::WHEAT),
+        ids::CARROTS_AGE_0 => Some(names::CARROTS),
+        ids::POTATOES_AGE_0 => Some(names::POTATOES),
+        ids::BEETROOTS_AGE_0 => Some(names::BEETROOTS),
+        ids::PUMPKIN_STEM_AGE_0 => Some(names::PUMPKIN_STEM),
+        ids::MELON_STEM_AGE_0 => Some(names::MELON_STEM),
+        ids::COCOA_AGE_0 => Some(names::COCOA),
         _ => None,
     }
 }
@@ -103,6 +127,14 @@ pub fn name_to_state_id(name: &str) -> Option<i32> {
         names::REDSTONE_TORCH => Some(ids::REDSTONE_TORCH_OFF),
         names::REDSTONE_LAMP => Some(ids::REDSTONE_LAMP),
         names::REDSTONE_BLOCK => Some(ids::REDSTONE_BLOCK),
+        names::FARMLAND => Some(ids::FARMLAND),
+        names::WHEAT => Some(ids::WHEAT_AGE_0),
+        names::CARROTS => Some(ids::CARROTS_AGE_0),
+        names::POTATOES => Some(ids::POTATOES_AGE_0),
+        names::BEETROOTS => Some(ids::BEETROOTS_AGE_0),
+        names::PUMPKIN_STEM => Some(ids::PUMPKIN_STEM_AGE_0),
+        names::MELON_STEM => Some(ids::MELON_STEM_AGE_0),
+        names::COCOA => Some(ids::COCOA_AGE_0),
         _ => None,
     }
 }

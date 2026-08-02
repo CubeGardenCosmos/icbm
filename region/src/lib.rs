@@ -5,6 +5,7 @@
 //! 注册 → 模拟 → 沉睡 → 卸载（见 [`service`]）。
 
 pub mod entities;
+pub mod crops;
 pub mod fluids;
 pub mod mobs;
 pub mod portal;
@@ -12,6 +13,7 @@ pub mod protocol;
 pub mod redstone;
 pub mod service;
 pub mod store;
+pub mod weather;
 
 pub use service::{RegionConfig, RegionError, RegionService, run_region};
 
