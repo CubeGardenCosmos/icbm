@@ -330,6 +330,20 @@ impl Writer {
         self.buf.extend_from_slice(&value.to_be_bytes());
     }
 
+    /// 写 NBT 编码的纯文本聊天组件（1.20.5+ 组件网络序列化为 NBT，
+    /// 形如 `{text: "..."}`；disconnect reason、chat 等一律用此格式）。
+    pub fn write_text_component(&mut self, text: &str) {
+        self.write_u8(10); // CompoundTag id
+        self.write_u16_be(0); // 根 name 为空（网络 NBT readNbt 后接 readUTF name）
+        self.write_u8(8); // StringTag id
+        self.write_u16_be(4);
+        self.write_slice(b"text");
+        let len = u16::try_from(text.len()).unwrap_or(u16::MAX);
+        self.write_u16_be(len);
+        self.write_slice(text.as_bytes());
+        self.write_u8(0); // EndTag
+    }
+
     /// 写入大端 i64。
     pub fn write_i64_be(&mut self, value: i64) {
         self.buf.extend_from_slice(&value.to_be_bytes());
@@ -460,5 +474,25 @@ mod tests {
             r.read_i32_be(),
             Err(super::CodecError::UnexpectedEof { .. })
         ));
+    }
+
+    #[test]
+    fn text_component_matches_official_nbt_layout() {
+        // 官方 1.20.5+ 组件网络序列化 = NBT：{text: "hello"}
+        // readNbt 读 tag id → readUTF 空 name → Compound 内容 → End
+        let mut w = Writer::new();
+        w.write_text_component("hello");
+        let bytes = w.into_bytes();
+        assert_eq!(
+            bytes,
+            vec![
+                0x0A, // CompoundTag
+                0x00, 0x00, // 根 name 长度 0
+                0x08, // StringTag
+                0x00, 0x04, b't', b'e', b'x', b't', // key "text"
+                0x00, 0x05, b'h', b'e', b'l', b'l', b'o', // value
+                0x00, // EndTag
+            ]
+        );
     }
 }

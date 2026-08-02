@@ -81,14 +81,14 @@ impl CLoginSuccess {
 /// Clientbound：登录断开（0x00）。
 #[derive(Debug, Clone)]
 pub struct CLoginDisconnect {
-    /// 断开原因 JSON 文本组件。
+    /// 断开原因纯文本（组件网络序列化为 NBT）。
     pub reason: String,
 }
 
 impl CLoginDisconnect {
     /// 编码载荷。
     pub fn encode(&self, writer: &mut Writer) {
-        writer.write_string(&self.reason);
+        writer.write_text_component(&self.reason);
     }
 
     /// 包 ID。

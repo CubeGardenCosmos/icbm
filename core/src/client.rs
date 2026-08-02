@@ -222,15 +222,17 @@ impl Client {
     }
 
     /// 断开连接（发送原因并关闭）。
+    ///
+    /// 原因按官方 1.20.5+ 格式编码：组件网络序列化为 NBT `{text: ...}`
+    /// （客户端 `FriendlyByteBuf.readNbt` 解析），非裸 JSON 字符串。
     pub fn kick(&self, reason: &str) {
-        let json = serde_json::json!({ "text": reason }).to_string();
         // 各阶段 disconnect 包 ID 不同（Mojang：login=0x00/config=0x02/play=0x1D）
         let id = match self.connection_state() {
             ConnectionState::Login => icbm_mc_767::packets::login_ids::CLIENTBOUND_DISCONNECT,
             ConnectionState::Config => icbm_mc_767::packets::config_ids::CLIENTBOUND_DISCONNECT,
             _ => icbm_mc_767::packets::play_ids::CLIENTBOUND_DISCONNECT,
         };
-        let _ = self.send_encoded(id, |w| w.write_string(&json));
+        let _ = self.send_encoded(id, |w| w.write_text_component(reason));
         self.alive.store(false, Ordering::Relaxed);
     }
 
@@ -487,7 +489,7 @@ fn handle_login_start(
     if name.is_empty() || name.len() > 16 {
         client.send_encoded(CLoginDisconnect::packet_id(), |w| {
             CLoginDisconnect {
-                reason: "{\"text\":\"玩家名长度非法\"}".to_owned(),
+                reason: "玩家名长度非法".to_owned(),
             }
             .encode(w);
         })?;
