@@ -180,8 +180,16 @@ pub struct Client {
     pub last_portal_check: Mutex<Instant>,
     /// 上次向 region 发送 `PLAYER_MOVE` 的时间（节流：约 4 次/秒）。
     pub last_player_move_sent: Mutex<Instant>,
+    /// 上次屏障检测时间（节流：约 4 次/秒）。
+    pub last_barrier_check: Mutex<Instant>,
     /// 待消费的传送门检测结果（`BLOCK_QUERY_RESP` 写入；-1 = 无）。
     pub pending_portal_block: std::sync::atomic::AtomicI32,
+    /// 屏障检测挂起（receiver 据此路由 `BLOCK_QUERY_RESP` 到 `pending_barrier_state`）。
+    pub barrier_query_pending: std::sync::atomic::AtomicBool,
+    /// 屏障检测结果（-1 = 无查询）。
+    pub pending_barrier_state: std::sync::atomic::AtomicI32,
+    /// 最近一次非屏障位置的合法位置（屏障拦截后回退用）。
+    pub last_valid_position: Mutex<Position>,
     /// `/data` 请求挂起标志（receiver 收到 `BLOCK_NBT_RESP` 后写入响应）。
     pub data_request_pending: std::sync::atomic::AtomicBool,
     /// `/data` 响应（`BLOCK_NBT_RESP` 写入）。
@@ -245,7 +253,17 @@ impl Client {
             verify_token: Mutex::new(None),
             last_portal_check: Mutex::new(Instant::now()),
             last_player_move_sent: Mutex::new(Instant::now()),
+            last_barrier_check: Mutex::new(Instant::now()),
             pending_portal_block: std::sync::atomic::AtomicI32::new(-1),
+            barrier_query_pending: std::sync::atomic::AtomicBool::new(false),
+            pending_barrier_state: std::sync::atomic::AtomicI32::new(-1),
+            last_valid_position: Mutex::new(Position {
+                x: 0.0,
+                y: f64::from(OVERWORLD_SURFACE_FEET_Y),
+                z: 0.0,
+                yaw: 0.0,
+                pitch: 0.0,
+            }),
             data_request_pending: std::sync::atomic::AtomicBool::new(false),
             pending_block_nbt: Mutex::new(None),
             pending_raycast: Mutex::new(None),

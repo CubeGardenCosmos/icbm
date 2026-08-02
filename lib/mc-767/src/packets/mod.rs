@@ -77,6 +77,7 @@ pub mod play_ids {
     pub const SERVERBOUND_MOVE_POS_ROT: i32 = 0x1B;
     pub const SERVERBOUND_MOVE_ROT: i32 = 0x1C;
     pub const SERVERBOUND_MOVE_STATUS_ONLY: i32 = 0x1D;
+    pub const SERVERBOUND_MOVE_VEHICLE: i32 = 0x1E;
     pub const SERVERBOUND_PICK_ITEM: i32 = 0x20;
     pub const SERVERBOUND_PLAYER_ABILITIES: i32 = 0x23;
     pub const SERVERBOUND_PLAYER_ACTION: i32 = 0x24;

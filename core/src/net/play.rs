@@ -295,6 +295,19 @@ pub fn handle_play_packet(
         play_ids::SERVERBOUND_MOVE_STATUS_ONLY => {
             let _ = SMovePlayerStatusOnly::decode(reader)?;
         }
+        play_ids::SERVERBOUND_MOVE_VEHICLE => {
+            // 乘船/矿车时客户端发送载具移动（0x1E）替代玩家移动包：更新位置
+            // 但不做屏障拦截（水面乘船放行，对照需求）。
+            let packet = icbm_mc_767::packets::play::serverbound::SMoveVehicle::decode(reader)?;
+            update_position(server, client, |pos| {
+                pos.x = packet.x;
+                pos.y = packet.feet_y;
+                pos.z = packet.z;
+                pos.yaw = packet.yaw;
+                pos.pitch = packet.pitch;
+            })?;
+            *client.last_barrier_check.lock().expect("last barrier check") = Instant::now();
+        }
         play_ids::SERVERBOUND_PLAYER_ACTION => {
             let packet = SPlayerAction::decode(reader)?;
             handle_player_action(server, client, &packet)?;
@@ -491,8 +504,103 @@ fn update_position(
         )?;
         *client.last_player_move_sent.lock().expect("last move sent") = Instant::now();
     }
+    // 屏障拦截（节流：约 4 次/秒）：玩家位置在屏障方块内时回退到最近合法
+    // 位置。乘船（走 MOVE_VEHICLE）时客户端不发送本函数，天然放行。
+    if let Some(region) = new_region
+        && client
+            .last_barrier_check
+            .lock()
+            .expect("last barrier check")
+            .elapsed()
+            >= Duration::from_millis(250)
+    {
+        check_barrier_blocked(server, client, &region, uuid)?;
+        *client.last_barrier_check.lock().expect("last barrier check") = Instant::now();
+    }
     // 传送门检测（节流：约每 0.5 秒一次，避免每 tick 查询 region）
     check_portal_entry(server, client)?;
+    Ok(())
+}
+
+/// 屏障拦截：查询玩家位置方块，命中屏障（10366）时回退到最近合法位置。
+///
+/// 对照需求：鞘翅/创造飞行不能快速穿过屏障；乘船（MOVE_VEHICLE）时不经过
+/// 本检查（客户端在船上发 `VehicleMoveC2SPacket`），水面乘船自然放行。
+fn check_barrier_blocked(
+    server: &Server,
+    client: &Arc<Client>,
+    region: &icbm_region::RegionId,
+    uuid: uuid::Uuid,
+) -> Result<(), NetError> {
+    let (bx, by, bz) = {
+        let position = client.position.lock().expect("position");
+        (
+            position.x.floor() as i32,
+            position.y.floor() as i32,
+            position.z.floor() as i32,
+        )
+    };
+    client.barrier_query_pending.store(true, std::sync::atomic::Ordering::Relaxed);
+    server.ipc.send(
+        &region.service_name(),
+        icbm_region::protocol::kind::BLOCK_QUERY,
+        &icbm_region::protocol::encode_block_query(
+            icbm_region::protocol::DIM_OVERWORLD,
+            bx,
+            by,
+            bz,
+        ),
+    )?;
+    // 等待响应（receiver 线程路由到 pending_barrier_state）
+    let deadline = Instant::now() + Duration::from_millis(300);
+    let state = loop {
+        let value = client.pending_barrier_state.load(std::sync::atomic::Ordering::Relaxed);
+        if value != -1 {
+            break value;
+        }
+        if Instant::now() > deadline {
+            break -1;
+        }
+        std::thread::sleep(Duration::from_millis(5));
+    };
+    client
+        .pending_barrier_state
+        .store(-1, std::sync::atomic::Ordering::Relaxed);
+    if state != icbm_mc_767::packets::play::block_state_ids::BARRIER {
+        // 位置合法：记录为回退基准
+        *client.last_valid_position.lock().expect("last valid") =
+            *client.position.lock().expect("position");
+        return Ok(());
+    }
+    // 命中屏障：回退到最近合法位置
+    let fallback = *client.last_valid_position.lock().expect("last valid");
+    let teleport_id = client.next_teleport_id();
+    let (x, y, z) = (fallback.x, fallback.y, fallback.z);
+    client.send_encoded(CPlayerPosition::packet_id(), |w| {
+        CPlayerPosition {
+            x,
+            y,
+            z,
+            yaw: fallback.yaw,
+            pitch: fallback.pitch,
+            flags: 0,
+            teleport_id,
+        }
+        .encode(w);
+    })?;
+    // 同步服务端位置与 region 归属（复用 update_position 的迁移路径）
+    update_position(server, client, |pos| {
+        pos.x = x;
+        pos.y = y;
+        pos.z = z;
+    })?;
+    debug!(
+        name = %client.name.lock().expect("name"),
+        uuid = %uuid,
+        bx, by, bz,
+        "barrier blocked, teleported back"
+    );
+    client.reset_move_baseline();
     Ok(())
 }
 

@@ -625,10 +625,19 @@ fn handle_core_message(server: &Server, message: &icbm_region::protocol::IpcMess
                     let pz = pos.z.floor() as i32;
                     let matches = (px == x && pz == z) && (py == y || py - 1 == y);
                     drop(pos);
-                    if matches {
-                        player.pending_portal_block.store(state, Ordering::Relaxed);
-                        break;
+                    if !matches {
+                        continue;
                     }
+                    // 屏障检测优先：路由到 pending_barrier_state
+                    if player
+                        .barrier_query_pending
+                        .swap(false, std::sync::atomic::Ordering::Relaxed)
+                    {
+                        player.pending_barrier_state.store(state, std::sync::atomic::Ordering::Relaxed);
+                    } else {
+                        player.pending_portal_block.store(state, std::sync::atomic::Ordering::Relaxed);
+                    }
+                    break;
                 }
             }
         }

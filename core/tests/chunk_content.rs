@@ -757,6 +757,81 @@ fn ender_pearl_teleports_to_landing_point() {
     assert_eq!(teleport.2, 0.0, "teleport z");
 }
 
+/// 屏障拦截：玩家位置在屏障方块内时回退到最近合法位置；乘船（MOVE_VEHICLE）
+/// 时放行（水面乘船可以穿过屏障）。
+#[test]
+fn barrier_blocks_walkers_but_not_boats() {
+    let server = TestServer::start("barrier");
+    let mut client = FakeClient::connect(&server.addr);
+    join_to_play(&mut client);
+    client.recv_until(play_ids::CLIENTBOUND_CHUNK_BATCH_FINISHED, "initial batch");
+
+    // 一道屏障墙：x=10, y=-60
+    send_chat_command(&mut client, "setblock 10 -60 0 barrier");
+    recv_chat_until(&mut client, "已放置");
+
+    // 走到屏障前 (9,-60,0)：合法，记录为回退基准
+    let mut move_to = Writer::new();
+    move_to.write_f64_be(9.0);
+    move_to.write_f64_be(-60.0);
+    move_to.write_f64_be(0.0);
+    move_to.write_bool(true);
+    client.send(play_ids::SERVERBOUND_MOVE_POS, &move_to.into_bytes());
+    std::thread::sleep(std::time::Duration::from_millis(900)); // 越过屏障检测节流（服务端处理首个移动含 IPC 往返）
+
+    // 走进屏障 (10,-60,0)：服务端应回退到 (9,-60,0)
+    let mut into_barrier = Writer::new();
+    into_barrier.write_f64_be(10.0);
+    into_barrier.write_f64_be(-60.0);
+    into_barrier.write_f64_be(0.0);
+    into_barrier.write_bool(true);
+    client.send(play_ids::SERVERBOUND_MOVE_POS, &into_barrier.into_bytes());
+
+    let deadline = Instant::now() + Duration::from_secs(15);
+    let fallback = loop {
+        assert!(Instant::now() < deadline, "no barrier fallback teleport");
+        let (id, payload) = client.recv();
+        if id == play_ids::CLIENTBOUND_PLAYER_POSITION {
+            let mut r = Reader::new(&payload);
+            let x = r.read_f64_be().unwrap();
+            let y = r.read_f64_be().unwrap();
+            let z = r.read_f64_be().unwrap();
+            if (x, z) == (9.0, 0.0) {
+                break (x, y, z);
+            }
+        }
+    };
+    assert_eq!(fallback.1, -60.0, "fallback y");
+
+    // 乘船（MOVE_VEHICLE）进入屏障位置：放行（不发送回退 CPlayerPosition）
+    let mut boat = Writer::new();
+    boat.write_f64_be(10.0);
+    boat.write_f64_be(-60.0);
+    boat.write_f64_be(0.0);
+    boat.write_f32_be(0.0);
+    boat.write_f32_be(0.0);
+    client.send(play_ids::SERVERBOUND_MOVE_VEHICLE, &boat.into_bytes());
+
+    // 1.5 秒内不得出现新的位置回退包
+    client.set_read_timeout(Duration::from_millis(200));
+    let deadline = Instant::now() + Duration::from_millis(1500);
+    while Instant::now() < deadline {
+        let Some((id, payload)) = client.recv_opt() else {
+            continue;
+        };
+        if id == play_ids::CLIENTBOUND_PLAYER_POSITION {
+            let mut r = Reader::new(&payload);
+            let x = r.read_f64_be().unwrap();
+            let z = r.read_f64_be().unwrap();
+            assert!(
+                (x, z) != (9.0, 0.0),
+                "boat must pass through barrier without fallback"
+            );
+        }
+    }
+    client.set_read_timeout(Duration::from_secs(10));
+}
+
 /// 服务端命令：`/gamemode creative`、`/gamerule`（含 level.dat 持久化）与
 /// `/bmtool tps` 应从系统聊天返回反馈。
 #[test]

@@ -8,10 +8,11 @@ use crate::packets::play_ids::{
     SERVERBOUND_CHAT_COMMAND_SIGNED, SERVERBOUND_CHUNK_BATCH_RECEIVED, SERVERBOUND_CLIENT_COMMAND,
     SERVERBOUND_CLIENT_INFORMATION, SERVERBOUND_COMMAND_SUGGESTION, SERVERBOUND_CONFIRM_TELEPORT,
     SERVERBOUND_KEEP_ALIVE, SERVERBOUND_MOVE_POS, SERVERBOUND_MOVE_POS_ROT, SERVERBOUND_MOVE_ROT,
-    SERVERBOUND_MOVE_STATUS_ONLY, SERVERBOUND_PICK_ITEM, SERVERBOUND_PLAYER_ABILITIES,
-    SERVERBOUND_PLAYER_ACTION, SERVERBOUND_PLAYER_COMMAND, SERVERBOUND_PLAYER_INPUT,
-    SERVERBOUND_PONG, SERVERBOUND_SET_CARRIED_ITEM, SERVERBOUND_SET_CREATIVE_MODE_SLOT,
-    SERVERBOUND_SWING, SERVERBOUND_USE_ITEM, SERVERBOUND_USE_ITEM_ON,
+    SERVERBOUND_MOVE_STATUS_ONLY, SERVERBOUND_MOVE_VEHICLE, SERVERBOUND_PICK_ITEM,
+    SERVERBOUND_PLAYER_ABILITIES, SERVERBOUND_PLAYER_ACTION, SERVERBOUND_PLAYER_COMMAND,
+    SERVERBOUND_PLAYER_INPUT, SERVERBOUND_PONG, SERVERBOUND_SET_CARRIED_ITEM,
+    SERVERBOUND_SET_CREATIVE_MODE_SLOT, SERVERBOUND_SWING, SERVERBOUND_USE_ITEM,
+    SERVERBOUND_USE_ITEM_ON,
 };
 
 /// Serverbound：确认传送（0x00）。
@@ -358,6 +359,41 @@ impl SMovePlayerPos {
     #[must_use]
     pub const fn packet_id() -> i32 {
         SERVERBOUND_MOVE_POS
+    }
+}
+
+/// Serverbound：移动载具（0x1E `VehicleMoveC2SPacket`；乘船/矿车等时替代
+/// 玩家移动包）。
+#[derive(Debug, Clone, Copy)]
+pub struct SMoveVehicle {
+    /// X。
+    pub x: f64,
+    /// 脚部 Y。
+    pub feet_y: f64,
+    /// Z。
+    pub z: f64,
+    /// 偏航角（度）。
+    pub yaw: f32,
+    /// 俯仰角（度）。
+    pub pitch: f32,
+}
+
+impl SMoveVehicle {
+    /// 解码。
+    pub fn decode(reader: &mut Reader<'_>) -> Result<Self, CodecError> {
+        Ok(Self {
+            x: reader.read_f64_be()?,
+            feet_y: reader.read_f64_be()?,
+            z: reader.read_f64_be()?,
+            yaw: reader.read_f32_be()?,
+            pitch: reader.read_f32_be()?,
+        })
+    }
+
+    /// 包 ID。
+    #[must_use]
+    pub const fn packet_id() -> i32 {
+        SERVERBOUND_MOVE_VEHICLE
     }
 }
 
