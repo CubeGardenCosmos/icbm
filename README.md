@@ -105,16 +105,16 @@ world/
 
 ## 第二阶段范围（Phase 2）
 
-- [ ] 红石（不包括活塞）。
-- [ ] Minecraft 原版指令：`tp`、`ban`、`whitelist`、`fill`、`setblock`、`give`。
-- [ ] 原版 `gamerule`。
-- [ ] master 分支 `/about` 实现；品牌名改为大写 `ICBM`。
-- [ ] 友好生物生成与 AI（包括声音）；暂不移除随机移动的苦力怕，但让他们的寻路看上去更合理、更符合友好生物的样子。
-- [ ] 地狱功能，包括下界传送门。
-- [ ] 附魔系统。
-- [ ] 流体：水、岩浆、含水方块。
-- [ ] TNT、掉落物实体。
-- [ ] 正版验证系统（参考 master 实现）。
+- [x] 红石（不包括活塞）：红石线供电传播、红石火把、红石块、红石灯（region tick 接入）。
+- [x] Minecraft 原版指令：`tp`、`ban`、`whitelist`、`fill`、`setblock`、`give`。
+- [x] 原版 `gamerule`：51 条全量注册 + `doDaylightCycle`/`doMobSpawning` 等落地（`GAMERULE_UPDATE` 同步 region）。
+- [x] master 分支 `/about` 实现；品牌名改为大写 `ICBM`（brand 通道与 `/about`）。
+- [x] 友好生物生成与 AI（包括声音）：牛/猪/鸡/羊惯性随机游走 + 环境音效；暂不移除随机移动的苦力怕，但寻路改为惯性漫步（排除连续折返、降低游走概率），更符合友好生物的样子。
+- [x] 地狱功能，包括下界传送门：黑曜石 4×5 框架检测自动填充传送门方块、`CRespawn` 维度切换（主世界 ↔ 地狱 1:8）。
+- [x] 附魔系统：`/enchant` 给主手物品附加附魔（enchantments 数据组件编码）。
+- [x] 流体：水、岩浆扩散（下落 + 水平流动）、region tick 接入与方块更新广播。
+- [x] TNT、掉落物实体：TNT 引信爆炸/破坏方块/掉落物生成，掉落物物理下落。
+- [x] 正版验证系统（参考 master 实现）：RSA 登录加密、AES-CFB8 流、Mojang session server 校验（`ICBM_ONLINE_MODE`）。
 
 ## 参考基线
 
