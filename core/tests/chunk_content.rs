@@ -832,6 +832,179 @@ fn join_to_play(client: &mut FakeClient) {
     client.recv_until(play_ids::CLIENTBOUND_CHUNK_BATCH_START, "batch start");
 }
 
+/// 创造模式从背包拿取物品（`SET_CREATIVE_MODE_SLOT`）不得触发数据包处理失败。
+///
+/// 回归：`CreativeInventoryActionC2SPacket.java` 的槽位是 `PacketCodecs.SHORT`
+/// （2 字节有符号大端），旧实现按 VarInt 解码导致整包错位；且 1.21.1
+/// `ComponentChanges.PACKET_CODEC` 无长度前缀，旧解码器多读一个 `len` VarInt，
+/// 遇到带附魔组件的栈时读越界 → `unexpected eof` → 玩家被踢"数据包处理失败"。
+#[test]
+fn creative_inventory_take_does_not_kick() {
+    let mut server = TestServer::start("creative-take");
+    let mut client = FakeClient::connect(&server.addr);
+    join_to_play(&mut client);
+    client.recv_until(play_ids::CLIENTBOUND_CHUNK_BATCH_FINISHED, "initial batch");
+
+    send_chat_command(&mut client, "gamemode creative");
+    recv_chat_until(&mut client, "creative");
+
+    // 模拟 vanilla 1.21.1 客户端把一件附魔钻石剑放入删除槽（slot=-1）：
+    // `[short slot][ItemStack]`，栈 = count + item(id+1) + ComponentChanges
+    // （无长度前缀；enchantments 组件网络 ID=9）。
+    let mut w = Writer::new();
+    w.write_i16_be(-1); // slot = -1（删除）
+    w.write_var_int(1); // count = 1
+    let diamond_sword = icbm_mc_767::item_ids::item_id("diamond_sword").unwrap() + 1;
+    w.write_var_int(diamond_sword); // registryEntry：raw_id + 1
+    w.write_var_int(1); // to_add = 1
+    w.write_var_int(0); // to_remove = 0
+    w.write_var_int(9); // component = minecraft:enchantments
+    w.write_var_int(1); // entries = 1
+    w.write_var_int(1 + 1); // sharpness (raw 1) + 1
+    w.write_var_int(3); // level = 3
+    w.write_bool(true); // showInTooltip
+    client.send(play_ids::SERVERBOUND_SET_CREATIVE_MODE_SLOT, &w.into_bytes());
+
+    // 再放一个普通石头栈到槽 5（无组件），两包都不得导致断线。
+    let mut w = Writer::new();
+    w.write_i16_be(5); // slot = 5
+    w.write_var_int(1); // count
+    let stone = icbm_mc_767::item_ids::item_id("stone").unwrap() + 1;
+    w.write_var_int(stone);
+    w.write_var_int(0); // to_add = 0
+    w.write_var_int(0); // to_remove = 0
+    client.send(play_ids::SERVERBOUND_SET_CREATIVE_MODE_SLOT, &w.into_bytes());
+
+    // 5 秒内不得收到 DISCONNECT（数据包处理失败）。
+    client.set_read_timeout(Duration::from_millis(200));
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while Instant::now() < deadline {
+        let Some((id, _)) = client.recv_opt() else {
+            continue;
+        };
+        assert!(
+            id != play_ids::CLIENTBOUND_DISCONNECT,
+            "creative take kicked player (disconnect packet received)"
+        );
+    }
+    client.set_read_timeout(Duration::from_secs(10));
+    // 服务器进程仍在运行（连接未被踢则无 REMOVE_ENTITIES/断开痕迹）
+    assert!(server.child.try_wait().expect("try_wait").is_none(), "server exited");
+}
+
+/// 玩家移动到负数坐标时，该区域的 terrain 必须生成并送达（修复"地形不在
+/// 负数区域生成导致无限下坠"）。
+#[test]
+fn negative_coordinates_terrain_is_generated() {
+    let server = TestServer::start("negative-terrain");
+    let mut client = FakeClient::connect(&server.addr);
+    join_to_play(&mut client);
+    client.recv_until(play_ids::CLIENTBOUND_CHUNK_BATCH_FINISHED, "initial batch");
+
+    // 跨区到负数：从 (0,4,0) 走到 (-600,4,0)（x=-512 是 region -1 与 0 的边界）。
+    let mut move_packet = Writer::new();
+    move_packet.write_f64_be(-600.0);
+    move_packet.write_f64_be(4.0);
+    move_packet.write_f64_be(0.0);
+    move_packet.write_bool(true);
+    client.send(play_ids::SERVERBOUND_MOVE_POS, &move_packet.into_bytes());
+
+    // 区块缓存中心更新到负数区块：floor(-600/16) = -38。
+    let center = client.recv_until(
+        play_ids::CLIENTBOUND_SET_CHUNK_CACHE_CENTER,
+        "negative chunk cache center",
+    );
+    let mut r = Reader::new(&center);
+    let cx = r.read_var_int().unwrap();
+    let cz = r.read_var_int().unwrap();
+    assert_eq!((cx, cz), (-38, 0));
+
+    // 视野区块到达（批次开始 → 完成），289 = (2*8+1)^2；同时收集批次中
+    // 是否出现负数坐标区块（-38 属 region (-2,0) 内部，必然出现），并解码其
+    // 地形 palette 确认是真实的超平坦（草/泥土/基岩），而非空气。
+    client.recv_until(play_ids::CLIENTBOUND_CHUNK_BATCH_START, "negative batch start");
+    let deadline = Instant::now() + Duration::from_secs(30);
+    let mut saw_negative_chunk = false;
+    let mut negative_palettes: Option<Vec<Vec<i32>>> = None;
+    let mut batch_size = None;
+    while Instant::now() < deadline && batch_size.is_none() {
+        let (id, payload) = client.recv();
+        if id == play_ids::CLIENTBOUND_LEVEL_CHUNK_WITH_LIGHT {
+            let mut r = Reader::new(&payload);
+            let x = r.read_i32_be().unwrap();
+            let z = r.read_i32_be().unwrap();
+            let _heightmap = r.read_nbt().unwrap().unwrap();
+            let data_len = r.read_var_int().unwrap() as usize;
+            let data = r.read_bytes(data_len).unwrap();
+            let mut sr = Reader::new(data);
+            let mut palettes: Vec<Vec<i32>> = Vec::new();
+            for _ in 0..24 {
+                let _nonair = sr.read_i16_be().unwrap();
+                let (_, entries) = read_palette_container(&mut sr);
+                palettes.push(entries);
+                read_biome_container(&mut sr);
+            }
+            if x < 0 || z < 0 {
+                saw_negative_chunk = true;
+                if negative_palettes.is_none() {
+                    negative_palettes = Some(palettes);
+                }
+            }
+        } else if id == play_ids::CLIENTBOUND_CHUNK_BATCH_FINISHED {
+            let mut r = Reader::new(&payload);
+            batch_size = Some(r.read_var_int().unwrap());
+        }
+    }
+    assert_eq!(batch_size, Some(289), "(2*8+1)^2 chunks");
+    assert!(saw_negative_chunk, "no negative-coordinate chunk delivered");
+    // 负数区块必须有真实的超平坦地形：section 4 = 世界 y 0..15 含
+    // 基岩(79)/泥土(10)/非雪草(9)。
+    let palettes = negative_palettes.expect("negative chunk palettes");
+    let surface = &palettes[4];
+    for id in [79, 10, 9] {
+        assert!(
+            surface.contains(&id),
+            "negative chunk surface palette {surface:?} missing block id {id}"
+        );
+    }
+    assert!(
+        palettes[0..4].iter().all(|section| section == &vec![0]),
+        "negative chunk bottom sections must be air only"
+    );
+}
+
+/// 玩家坠入主世界虚空（Y < -64）时被拉回出生点，避免无限下坠。
+#[test]
+fn void_fall_rescued_to_spawn() {
+    let server = TestServer::start("void-rescue");
+    let mut client = FakeClient::connect(&server.addr);
+    join_to_play(&mut client);
+    client.recv_until(play_ids::CLIENTBOUND_CHUNK_BATCH_FINISHED, "initial batch");
+
+    // 模拟客户端掉到世界底部之下（如区块未及时加载导致的坠入虚空）
+    let mut fall = Writer::new();
+    fall.write_f64_be(0.0);
+    fall.write_f64_be(-100.0);
+    fall.write_f64_be(0.0);
+    fall.write_bool(false);
+    client.send(play_ids::SERVERBOUND_MOVE_POS, &fall.into_bytes());
+
+    // 服务端应发回 CPlayerPosition 到出生点 (0, 4, 0)
+    let deadline = Instant::now() + Duration::from_secs(15);
+    let (x, y, z) = loop {
+        assert!(Instant::now() < deadline, "no rescue teleport received");
+        let (id, payload) = client.recv();
+        if id == play_ids::CLIENTBOUND_PLAYER_POSITION {
+            let mut r = Reader::new(&payload);
+            let x = r.read_f64_be().unwrap();
+            let y = r.read_f64_be().unwrap();
+            let z = r.read_f64_be().unwrap();
+            break (x, y, z);
+        }
+    };
+    assert_eq!((x, y, z), (0.0, 4.0, 0.0), "rescued to world spawn");
+}
+
 /// 玩家放置与破坏方块：`give` 石头 → 右键（USE_ITEM_ON）在脚下放置 →
 /// 服务端应广播 `CBlockUpdate`（石头）；随后破坏该方块 → 广播空气。
 #[test]

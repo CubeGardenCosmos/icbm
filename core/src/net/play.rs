@@ -28,6 +28,10 @@ use crate::world::ChunkPending;
 /// 「Y > 400 活动时不加载任何 region」与 master「Y>400 虚拟服务器」设计）。
 pub const VIRTUAL_ZONE_MIN_Y: f64 = 400.0;
 
+/// 主世界最低 Y（`WorldHeight.min_y`，与 `icbm_terrain_gen` 一致）。
+/// Y 低于此值视为坠入虚空（无死亡/重生系统，直接拉回出生点）。
+pub const OVERWORLD_MIN_Y: f64 = -64.0;
+
 /// 服务端视角的区块半径（客户端可视距离只影响其渲染，不扩大服务端发送半径；
 /// 对照 vanilla `PlayerManager.viewDistance` 与 `ServerChunkLoadingManager`）。
 ///
@@ -294,6 +298,14 @@ pub fn handle_play_packet(
             let packet = SPlayerAction::decode(reader)?;
             handle_player_action(server, client, &packet)?;
         }
+        play_ids::SERVERBOUND_PICK_ITEM => {
+            // 创造模式中键拾取：槽位由客户端决定，服务端无需处理（仅消费载荷）
+            let _ = icbm_mc_767::packets::play::serverbound::SPickItem::decode(reader)?;
+        }
+        play_ids::SERVERBOUND_PLAYER_ABILITIES => {
+            // 创造/旁观飞行切换（双击空格）：解码消费即可，飞行状态由客户端掌控
+            let _ = icbm_mc_767::packets::play::serverbound::SPlayerAbilities::decode(reader)?;
+        }
         play_ids::SERVERBOUND_USE_ITEM_ON => {
             let packet =
                 icbm_mc_767::packets::play::serverbound::SUseItemOn::decode(reader)?;
@@ -337,6 +349,11 @@ pub fn handle_play_packet(
 /// （虚拟区不加载/不模拟任何 region，对照 README「Y > 400 活动时不加载任何
 /// region」）。升入虚拟区时通知原 region 离开（无玩家即沉睡），回落时拉起
 /// 精确落点 region 并立即补视野区块，避免落在未加载地形。
+///
+/// 主世界 Y 低于世界底部（-64）视为坠入虚空：本实现没有死亡/重生系统，直接
+/// 把玩家传送回出生点地表（对照 vanilla 虚空伤害→重生到世界出生点），避免
+/// 无限下坠。
+#[allow(clippy::too_many_lines)] // 虚空救援 + region 迁移状态机分支
 fn update_position(
     server: &Server,
     client: &Arc<Client>,
@@ -355,6 +372,38 @@ fn update_position(
     let y = position.y;
     drop(position);
     client.note_move();
+
+    // 虚空救援：主世界 Y < 世界底部（-64）→ 传回出生点（世界 spawn，地表上方）。
+    // 区块加载期间坠入虚空（如初始区块批次未及时到达）也会在这里被拉回。
+    if y < OVERWORLD_MIN_Y && client.dimension.load(Ordering::Relaxed) == 0 {
+        let (sx, sy, sz) = {
+            let spawn = server.world.lock().expect("world lock").spawn;
+            (f64::from(spawn.x), f64::from(spawn.y), f64::from(spawn.z))
+        };
+        let (yaw, pitch) = {
+            let mut position = client.position.lock().expect("position");
+            position.x = sx;
+            position.y = sy;
+            position.z = sz;
+            (position.yaw, position.pitch)
+        };
+        let teleport_id = client.next_teleport_id();
+        client.send_encoded(CPlayerPosition::packet_id(), |w| {
+            CPlayerPosition {
+                x: sx,
+                y: sy,
+                z: sz,
+                yaw,
+                pitch,
+                flags: 0,
+                teleport_id,
+            }
+            .encode(w);
+        })?;
+        client.reset_move_baseline();
+        debug!(name = %client.name.lock().expect("name"), y, "rescued from void below world, teleported to spawn");
+        return Ok(());
+    }
 
     let (chunk_x, chunk_z) = {
         let position = client.position.lock().expect("position");

@@ -610,11 +610,24 @@ impl RegionService {
     }
 
     /// 响应区块请求（入队，由每 tick 的 `flush_chunks` 分批发送）。
+    ///
+    /// 顺序按**切比雪夫环从中心向外**：玩家所在区块最先送达，脚下地形在
+    /// 1 tick 内出现，避免玩家在区块加载期间坠入虚空（区块请求半径 8 →
+    /// 289 块，若中心块排在第 144 位、每 tick 8 块需约 0.9 秒，玩家已落到
+    /// 世界底部之下）。
     fn serve_chunks(&mut self, face: Face, cx: i32, cz: i32, radius: i32) {
         let radius = radius.clamp(0, 32);
-        for dx in -radius..=radius {
-            for dz in -radius..=radius {
-                self.pending_chunks.push_back((face, cx + dx, cz + dz));
+        for ring in 0..=radius {
+            if ring == 0 {
+                self.pending_chunks.push_back((face, cx, cz));
+                continue;
+            }
+            for dx in -ring..=ring {
+                for dz in -ring..=ring {
+                    if dx.abs() == ring || dz.abs() == ring {
+                        self.pending_chunks.push_back((face, cx + dx, cz + dz));
+                    }
+                }
             }
         }
     }

@@ -8,10 +8,10 @@ use crate::packets::play_ids::{
     SERVERBOUND_CHAT_COMMAND_SIGNED, SERVERBOUND_CHUNK_BATCH_RECEIVED, SERVERBOUND_CLIENT_COMMAND,
     SERVERBOUND_CLIENT_INFORMATION, SERVERBOUND_COMMAND_SUGGESTION, SERVERBOUND_CONFIRM_TELEPORT,
     SERVERBOUND_KEEP_ALIVE, SERVERBOUND_MOVE_POS, SERVERBOUND_MOVE_POS_ROT, SERVERBOUND_MOVE_ROT,
-    SERVERBOUND_MOVE_STATUS_ONLY, SERVERBOUND_PICK_ITEM, SERVERBOUND_PLAYER_ACTION,
-    SERVERBOUND_PLAYER_COMMAND, SERVERBOUND_PLAYER_INPUT, SERVERBOUND_PONG,
-    SERVERBOUND_SET_CARRIED_ITEM, SERVERBOUND_SET_CREATIVE_MODE_SLOT, SERVERBOUND_SWING,
-    SERVERBOUND_USE_ITEM, SERVERBOUND_USE_ITEM_ON,
+    SERVERBOUND_MOVE_STATUS_ONLY, SERVERBOUND_PICK_ITEM, SERVERBOUND_PLAYER_ABILITIES,
+    SERVERBOUND_PLAYER_ACTION, SERVERBOUND_PLAYER_COMMAND, SERVERBOUND_PLAYER_INPUT,
+    SERVERBOUND_PONG, SERVERBOUND_SET_CARRIED_ITEM, SERVERBOUND_SET_CREATIVE_MODE_SLOT,
+    SERVERBOUND_SWING, SERVERBOUND_USE_ITEM, SERVERBOUND_USE_ITEM_ON,
 };
 
 /// Serverbound：确认传送（0x00）。
@@ -501,6 +501,55 @@ impl SPong {
     }
 }
 
+/// Serverbound：创造模式拾取方块到物品栏（0x20 `PickFromInventoryC2SPacket`）。
+///
+/// 中键拾取方块时发送；字段：`VarInt slot`（对照 `PickFromInventoryC2SPacket.java`）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SPickItem {
+    /// 槽位。
+    pub slot: i32,
+}
+
+impl SPickItem {
+    /// 解码。
+    pub fn decode(reader: &mut Reader<'_>) -> Result<Self, CodecError> {
+        Ok(Self {
+            slot: reader.read_var_int()?,
+        })
+    }
+
+    /// 包 ID。
+    #[must_use]
+    pub const fn packet_id() -> i32 {
+        SERVERBOUND_PICK_ITEM
+    }
+}
+
+/// Serverbound：玩家能力（0x23 `UpdatePlayerAbilitiesC2SPacket`）。
+///
+/// 创造/旁观模式双击空格切换飞行时发送；字段：`Bool flying`
+/// （对照 `UpdatePlayerAbilitiesC2SPacket.java`）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SPlayerAbilities {
+    /// 是否飞行中。
+    pub flying: bool,
+}
+
+impl SPlayerAbilities {
+    /// 解码。
+    pub fn decode(reader: &mut Reader<'_>) -> Result<Self, CodecError> {
+        Ok(Self {
+            flying: reader.read_bool()?,
+        })
+    }
+
+    /// 包 ID。
+    #[must_use]
+    pub const fn packet_id() -> i32 {
+        SERVERBOUND_PLAYER_ABILITIES
+    }
+}
+
 /// Serverbound：挥手（0x36）。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct SSwing {
@@ -772,7 +821,8 @@ impl SPlayerInput {
 
 /// Serverbound：创造模式物品栏操作（0x32 `CreativeInventoryActionC2SPacket`）。
 ///
-/// 字段：`VarInt slot` → `ItemStack`（网络编码）。
+/// 字段（对照 `CreativeInventoryActionC2SPacket.java`）：`short slot`（2 字节
+/// 有符号大端，-1 = 光标/删除）→ `ItemStack`（网络编码）。
 #[derive(Debug, Clone)]
 pub struct SSetCreativeModeSlot {
 
@@ -788,10 +838,12 @@ pub struct SSetCreativeModeSlot {
 
 impl SSetCreativeModeSlot {
 
-    /// 解码（对照 `CreativeInventoryActionC2SPacket.java`）。
+    /// 解码（对照 `CreativeInventoryActionC2SPacket.java`：槽位是
+    /// `PacketCodecs.SHORT`，不是 `VarInt`——旧实现按 `VarInt` 读会把槽位后一字节
+    /// 吞进 count，导致整包错位、带组件的栈读到 EOF 被踢）。
     pub fn decode(reader: &mut Reader<'_>) -> Result<Self, CodecError> {
 
-        let slot = reader.read_var_int()?;
+        let slot = i32::from(reader.read_i16_be()?);
 
         let stack = decode_item_stack(reader)?;
 
@@ -814,6 +866,15 @@ impl SSetCreativeModeSlot {
 
 
 /// 解码 `ItemStack.OPTIONAL_PACKET_CODEC`（网络物品栈；含附魔组件）。
+///
+/// 1.21.1 `ComponentChanges.PACKET_CODEC` **没有长度前缀**：`[VarInt to_add]`
+/// `[VarInt to_remove]` 后直接跟 `[VarInt component_type][组件载荷]` 列表
+/// （对照 `ComponentChanges.java`）。旧实现多读一个 `len` `VarInt` 会把组件载荷
+/// 首字节吞掉，带附魔的栈最终越界读取 → `unexpected eof` → 玩家被踢。
+///
+/// 仅 `minecraft:enchantments`（网络 ID 9）被解析；未知组件的载荷长度无法
+/// 从格式得知，停止解析并返回已解析部分即可——帧按长度前缀整体消费，
+/// 未消费字节被丢弃，不会造成流错位，也不会误踢合法客户端。
 fn decode_item_stack(reader: &mut Reader<'_>) -> Result<super::clientbound::CItemStack, CodecError> {
 
     let count = reader.read_var_int()?;
@@ -828,7 +889,7 @@ fn decode_item_stack(reader: &mut Reader<'_>) -> Result<super::clientbound::CIte
 
     let item = crate::item_ids::item_name(item_id).map(str::to_owned);
 
-    // ComponentChanges：跳过（解析添加/移除数）
+    // ComponentChanges：逐组件解析（无长度前缀）
 
     let to_add = reader.read_var_int()?;
 
@@ -836,25 +897,37 @@ fn decode_item_stack(reader: &mut Reader<'_>) -> Result<super::clientbound::CIte
 
     let mut enchantments = Vec::new();
 
+    let mut show_in_tooltip = true;
+
     for _ in 0..to_add {
 
-        let component = reader.read_var_int()?;
-
-        let len = reader.read_var_int()?;
+        let Ok(component) = reader.read_var_int() else {
+            return Ok(super::clientbound::CItemStack {
+                item,
+                count,
+                enchantments,
+                show_in_tooltip,
+            });
+        };
 
         if component == 9 {
 
-            // minecraft:enchantments
+            // minecraft:enchantments：`ItemEnchantmentsComponent.PACKET_CODEC`
 
-            let entries = reader.read_var_int()?;
+            let Ok(entries) = reader.read_var_int() else {
+                break;
+            };
+
+            let mut ok = true;
 
             for _ in 0..entries {
 
-                let ench_id = reader.read_var_int()? - 1;
+                let (Ok(ench_id), Ok(level)) = (reader.read_var_int(), reader.read_var_int()) else {
+                    ok = false;
+                    break;
+                };
 
-                let level = reader.read_var_int()?;
-
-                if let Some(name) = crate::enchantment_ids::enchantment_name(ench_id) {
+                if let Some(name) = crate::enchantment_ids::enchantment_name(ench_id - 1) {
 
                     enchantments.push((name.to_owned(), level));
 
@@ -862,14 +935,21 @@ fn decode_item_stack(reader: &mut Reader<'_>) -> Result<super::clientbound::CIte
 
             }
 
-            let _show = reader.read_bool()?;
+            if !ok {
+                break;
+            }
+
+            if let Ok(show) = reader.read_bool() {
+                show_in_tooltip = show;
+            } else {
+                break;
+            }
 
         } else {
 
-            // 未知组件：跳过数据
+            // 未知组件：载荷长度不可知，停止解析（剩余字节随帧丢弃）
 
-            let skip = usize::try_from(len).unwrap_or(0);
-            let _ = reader.read_bytes(skip)?;
+            break;
 
         }
 
@@ -877,7 +957,9 @@ fn decode_item_stack(reader: &mut Reader<'_>) -> Result<super::clientbound::CIte
 
     for _ in 0..to_remove {
 
-        let _component = reader.read_var_int()?;
+        let Ok(_component) = reader.read_var_int() else {
+            break;
+        };
 
     }
 
@@ -889,7 +971,7 @@ fn decode_item_stack(reader: &mut Reader<'_>) -> Result<super::clientbound::CIte
 
         enchantments,
 
-        show_in_tooltip: true,
+        show_in_tooltip,
 
     })
 
@@ -1043,5 +1125,92 @@ mod tests {
         assert_eq!(packet.location, BlockPos::new(10, 64, -5));
         assert_eq!(packet.face, 1);
         assert_eq!(packet.sequence, 7);
+    }
+
+    /// vanilla 1.21.1 客户端编码的 `SET_CREATIVE_MODE_SLOT`：槽位是
+    /// `short`（2 字节有符号大端），栈按 `ItemStack.OPTIONAL_PACKET_CODEC`
+    /// （`ComponentChanges` 无长度前缀）。回归：旧实现按 `VarInt` 读槽位、多读
+    /// `len` 前缀，带附魔的栈解码越界（`unexpected eof`）踢人。
+    #[test]
+    fn creative_mode_slot_decode_vanilla_wire_format() {
+        // 槽位 -1（删除）+ 附魔钻石剑（sharpness III）
+        let mut w = Writer::new();
+        w.write_i16_be(-1);
+        w.write_var_int(1); // count
+        let diamond_sword = crate::item_ids::item_id("diamond_sword").unwrap() + 1;
+        w.write_var_int(diamond_sword); // registryEntry：raw_id + 1
+        w.write_var_int(1); // to_add
+        w.write_var_int(0); // to_remove
+        w.write_var_int(9); // enchantments 组件
+        w.write_var_int(1); // 附魔条数
+        w.write_var_int(32 + 1); // sharpness (raw 32) + 1
+        w.write_var_int(3); // level
+        w.write_bool(true); // showInTooltip
+        let bytes = w.into_bytes();
+        let packet = decode_round_trip(&bytes, SSetCreativeModeSlot::decode);
+        assert_eq!(packet.slot, -1);
+        assert_eq!(packet.stack.item.as_deref(), Some("diamond_sword"));
+        assert_eq!(packet.stack.count, 1);
+        assert_eq!(packet.stack.enchantments, vec![("sharpness".to_owned(), 3)]);
+
+        // 槽位 5 + 普通石头（无组件）
+        let mut w = Writer::new();
+        w.write_i16_be(5);
+        w.write_var_int(1);
+        let stone = crate::item_ids::item_id("stone").unwrap() + 1;
+        w.write_var_int(stone);
+        w.write_var_int(0); // to_add
+        w.write_var_int(0); // to_remove
+        let bytes = w.into_bytes();
+        let packet = decode_round_trip(&bytes, SSetCreativeModeSlot::decode);
+        assert_eq!(packet.slot, 5);
+        assert_eq!(packet.stack.item.as_deref(), Some("stone"));
+        assert!(packet.stack.enchantments.is_empty());
+
+        // 空栈（count = 0）
+        let mut w = Writer::new();
+        w.write_i16_be(0);
+        w.write_var_int(0);
+        let bytes = w.into_bytes();
+        let packet = decode_round_trip(&bytes, SSetCreativeModeSlot::decode);
+        assert_eq!(packet.slot, 0);
+        assert!(packet.stack.is_empty());
+    }
+
+    /// 未知组件（无长度前缀、载荷结构未知）不得把解码推向 EOF：优雅停止，
+    /// 已解析部分（物品名/数量）保留，剩余字节随帧丢弃。
+    #[test]
+    fn creative_mode_slot_decode_unknown_component_does_not_eof() {
+        let mut w = Writer::new();
+        w.write_i16_be(3);
+        w.write_var_int(1); // count
+        let diamond_sword = crate::item_ids::item_id("diamond_sword").unwrap() + 1;
+        w.write_var_int(diamond_sword);
+        w.write_var_int(1); // to_add
+        w.write_var_int(0); // to_remove
+        w.write_var_int(5); // custom_name（未知组件：载荷为 NBT，此处给任意字节）
+        w.write_slice(&[0x01, 0x02, 0x03, 0x04]); // 组件载荷（不解读）
+        w.write_var_int(1); // 后续另一个组件（到不了）
+        let bytes = w.into_bytes();
+        let mut r = Reader::new(&bytes);
+        let packet = SSetCreativeModeSlot::decode(&mut r).expect("must not fail on unknown component");
+        assert_eq!(packet.slot, 3);
+        assert_eq!(packet.stack.item.as_deref(), Some("diamond_sword"));
+        assert!(packet.stack.enchantments.is_empty());
+    }
+
+    #[test]
+    fn pick_item_and_player_abilities_decode() {
+        let mut w = Writer::new();
+        w.write_var_int(7);
+        let bytes = w.into_bytes();
+        let packet = decode_round_trip(&bytes, SPickItem::decode);
+        assert_eq!(packet.slot, 7);
+
+        let mut w = Writer::new();
+        w.write_bool(true);
+        let bytes = w.into_bytes();
+        let packet = decode_round_trip(&bytes, SPlayerAbilities::decode);
+        assert!(packet.flying);
     }
 }
