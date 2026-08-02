@@ -103,17 +103,18 @@ world/
 - 应用层约定**无上下文开销的二进制协议**（见 `docs/ipc.md`）：消息体为紧凑二进制帧，不使用业务 JSON/TLV 上下文。
 - 消息类型：注册、心跳（TPS/沉睡状态）、玩家进出、区块请求与数据、卸载指令等。
 
-## 第一阶段范围（Phase 1）
+## 第二阶段范围（Phase 2）
 
-- [x] 地形生成器：主世界、地狱、末地统一为 flat 超平坦（vanilla 全局方块状态 ID 对齐，含 golden 测试）。
-- [x] `lib/anvil`：1.21.1 Anvil 存档格式——.mca region 文件（8KiB 头部/扇区分配/压缩编解码，含 LZ4 与外部 .mcc 流）、chunk NBT 编解码（sections/palette/heightmap/block_entities/entities）、level.dat 与 playerdata。
-- [x] core–region 分型基本功能：region 拉起/注册/心跳/沉睡/卸载、3 × 3 预生成（9×9 超出 datarouter 端口上限，见 README 边境章节）；region 通过 `lib/anvil` 读写并锁住其 `.mca` 存档文件。
-- [x] `gameplay/minecraft`：方块、生物、声音注册；`gamerule` 与 `gamemode` 指令（含创造模式能力包、游戏规则持久化到 level.dat）。
-- [x] `/bmtool` 工具：`/bmtool tps`，输出 CPU 负载、CPU 核心数、活跃 Region 数、沉睡 Region 数、当前 region TPS、平均 region TPS。
-- [x] 控制台：参考 master 分支（stdin 线程 + 命令分发）。
-- [x] 默认 icon 与 MOTD：参考 master 分支（状态查询响应，内置 favicon）。
-- [x] `lib/mc-767`：协议 767 编解码（握手/状态/登录/配置/Play 最小子集，含实体 AddEntity/MoveEntityPos/RemoveEntities）+ NBT。
-- [x] datarouter 接入：core/region 通过共享内存通讯，二进制协议落地（含实体包转发 `ENTITY_DATA`）。
+- [ ] 红石（不包括活塞）。
+- [ ] Minecraft 原版指令：`tp`、`ban`、`whitelist`、`fill`、`setblock`、`give`。
+- [ ] 原版 `gamerule`。
+- [ ] master 分支 `/about` 实现；品牌名改为大写 `ICBM`。
+- [ ] 友好生物生成与 AI（包括声音）；暂不移除随机移动的苦力怕，但让他们的寻路看上去更合理、更符合友好生物的样子。
+- [ ] 地狱功能，包括下界传送门。
+- [ ] 附魔系统。
+- [ ] 流体：水、岩浆、含水方块。
+- [ ] TNT、掉落物实体。
+- [ ] 正版验证系统（参考 master 实现）。
 
 ## 参考基线
 

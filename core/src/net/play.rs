@@ -433,7 +433,10 @@ fn handle_player_command(server: &Server, client: &Arc<Client>, command: &str) {
             }
         }
         Some(Command::Help) => {
-            let _ = client.send_system_chat("可用命令: /gamemode, /gamerule, /bmtool tps", false);
+            let _ = client.send_system_chat("可用命令: /about, /gamemode, /gamerule, /bmtool tps", false);
+        }
+        Some(Command::About) => {
+            let _ = client.send_system_chat(&about_message(), false);
         }
         None => {}
     }
@@ -446,9 +449,9 @@ fn handle_player_command(server: &Server, client: &Arc<Client>, command: &str) {
     }
 }
 
-/// 全部顶层命令名（minecraft 命名空间 + icbm 命名空间 `bmtool`；升序，与
+/// 顶层命令名（minecraft 命名空间 + icbm 命名空间 `bmtool`；升序，与
 /// `command_suggestions` 的排序约定一致）。
-const TOP_LEVEL_COMMANDS: &[&str] = &["bmtool", "gamemode", "gamerule", "help"];
+const TOP_LEVEL_COMMANDS: &[&str] = &["about", "bmtool", "gamemode", "gamerule", "help"];
 
 /// 构建客户端命令树（0x11 `CommandTreeS2CPacket`）。
 ///
@@ -460,19 +463,23 @@ pub fn build_command_tree() -> CCommands {
     CCommands {
         nodes: vec![
             Node::Root {
-                children: vec![1, 2, 3, 4],
+                children: vec![1, 2, 3, 4, 5],
+            },
+            Node::Literal {
+                name: "about".to_owned(),
+                children: vec![],
             },
             Node::Literal {
                 name: "gamemode".to_owned(),
-                children: vec![5],
-            },
-            Node::Literal {
-                name: "gamerule".to_owned(),
                 children: vec![6],
             },
             Node::Literal {
-                name: "bmtool".to_owned(),
+                name: "gamerule".to_owned(),
                 children: vec![7],
+            },
+            Node::Literal {
+                name: "bmtool".to_owned(),
+                children: vec![8],
             },
             Node::Literal {
                 name: "help".to_owned(),
@@ -480,11 +487,11 @@ pub fn build_command_tree() -> CCommands {
             },
             Node::Argument {
                 name: "mode".to_owned(),
-                children: vec![8],
+                children: vec![9],
             },
             Node::Argument {
                 name: "rule".to_owned(),
-                children: vec![9],
+                children: vec![10],
             },
             Node::Literal {
                 name: "tps".to_owned(),
@@ -606,6 +613,15 @@ fn gamerule_value_suggestions(rule: &str) -> Vec<String> {
         }
         _ => Vec::new(),
     }
+}
+
+/// `/about` 品牌信息（参考 master `core/src/command/commands/about.rs`，品牌为
+/// 大写 ICBM；Git 哈希由 `core/build.rs` 注入）。
+pub fn about_message() -> String {
+    format!(
+        "ICBM Block Game Server, fixable client protocol version.\nGit commit: {}\nDeveloped by CubeGarden Studio, Hosted by BlockMember.\nICBM Server is NOT an open source project or freeware. All right reserved except the gameplay assets.",
+        env!("GIT_HASH")
+    )
 }
 
 /// 聚合 `/bmtool tps` 数据（`current_region` 为玩家所在区块，无玩家时 `None`）。

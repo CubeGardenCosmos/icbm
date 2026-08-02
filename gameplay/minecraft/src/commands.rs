@@ -62,7 +62,7 @@ impl GameMode {
 
 /// 顶层命令名（客户端命令树与 Tab 补全建议用；icbm 命名空间的 `bmtool` 由
 /// `icbm-gameplay-icbm` 提供，core 汇总时追加）。
-pub const COMMAND_NAMES: &[&str] = &["gamemode", "gamerule", "help"];
+pub const COMMAND_NAMES: &[&str] = &["about", "gamemode", "gamerule", "help"];
 
 /// 解析后的命令。
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -76,6 +76,8 @@ pub enum Command {
     GameRule { rule: String, value: Option<String> },
     /// `/help`。
     Help,
+    /// `/about`（品牌与构建信息）。
+    About,
 }
 
 /// 解析命令行的第一段（`/gamemode ...` / `/gamerule ...` / `/help`）。
@@ -102,6 +104,7 @@ pub fn parse_command(line: &str) -> Option<Command> {
             })
         }
         "help" => Some(Command::Help),
+        "about" => Some(Command::About),
         _ => None,
     }
 }
@@ -196,6 +199,7 @@ mod tests {
             })
         );
         assert_eq!(parse_command("/help"), Some(Command::Help));
+        assert_eq!(parse_command("/about"), Some(Command::About));
         assert_eq!(parse_command("/stop"), None); // 由 core 处理
     }
 

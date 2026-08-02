@@ -640,7 +640,7 @@ fn send_config_intro(server: &Server, client: &Arc<Client>) -> Result<(), NetErr
         icbm_mc_767::packets::config_ids::CLIENTBOUND_CUSTOM_PAYLOAD,
         |w| {
             w.write_string("minecraft:brand");
-            w.write_string("icbm");
+            w.write_string("ICBM");
         },
     )?;
     let features = crate::net::registry::feature_flags();

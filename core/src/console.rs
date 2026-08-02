@@ -21,6 +21,7 @@ use std::sync::{Arc, Mutex, OnceLock};
 use flate2::write::GzEncoder;
 use icbm_gameplay_icbm::bmtool::{BmToolCommand, format_bmtool_tps};
 use icbm_gameplay_minecraft::commands::{self, Command, GameMode};
+use crate::net::play::about_message;
 use icbm_mc_767::packets::play::clientbound::{
     CGameEvent, CPlayerAbilities, CPlayerInfoUpdate, PlayerInfoEntry,
 };
@@ -235,7 +236,7 @@ fn run_stdin_console(server: Server) {
 
 /// 控制台命令名（升序；补全与提示用）。
 const CONSOLE_COMMANDS: &[&str] = &[
-    "bmtool", "gamemode", "gamerule", "help", "list", "regions", "say", "stop",
+    "about", "bmtool", "gamemode", "gamerule", "help", "list", "regions", "say", "stop",
 ];
 
 /// rustyline 补全/高亮/提示助手（参考 master `IcbmCommandCompleter`）。
@@ -401,6 +402,7 @@ impl Server {
                     }
                 }
                 Command::Help => print_help(),
+                Command::About => info!("{}", about_message()),
             }
             return;
         }
@@ -450,6 +452,7 @@ impl Server {
 /// 打印帮助。
 fn print_help() {
     info!("可用命令:");
+    info!("  about");
     info!("  gamemode <survival|creative|adventure|spectator> [玩家]");
     info!("  gamerule <规则> [值]");
     info!("  bmtool tps");
