@@ -71,6 +71,8 @@ pub struct ServerInner {
     pub world: Mutex<WorldState>,
     /// 运行标志。
     pub running: AtomicBool,
+    /// 收到的 `CHUNK_DATA` 计数（诊断）。
+    pub chunk_diag: std::sync::atomic::AtomicU64,
 }
 
 /// 服务器（可克隆共享）。
@@ -104,6 +106,7 @@ impl Server {
                 ipc,
                 world,
                 running: AtomicBool::new(true),
+                chunk_diag: std::sync::atomic::AtomicU64::new(0),
             }),
         })
     }
@@ -210,9 +213,24 @@ impl std::ops::Deref for Server {
 fn spawn_receiver(server: &Server) {
     let server = server.clone();
     std::thread::spawn(move || {
+        let mut last_icbm_push = Instant::now();
         while server.running.load(Ordering::Relaxed) {
             match server.ipc.recv(100) {
-                Ok(Some(message)) => handle_core_message(&server, &message),
+                Ok(Some(message)) => {
+                    if message.kind == 0x07
+                        && server
+                            .chunk_diag
+                            .fetch_add(1, Ordering::Relaxed)
+                            .is_multiple_of(10)
+                    {
+                        // CHUNK_DATA 计数（诊断，每 10 个一条）
+                        info!(
+                            count = server.chunk_diag.load(Ordering::Relaxed),
+                            "core chunk data"
+                        );
+                    }
+                    handle_core_message(&server, &message);
+                }
                 Ok(None) => {}
                 Err(err) => {
                     warn!(%err, "ipc recv failed");
@@ -220,9 +238,29 @@ fn spawn_receiver(server: &Server) {
                 }
             }
             maintain_regions(&server);
+            // ICBM 快照约每秒推送（协议建议 refreshIntervalTicks=20）
+            if last_icbm_push.elapsed() >= Duration::from_secs(1) {
+                push_icbm_snapshots(&server);
+                last_icbm_push = Instant::now();
+            }
         }
         info!("datarouter receiver stopped");
     });
+}
+
+/// 给已订阅且支持快照的玩家推送 ICBM 状态快照。
+fn push_icbm_snapshots(server: &Server) {
+    let players: Vec<Arc<Client>> = {
+        let world = server.world.lock().expect("world lock");
+        world.players.values().cloned().collect()
+    };
+    for client in players {
+        if client.icbm_subscribed.load(Ordering::Relaxed)
+            && client.icbm_snapshot_ok.load(Ordering::Relaxed)
+        {
+            crate::net::play::send_icbm_snapshot(server, &client);
+        }
+    }
 }
 
 /// region 心跳超时与沉睡卸载维护。

@@ -1,6 +1,7 @@
 //! Play 阶段处理：进服区块加载、玩家包处理、聊天与命令。
 
 use std::sync::Arc;
+use std::sync::atomic::Ordering;
 use std::time::{Duration, Instant};
 
 use icbm_gameplay_icbm::bmtool::{BmToolTpsData, format_bmtool_tps};
@@ -13,7 +14,7 @@ use icbm_mc_767::packets::play::serverbound::{
 use icbm_mc_767::packets::play_ids;
 use icbm_region::RegionId;
 use icbm_region::protocol::{DIM_OVERWORLD, encode_chunk_request};
-use tracing::{info, warn};
+use tracing::{debug, info, warn};
 
 use crate::client::{Client, NetError, Position};
 use crate::server::Server;
@@ -97,6 +98,9 @@ pub fn handle_play_packet(
         }
         play_ids::SERVERBOUND_CLIENT_COMMAND => {
             let _ = icbm_mc_767::packets::play::serverbound::SClientCommand::decode(reader)?;
+        }
+        play_ids::SERVERBOUND_CUSTOM_PAYLOAD => {
+            handle_custom_payload(server, client, reader)?;
         }
         play_ids::SERVERBOUND_CLIENT_INFORMATION => {
             let info = icbm_mc_767::packets::play::serverbound::SClientInformation::decode(reader)?;
@@ -249,4 +253,116 @@ fn read_cpu_load() -> f32 {
         .and_then(|text| text.split_whitespace().next().map(str::to_owned))
         .and_then(|value| value.parse::<f32>().ok())
         .unwrap_or(0.0)
+}
+
+/// Play 阶段 `minecraft:register` 与 ICBM 通道处理。
+///
+/// 对照 ICBM Client 协议 v1：`icbm_client:state_subscription`（C2S）为
+/// `VarInt` `protocolVersion` + `Boolean` `enabled`；服务器收到有效订阅且客户端
+/// 已声明 `state_snapshot` 接收能力后发送快照。
+fn handle_custom_payload(
+    server: &Server,
+    client: &Arc<Client>,
+    reader: &mut Reader<'_>,
+) -> Result<(), NetError> {
+    let channel = reader.read_string()?;
+    let data = reader.read_rest().to_vec();
+    match channel.as_str() {
+        "minecraft:register" => {
+            for ch in crate::client::register_channels(&data) {
+                if ch == "icbm_client:state_snapshot" {
+                    client.icbm_snapshot_ok.store(true, Ordering::Relaxed);
+                }
+            }
+        }
+        "icbm_client:state_subscription" => {
+            let mut r = Reader::new(&data);
+            let Ok(protocol) = r.read_var_int() else {
+                return Ok(());
+            };
+            if protocol != 1 {
+                // 协议版本不匹配：忽略
+                return Ok(());
+            }
+            let Ok(enabled) = r.read_bool() else {
+                return Ok(());
+            };
+            client.icbm_subscribed.store(enabled, Ordering::Relaxed);
+            debug!(
+                name = %client.name.lock().expect("name"),
+                enabled, "icbm state subscription"
+            );
+            if enabled {
+                send_icbm_snapshot(server, client);
+            }
+        }
+        _ => {}
+    }
+    Ok(())
+}
+
+/// 发送 ICBM 状态快照（S2C `icbm_client:state_snapshot`）。
+///
+/// 字段顺序对照 `StateSnapshotPayload.STREAM_CODEC`：`VarInt` 协议版本 →
+/// `VarLong` 序号 → `ResourceLocation` 维度 → `Boolean` 裁切 → 可选 Region（4×VarInt）→
+/// 可选 regionId → 可选 processId → 可选速度 → 可选 TPS → `VarInt` 刷新间隔。
+pub fn send_icbm_snapshot(server: &Server, client: &Arc<Client>) {
+    let position = client.position.lock().expect("position");
+    let region_id = RegionId::from_overworld_chunk(position.chunk_x(), position.chunk_z());
+    let world = server.world.lock().expect("world lock");
+    let (region, region_name, process_id, tps) =
+        world
+            .regions
+            .get(&region_id)
+            .map_or((None, None, None, 0.0), |entry| {
+                let min_x = i64::from(region_id.rx) * 32 * 16;
+                let min_z = i64::from(region_id.rz) * 32 * 16;
+                let max_x = min_x + 32 * 16;
+                let max_z = min_z + 32 * 16;
+                (
+                    Some((min_x, min_z, max_x, max_z)),
+                    Some(region_id.service_name()),
+                    Some(entry.pid.to_string()),
+                    entry.tps,
+                )
+            });
+    let sequence = client.icbm_sequence.fetch_add(1, Ordering::Relaxed) + 1;
+    let _ = client.send_encoded(
+        icbm_mc_767::packets::play_ids::CLIENTBOUND_CUSTOM_PAYLOAD,
+        |w| {
+            w.write_string("icbm_client:state_snapshot");
+            w.write_var_int(1); // protocolVersion
+            w.write_var_long(i64::try_from(sequence).unwrap_or(i64::MAX));
+            w.write_string("minecraft:overworld");
+            w.write_bool(false); // Phase 1 无裁切（区域外临时生成）
+            match region {
+                Some((min_x, min_z, max_x, max_z)) => {
+                    w.write_bool(true);
+                    w.write_var_int(i32::try_from(min_x).unwrap_or(i32::MAX));
+                    w.write_var_int(i32::try_from(min_z).unwrap_or(i32::MAX));
+                    w.write_var_int(i32::try_from(max_x).unwrap_or(i32::MAX));
+                    w.write_var_int(i32::try_from(max_z).unwrap_or(i32::MAX));
+                }
+                None => w.write_bool(false),
+            }
+            match region_name {
+                Some(name) => {
+                    w.write_bool(true);
+                    w.write_string(&name);
+                }
+                None => w.write_bool(false),
+            }
+            match process_id {
+                Some(pid) => {
+                    w.write_bool(true);
+                    w.write_string(&pid);
+                }
+                None => w.write_bool(false),
+            }
+            w.write_bool(false); // 速度未知
+            w.write_bool(true); // 有 TPS
+            w.write_f32_be(tps);
+            w.write_var_int(20); // refreshIntervalTicks
+        },
+    );
 }

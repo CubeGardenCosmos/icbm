@@ -6,7 +6,7 @@
 use std::fmt;
 use std::io::{Read, Write};
 use std::net::TcpStream;
-use std::sync::atomic::{AtomicBool, AtomicI32, AtomicU8, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicI32, AtomicU8, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
@@ -146,6 +146,12 @@ pub struct Client {
     teleport_id: AtomicI32,
     /// 延迟（毫秒）。
     pub latency: AtomicI32,
+    /// ICBM 客户端已声明可接收 `icbm_client:state_snapshot`（配置阶段 register）。
+    pub icbm_snapshot_ok: AtomicBool,
+    /// ICBM 玩家订阅状态（`icbm_client:state_subscription` enabled）。
+    pub icbm_subscribed: AtomicBool,
+    /// ICBM 快照单调序号。
+    pub icbm_sequence: AtomicU64,
 }
 
 const STATE_HANDSHAKE: u8 = 0;
@@ -177,6 +183,9 @@ impl Client {
             keep_alive: Mutex::new(None),
             teleport_id: AtomicI32::new(0),
             latency: AtomicI32::new(0),
+            icbm_snapshot_ok: AtomicBool::new(false),
+            icbm_subscribed: AtomicBool::new(false),
+            icbm_sequence: AtomicU64::new(0),
         })
     }
 
@@ -459,7 +468,19 @@ fn handle_serverbound(
                 let _ = icbm_mc_767::packets::config::SPong::decode(&mut reader)?;
             }
             icbm_mc_767::packets::config_ids::SERVERBOUND_CUSTOM_PAYLOAD => {
-                let _ = icbm_mc_767::packets::config::SPluginMessage::decode(&mut reader)?;
+                let msg = icbm_mc_767::packets::config::SPluginMessage::decode(&mut reader)?;
+                if msg.channel == "minecraft:register" {
+                    // 客户端声明可接收的 S2C 通道（NUL 分隔）
+                    for channel in register_channels(&msg.data) {
+                        if channel == "icbm_client:state_snapshot" {
+                            client.icbm_snapshot_ok.store(true, Ordering::Relaxed);
+                            debug!(
+                                name = %client.name.lock().expect("name"),
+                                "icbm client declared state_snapshot"
+                            );
+                        }
+                    }
+                }
             }
             _ => return Err(NetError::BadPacket("unexpected config packet")),
         },
@@ -527,6 +548,16 @@ fn handle_login_start(
 /// `CustomPayload(brand)`（可选）→ `FeaturesS2CPacket` → `SelectKnownPacksS2CPacket`，
 /// 然后等待客户端回显 known packs，再下发注册表与标签。
 fn send_config_intro(server: &Server, client: &Arc<Client>) -> Result<(), NetError> {
+    // 官方 `ServerConfigurationNetworkHandler#sendConfigurations` 最先发 brand：
+    // CustomPayloadS2CPacket(BrandCustomPayload(modName)) → Features → SelectKnownPacks。
+    // 客户端 F3 的 "Server brand" 依赖此包，缺失显示 ~~NULL~~。
+    client.send_encoded(
+        icbm_mc_767::packets::config_ids::CLIENTBOUND_CUSTOM_PAYLOAD,
+        |w| {
+            w.write_string("minecraft:brand");
+            w.write_string("icbm");
+        },
+    )?;
     let features = crate::net::registry::feature_flags();
     client.send_encoded(
         icbm_mc_767::packets::config_ids::CLIENTBOUND_UPDATE_ENABLED_FEATURES,
@@ -578,6 +609,16 @@ fn send_config_data(client: &Arc<Client>) -> Result<(), NetError> {
 /// 进入 Play：加入游戏 → 区块加载 → 位置同步。
 pub fn enter_play(server: &Server, client: &Arc<Client>) -> Result<(), NetError> {
     send_join_sequence(server, client)?;
+
+    // 服务器声明可接收 `icbm_client:state_subscription`（C2S 通道）。
+    // 对照 ICBM Client 协议：服务端进入 Play 后用原版 `minecraft:register` 声明。
+    client.send_encoded(
+        icbm_mc_767::packets::play_ids::CLIENTBOUND_CUSTOM_PAYLOAD,
+        |w| {
+            w.write_string("minecraft:register");
+            w.write_string("icbm_client:state_subscription");
+        },
+    )?;
 
     // 注册玩家（此后 receiver 可转发区块/聊天）
     {
@@ -772,6 +813,27 @@ pub fn offline_uuid(name: &str) -> Uuid {
     bytes[6] = (bytes[6] & 0x0F) | 0x30;
     bytes[8] = (bytes[8] & 0x3F) | 0x80;
     Uuid::from_bytes(bytes)
+}
+
+/// 解析原版 `minecraft:register` payload（VarInt 长度 + NUL 分隔通道列表）。
+#[must_use]
+pub fn register_channels(data: &[u8]) -> Vec<String> {
+    let mut reader = icbm_mc_767::codec::Reader::new(data);
+    let Ok(len) = reader.read_var_int() else {
+        return Vec::new();
+    };
+    let Ok(len) = usize::try_from(len) else {
+        return Vec::new();
+    };
+    let rest = reader.read_rest();
+    if rest.len() < len {
+        return Vec::new();
+    }
+    rest[..len]
+        .split(|&b| b == 0)
+        .filter(|part| !part.is_empty())
+        .map(|part| String::from_utf8_lossy(part).into_owned())
+        .collect()
 }
 
 #[cfg(test)]

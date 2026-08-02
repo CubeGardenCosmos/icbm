@@ -156,9 +156,13 @@ pub struct RegionService {
     players: HashSet<Uuid>,
     running: bool,
     unknown_messages: u64,
+    /// 待发送区块（每 tick 分批冲刷）。
+    pending_chunks: std::collections::VecDeque<(Face, i32, i32)>,
 }
 
 impl RegionService {
+    /// 每 tick 最多发送的区块数（约 416KB/批，远小于 channel 容量）。
+    const CHUNKS_PER_TICK: usize = 8;
     /// 新建服务（连接 datarouter、打开存档）。
     pub fn new(config: RegionConfig) -> Result<Self, RegionError> {
         let ipc = Ipc::connect(&config.shm_name, &config.id.service_name())?;
@@ -172,6 +176,7 @@ impl RegionService {
             players: HashSet::new(),
             running: true,
             unknown_messages: 0,
+            pending_chunks: std::collections::VecDeque::new(),
         })
     }
 
@@ -234,6 +239,7 @@ impl RegionService {
     fn tick_simulate(&mut self) -> Result<(), RegionError> {
         self.ticker.begin();
         self.drain_messages()?;
+        self.flush_chunks()?;
         // Phase 1 世界 tick 为空（无实体/方块更新），仅维持 TPS 与心跳
         let tps = self.ticker.end();
         if self.ticker.should_heartbeat() {
@@ -251,6 +257,7 @@ impl RegionService {
     /// 沉睡：不 tick 世界，保持响应与心跳。
     fn tick_sleeping(&mut self) -> Result<(), RegionError> {
         self.drain_messages()?;
+        self.flush_chunks()?;
         if self.ticker.should_heartbeat() {
             self.send_heartbeat(0.0);
             self.ticker.mark_heartbeat();
@@ -309,7 +316,7 @@ impl RegionService {
                 let Some(face) = Face::from_byte(dim) else {
                     return Err(RegionError::InvalidMessage(format!("bad dim {dim}")));
                 };
-                self.serve_chunks(face, cx, cz, radius)?;
+                self.serve_chunks(face, cx, cz, radius);
             }
             kind::REGION_UNLOAD => {
                 info!(id = %self.config.id.service_name(), "unload requested, flushing");
@@ -342,26 +349,40 @@ impl RegionService {
         Ok(())
     }
 
-    /// 响应区块请求（含半径内邻居）。
-    fn serve_chunks(
-        &mut self,
-        face: Face,
-        cx: i32,
-        cz: i32,
-        radius: i32,
-    ) -> Result<(), RegionError> {
+    /// 响应区块请求（入队，由每 tick 的 `flush_chunks` 分批发送）。
+    fn serve_chunks(&mut self, face: Face, cx: i32, cz: i32, radius: i32) {
         let radius = radius.clamp(0, 32);
         for dx in -radius..=radius {
             for dz in -radius..=radius {
-                let chunk_x = cx + dx;
-                let chunk_z = cz + dz;
-                let payload = self.store.network_chunk_payload(face, chunk_x, chunk_z)?;
-                self.ipc.send_retry(
-                    CORE_SERVICE,
-                    kind::CHUNK_DATA,
-                    &encode_chunk_data(face.byte(), chunk_x, chunk_z, &payload),
-                )?;
+                self.pending_chunks.push_back((face, cx + dx, cz + dz));
             }
+        }
+    }
+
+    /// 每 tick 最多发送固定数量的区块，避免一次性灌满 datarouter channel
+    /// （81 区块约 4.2MB > channel 容量会导致 send BUSY 阻塞心跳）。
+    fn flush_chunks(&mut self) -> Result<(), RegionError> {
+        let mut sent = 0;
+        let started = std::time::Instant::now();
+        while sent < Self::CHUNKS_PER_TICK {
+            let Some((face, chunk_x, chunk_z)) = self.pending_chunks.pop_front() else {
+                break;
+            };
+            let payload = self.store.network_chunk_payload(face, chunk_x, chunk_z)?;
+            self.ipc.send_retry(
+                CORE_SERVICE,
+                kind::CHUNK_DATA,
+                &encode_chunk_data(face.byte(), chunk_x, chunk_z, &payload),
+            )?;
+            sent += 1;
+        }
+        if sent > 0 {
+            debug!(
+                sent,
+                elapsed_ms = started.elapsed().as_millis(),
+                pending = self.pending_chunks.len(),
+                "chunk flush batch"
+            );
         }
         Ok(())
     }

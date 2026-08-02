@@ -72,6 +72,7 @@ pub mod play_ids {
     pub const SERVERBOUND_MOVE_ROT: i32 = 0x1C;
     pub const SERVERBOUND_MOVE_STATUS_ONLY: i32 = 0x1D;
     pub const SERVERBOUND_PLAYER_ACTION: i32 = 0x24;
+    pub const SERVERBOUND_CUSTOM_PAYLOAD: i32 = 0x17;
     pub const SERVERBOUND_PONG: i32 = 0x27;
     pub const SERVERBOUND_SWING: i32 = 0x36;
     // clientbound
@@ -80,6 +81,7 @@ pub mod play_ids {
     pub const CLIENTBOUND_CHUNK_BATCH_FINISHED: i32 = 0x0C;
     pub const CLIENTBOUND_CHUNK_BATCH_START: i32 = 0x0D;
     pub const CLIENTBOUND_COMMANDS: i32 = 0x11;
+    pub const CLIENTBOUND_CUSTOM_PAYLOAD: i32 = 0x18;
     pub const CLIENTBOUND_DISCONNECT: i32 = 0x1D;
     pub const CLIENTBOUND_FORGET_LEVEL_CHUNK: i32 = 0x21;
     pub const CLIENTBOUND_GAME_EVENT: i32 = 0x22;
