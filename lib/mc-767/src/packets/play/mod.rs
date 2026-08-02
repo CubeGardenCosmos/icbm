@@ -71,16 +71,19 @@ pub mod block_state_ids {
     pub const END_STONE: i32 = 7416;
 }
 
-/// 1.21.1 生物群系网络 ID（vanilla 字母序注册表，用于 chunk biome palette）。
+/// 1.21.1 生物群系网络 ID（icbm 服务器自定义注册表顺序）。
+///
+/// 注意：与 vanilla 字母序不同。客户端注册表由配置阶段的
+/// `registry_data` 按本顺序建立，chunk biome palette 使用这些 ID。
 pub mod biome_ids {
-    /// 平原。
-    pub const PLAINS: i32 = 39;
-    /// 地狱荒原。
-    pub const NETHER_WASTES: i32 = 34;
-    /// 末地。
-    pub const THE_END: i32 = 55;
     /// 虚空。
-    pub const THE_VOID: i32 = 56;
+    pub const THE_VOID: i32 = 0;
+    /// 平原。
+    pub const PLAINS: i32 = 1;
+    /// 地狱荒原。
+    pub const NETHER_WASTES: i32 = 2;
+    /// 末地。
+    pub const THE_END: i32 = 3;
 }
 
 /// 维度类型注册表网络 ID（顺序即注册表数据顺序，见 core 配置阶段）。

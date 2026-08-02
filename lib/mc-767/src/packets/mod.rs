@@ -61,6 +61,7 @@ pub mod play_ids {
     // serverbound
     pub const SERVERBOUND_CONFIRM_TELEPORT: i32 = 0x00;
     pub const SERVERBOUND_CHAT_ACK: i32 = 0x03;
+    pub const SERVERBOUND_CHAT_COMMAND: i32 = 0x04;
     pub const SERVERBOUND_CHAT: i32 = 0x06;
     pub const SERVERBOUND_CHUNK_BATCH_RECEIVED: i32 = 0x08;
     pub const SERVERBOUND_CLIENT_COMMAND: i32 = 0x09;

@@ -255,7 +255,7 @@ fn chunk_from_anvil(nbt: &ChunkNbt) -> ChunkColumn {
         .sections
         .first()
         .and_then(|s| s.biome_palette.first())
-        .map_or(39, |name| biome_id(name));
+        .map_or(1, |name| biome_id(name));
     ChunkColumn {
         x: nbt.x,
         z: nbt.z,
@@ -266,15 +266,13 @@ fn chunk_from_anvil(nbt: &ChunkNbt) -> ChunkColumn {
     }
 }
 
-/// 生物群系网络 ID → 名（存储 palette 使用）。
-///
-/// 返回 vanilla 生物群系名。
+/// 生物群系网络 ID → 名（icbm 注册表顺序）。
 #[must_use]
 pub const fn biome_name(id: i32) -> &'static str {
     match id {
-        34 => "minecraft:nether_wastes",
-        55 => "minecraft:the_end",
-        56 => "minecraft:the_void",
+        2 => "minecraft:nether_wastes",
+        3 => "minecraft:the_end",
+        0 => "minecraft:the_void",
         _ => "minecraft:plains",
     }
 }
@@ -283,10 +281,10 @@ pub const fn biome_name(id: i32) -> &'static str {
 #[must_use]
 pub fn biome_id(name: &str) -> i32 {
     match name {
-        "minecraft:nether_wastes" => 34,
-        "minecraft:the_end" => 55,
-        "minecraft:the_void" => 56,
-        _ => 39,
+        "minecraft:nether_wastes" => 2,
+        "minecraft:the_end" => 3,
+        "minecraft:the_void" => 0,
+        _ => 1,
     }
 }
 

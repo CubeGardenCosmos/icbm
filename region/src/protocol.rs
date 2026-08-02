@@ -7,6 +7,7 @@ use std::fmt;
 
 use blinkcms_datarouter::frontend::{Frontend, FrontendOptions};
 use blinkcms_datarouter::protocol::{self, MSG_CONTROL, Message};
+use uuid::Uuid;
 
 /// core 服务名。
 pub const CORE_SERVICE: &str = "icbm.core";
@@ -175,10 +176,74 @@ pub fn encode_heartbeat(tps: f32, sleeping: bool, loaded_chunks: u32, tick: u64)
     out
 }
 
+/// 解析 `REGION_HEARTBEAT` 载荷。
+pub fn decode_heartbeat(body: &[u8]) -> Result<(f32, bool, u32, u64), IpcError> {
+    if body.len() < 17 {
+        return Err(IpcError::Length("heartbeat", body.len()));
+    }
+    Ok((
+        f32::from_le_bytes(body[0..4].try_into().expect("slice")),
+        body[4] != 0,
+        u32::from_le_bytes(body[5..9].try_into().expect("slice")),
+        u64::from_le_bytes(body[9..17].try_into().expect("slice")),
+    ))
+}
+
 /// `REGION_UNLOAD` / `CHUNK_REQUEST` 的维度参数由服务侧直接构造。
 #[must_use]
 pub fn encode_unload(dim: u8, rx: i32, rz: i32) -> Vec<u8> {
     encode_register(dim, rx, rz, 0)
+}
+
+/// `PLAYER_ENTER` 载荷：`[uuid 16B][f64 x][f64 y][f64 z][f32 yaw][f32 pitch]`。
+#[must_use]
+pub fn encode_player_enter(uuid: &Uuid, pos: [f64; 3], rot: [f32; 2]) -> Vec<u8> {
+    let mut out = Vec::with_capacity(48);
+    out.extend_from_slice(uuid.as_bytes());
+    for value in pos {
+        out.extend_from_slice(&value.to_le_bytes());
+    }
+    for value in rot {
+        out.extend_from_slice(&value.to_le_bytes());
+    }
+    out
+}
+
+/// 解析 `PLAYER_ENTER` 载荷。
+pub fn decode_player_enter(body: &[u8]) -> Result<(Uuid, [f64; 3], [f32; 2]), IpcError> {
+    if body.len() < 48 {
+        return Err(IpcError::Length("player enter", body.len()));
+    }
+    let mut uuid_bytes = [0u8; 16];
+    uuid_bytes.copy_from_slice(&body[0..16]);
+    Ok((
+        Uuid::from_bytes(uuid_bytes),
+        [
+            f64::from_le_bytes(body[16..24].try_into().expect("slice")),
+            f64::from_le_bytes(body[24..32].try_into().expect("slice")),
+            f64::from_le_bytes(body[32..40].try_into().expect("slice")),
+        ],
+        [
+            f32::from_le_bytes(body[40..44].try_into().expect("slice")),
+            f32::from_le_bytes(body[44..48].try_into().expect("slice")),
+        ],
+    ))
+}
+
+/// `PLAYER_LEAVE` 载荷：`[uuid 16B]`。
+#[must_use]
+pub fn encode_player_leave(uuid: &Uuid) -> Vec<u8> {
+    uuid.as_bytes().to_vec()
+}
+
+/// 解析 `PLAYER_LEAVE` 载荷。
+pub fn decode_player_leave(body: &[u8]) -> Result<Uuid, IpcError> {
+    if body.len() < 16 {
+        return Err(IpcError::Length("player leave", body.len()));
+    }
+    let mut uuid_bytes = [0u8; 16];
+    uuid_bytes.copy_from_slice(&body[0..16]);
+    Ok(Uuid::from_bytes(uuid_bytes))
 }
 
 /// `CHUNK_REQUEST` 载荷：`[u8 dim][i32 cx][i32 cz][i32 radius]`。
@@ -316,6 +381,24 @@ mod tests {
     }
 
     #[test]
+    #[test]
+    fn player_enter_leave_round_trip() {
+        let uuid = Uuid::from_u128(0x1122_3344_5566_7788_99aa_bbcc_ddee_ff00);
+        let body = encode_player_enter(&uuid, [1.5, 64.0, -3.25], [90.0, 45.0]);
+        let (decoded_uuid, pos, rot) = decode_player_enter(&body).unwrap();
+        assert_eq!(decoded_uuid, uuid);
+        assert_eq!(pos, [1.5, 64.0, -3.25]);
+        assert_eq!(rot, [90.0, 45.0]);
+        let leave = encode_player_leave(&uuid);
+        assert_eq!(decode_player_leave(&leave).unwrap(), uuid);
+    }
+
+    fn heartbeat_round_trip() {
+        let body = encode_heartbeat(19.5, true, 7, 999);
+        let (tps, sleeping, loaded, tick) = decode_heartbeat(&body).unwrap();
+        assert_eq!((tps, sleeping, loaded, tick), (19.5, true, 7, 999));
+    }
+
     fn region_id_mapping() {
         let id = RegionId::from_overworld_chunk(100, -50);
         assert_eq!((id.rx, id.rz), (3, -2));

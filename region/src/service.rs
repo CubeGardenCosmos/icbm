@@ -10,7 +10,8 @@ use uuid::Uuid;
 
 use crate::protocol::{
     CORE_SERVICE, DIM_OVERWORLD, Ipc, IpcError, IpcMessage, decode_chunk_request,
-    decode_register_ack, encode_chunk_data, encode_heartbeat, encode_register, encode_stats, kind,
+    decode_player_enter, decode_player_leave, decode_register_ack, encode_chunk_data,
+    encode_heartbeat, encode_register, encode_stats, kind,
 };
 use crate::store::ChunkStore;
 use crate::{Face, RegionId};
@@ -291,12 +292,12 @@ impl RegionService {
     fn handle_message(&mut self, message: &IpcMessage) -> Result<(), RegionError> {
         match message.kind {
             kind::PLAYER_ENTER => {
-                let uuid = parse_uuid(&message.body, "player enter")?;
+                let (uuid, _, _) = decode_player_enter(&message.body)?;
                 self.players.insert(uuid);
                 debug!(%uuid, "player entered region");
             }
             kind::PLAYER_LEAVE => {
-                let uuid = parse_uuid(&message.body, "player leave")?;
+                let uuid = decode_player_leave(&message.body)?;
                 self.players.remove(&uuid);
                 debug!(%uuid, "player left region");
             }
@@ -361,19 +362,6 @@ impl RegionService {
         }
         Ok(())
     }
-}
-
-/// 解析 16 字节 UUID 载荷。
-fn parse_uuid(body: &[u8], field: &'static str) -> Result<Uuid, RegionError> {
-    if body.len() != 16 {
-        return Err(RegionError::InvalidMessage(format!(
-            "{field} uuid needs 16 bytes, got {}",
-            body.len()
-        )));
-    }
-    let mut bytes = [0u8; 16];
-    bytes.copy_from_slice(body);
-    Ok(Uuid::from_bytes(bytes))
 }
 
 /// 运行 region（core 二进制 `--region` 模式的入口）。

@@ -414,10 +414,10 @@ pub struct CGameEvent {
 }
 
 impl CGameEvent {
-    /// 区块加载开始事件。
-    pub const EVENT_LEVEL_CHUNKS_LOAD_START: u8 = 12;
-    /// 区块加载完成事件。
-    pub const EVENT_LEVEL_CHUNKS_LOAD_DONE: u8 = 13;
+    /// 区块即将到达（进服时发送；客户端据此显示加载界面）。
+    pub const EVENT_INITIAL_CHUNKS_COMING: u8 = 13;
+    /// 游戏模式变更。
+    pub const EVENT_GAME_MODE_CHANGED: u8 = 3;
 
     /// 编码载荷。
     pub fn encode(&self, writer: &mut Writer) {

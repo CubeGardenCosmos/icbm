@@ -9,25 +9,21 @@ use super::login_ids::{
     SERVERBOUND_START,
 };
 
-/// Serverbound：登录开始（0x00）。
+/// Serverbound：登录开始（0x00，1.21.1：`[String name≤16][UUID profile_id]`）。
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SLoginStart {
     /// 玩家名。
     pub name: String,
-    /// 玩家 UUID（1.20.2+ 可选）。
-    pub uuid: Option<Uuid>,
+    /// 玩家 UUID（客户端提供；离线模式下服务器以 `OfflinePlayer:` 哈希为准）。
+    pub profile_id: Uuid,
 }
 
 impl SLoginStart {
-    /// 解码。
+    /// 解码（对照 `LoginHelloC2SPacket.java`）。
     pub fn decode(reader: &mut Reader<'_>) -> Result<Self, CodecError> {
         let name = reader.read_string()?;
-        let uuid = if reader.read_bool()? {
-            Some(reader.read_uuid()?)
-        } else {
-            None
-        };
-        Ok(Self { name, uuid })
+        let profile_id = reader.read_uuid()?;
+        Ok(Self { name, profile_id })
     }
 
     /// 包 ID。
@@ -129,28 +125,17 @@ mod tests {
     use uuid::Uuid;
 
     #[test]
-    fn login_start_without_uuid() {
-        let mut w = Writer::new();
-        w.write_string("steve");
-        w.write_bool(false);
-        let bytes = w.into_bytes();
-        let mut r = Reader::new(&bytes);
-        let start = SLoginStart::decode(&mut r).unwrap();
-        assert_eq!(start.name, "steve");
-        assert!(start.uuid.is_none());
-    }
-
-    #[test]
-    fn login_start_with_uuid() {
+    fn login_start_decodes_name_and_uuid() {
         let uuid = Uuid::from_u128(0x1122_3344_5566_7788_99aa_bbcc_ddee_ff00);
         let mut w = Writer::new();
         w.write_string("steve");
-        w.write_bool(true);
         w.write_uuid(&uuid);
         let bytes = w.into_bytes();
         let mut r = Reader::new(&bytes);
         let start = SLoginStart::decode(&mut r).unwrap();
-        assert_eq!(start.uuid, Some(uuid));
+        assert_eq!(start.name, "steve");
+        assert_eq!(start.profile_id, uuid);
+        assert!(r.is_empty());
     }
 
     #[test]

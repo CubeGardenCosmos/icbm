@@ -280,9 +280,9 @@ mod tests {
 
     #[test]
     fn biome_ids_match_protocol() {
-        assert_eq!(Dimension::Overworld.flat_config().biome_id, 39);
-        assert_eq!(Dimension::Nether.flat_config().biome_id, 34);
-        assert_eq!(Dimension::End.flat_config().biome_id, 55);
+        assert_eq!(Dimension::Overworld.flat_config().biome_id, 1);
+        assert_eq!(Dimension::Nether.flat_config().biome_id, 2);
+        assert_eq!(Dimension::End.flat_config().biome_id, 3);
     }
 
     #[test]

@@ -4,9 +4,9 @@ use crate::codec::{CodecError, Reader};
 
 use super::BlockPos;
 use crate::packets::play_ids::{
-    SERVERBOUND_CHAT, SERVERBOUND_CHUNK_BATCH_RECEIVED, SERVERBOUND_CLIENT_COMMAND,
-    SERVERBOUND_CLIENT_INFORMATION, SERVERBOUND_CONFIRM_TELEPORT, SERVERBOUND_KEEP_ALIVE,
-    SERVERBOUND_MOVE_POS, SERVERBOUND_MOVE_POS_ROT, SERVERBOUND_MOVE_ROT,
+    SERVERBOUND_CHAT, SERVERBOUND_CHAT_COMMAND, SERVERBOUND_CHUNK_BATCH_RECEIVED,
+    SERVERBOUND_CLIENT_COMMAND, SERVERBOUND_CLIENT_INFORMATION, SERVERBOUND_CONFIRM_TELEPORT,
+    SERVERBOUND_KEEP_ALIVE, SERVERBOUND_MOVE_POS, SERVERBOUND_MOVE_POS_ROT, SERVERBOUND_MOVE_ROT,
     SERVERBOUND_MOVE_STATUS_ONLY, SERVERBOUND_PLAYER_ACTION, SERVERBOUND_PONG, SERVERBOUND_SWING,
 };
 
@@ -29,6 +29,53 @@ impl SConfirmTeleport {
     #[must_use]
     pub const fn packet_id() -> i32 {
         SERVERBOUND_CONFIRM_TELEPORT
+    }
+}
+
+/// Serverbound：聊天命令（0x04，`/` 开头消息）。
+#[derive(Debug, Clone)]
+pub struct SChatCommand {
+    /// 命令文本（不含 `/`）。
+    pub command: String,
+    /// 时间戳。
+    pub timestamp: i64,
+    /// 盐。
+    pub salt: i64,
+    /// 签名（未启用时为空）。
+    pub signature: Option<Vec<u8>>,
+    /// 消息数量。
+    pub message_count: i32,
+    /// 已确认消息位集。
+    pub acknowledged: Vec<i64>,
+}
+
+impl SChatCommand {
+    /// 解码。
+    pub fn decode(reader: &mut Reader<'_>) -> Result<Self, CodecError> {
+        let command = reader.read_string()?;
+        let timestamp = reader.read_i64_be()?;
+        let salt = reader.read_i64_be()?;
+        let signature = if reader.read_bool()? {
+            Some(reader.read_byte_array()?.to_vec())
+        } else {
+            None
+        };
+        let message_count = reader.read_var_int()?;
+        let acknowledged = reader.read_bitset()?;
+        Ok(Self {
+            command,
+            timestamp,
+            salt,
+            signature,
+            message_count,
+            acknowledged,
+        })
+    }
+
+    /// 包 ID。
+    #[must_use]
+    pub const fn packet_id() -> i32 {
+        SERVERBOUND_CHAT_COMMAND
     }
 }
 
