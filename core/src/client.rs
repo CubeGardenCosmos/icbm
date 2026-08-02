@@ -553,11 +553,9 @@ fn send_config_intro(server: &Server, client: &Arc<Client>) -> Result<(), NetErr
 /// 收到客户端 known packs 回显后发 `DynamicRegistriesS2CPacket` ×N + `SynchronizeTagsS2CPacket`，
 /// 随后发 ReadyS2CPacket（finish config）。
 fn send_config_data(client: &Arc<Client>) -> Result<(), NetError> {
-    let registries = [
-        crate::net::registry::dimension_type_registry(),
-        crate::net::registry::biome_registry(),
-    ];
-    for registry in &registries {
+    // 官方 RegistryLoader.SYNCED_REGISTRIES 共 11 个；wolf_variant / painting_variant
+    // 标记 requiredNonEmpty，客户端校验非空，必须全部下发。
+    for registry in crate::net::registry::synced_registries() {
         client.send_encoded(
             icbm_mc_767::packets::config_ids::CLIENTBOUND_REGISTRY_DATA,
             |w| registry.encode(w),

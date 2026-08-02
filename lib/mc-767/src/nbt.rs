@@ -96,6 +96,29 @@ impl NbtList {
             values: Vec::new(),
         }
     }
+
+    /// 从元素构造（自动推导元素标签类型；空列表为 End）。
+    #[must_use]
+    pub fn from_values(values: Vec<Nbt>) -> Self {
+        let tag = values.first().map_or(TagId::End, |v| {
+            TagId::from_id(tag_id_of(v)).expect("known tag id")
+        });
+        Self { tag, values }
+    }
+
+    /// 追加元素（自动设置/校验元素标签类型）。
+    pub fn push(&mut self, value: Nbt) {
+        if self.values.is_empty() {
+            self.tag = TagId::from_id(tag_id_of(&value)).expect("known tag id");
+        } else {
+            debug_assert_eq!(
+                self.tag,
+                TagId::from_id(tag_id_of(&value)).expect("known tag id"),
+                "NbtList 元素类型必须一致"
+            );
+        }
+        self.values.push(value);
+    }
 }
 
 /// NBT 复合（有序键值）。
@@ -429,6 +452,9 @@ fn write_payload(writer: &mut Writer, value: &Nbt, depth: usize) {
         Nbt::List(list) => {
             let tag = if list.values.is_empty() {
                 TagId::End
+            } else if list.tag == TagId::End {
+                // 防御：构造漏设 tag 时按首元素推导（与 Mojang 语义一致）
+                TagId::from_id(tag_id_of(&list.values[0])).expect("known tag id")
             } else {
                 list.tag
             };

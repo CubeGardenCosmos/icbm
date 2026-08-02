@@ -5,7 +5,7 @@
 //! - `minecraft:worldgen/biome`：4 条目（`the_void` / `plains` /
 //!   `nether_wastes` / `the_end`），顺序即 biome 网络 ID（见 `biome_ids`）
 
-use icbm_mc_767::nbt::{Nbt, NbtCompound};
+use icbm_mc_767::nbt::{Nbt, NbtCompound, NbtList};
 use icbm_mc_767::packets::config::{
     CRegistryData, CUpdateEnabledFeatures, CUpdateTags, RegistryEntry,
 };
@@ -221,6 +221,120 @@ pub fn biome_registry() -> CRegistryData {
             },
         ],
     }
+}
+
+/// 构造空注册表（对应官方 `SYNCED_REGISTRIES` 中 Phase 1 暂不填充的注册表）。
+fn empty_registry(registry_id: &str) -> CRegistryData {
+    CRegistryData {
+        registry_id: registry_id.to_owned(),
+        entries: Vec::new(),
+    }
+}
+
+/// `minecraft:wolf_variant` 注册表（官方 `requiredNonEmpty`，客户端校验非空）。
+#[must_use]
+pub fn wolf_variant_registry() -> CRegistryData {
+    let mut data = NbtCompound::new();
+    data.insert(
+        "wild_texture",
+        Nbt::String("minecraft:entity/wolf/wolf_ashy".to_owned()),
+    );
+    data.insert(
+        "tame_texture",
+        Nbt::String("minecraft:entity/wolf/wolf_ashy_tame".to_owned()),
+    );
+    data.insert(
+        "angry_texture",
+        Nbt::String("minecraft:entity/wolf/wolf_ashy_angry".to_owned()),
+    );
+    data.insert("biomes", Nbt::List(Box::new(NbtList::empty())));
+    CRegistryData {
+        registry_id: "minecraft:wolf_variant".to_owned(),
+        entries: vec![RegistryEntry {
+            id: "minecraft:wolf_ashy".to_owned(),
+            data: Nbt::Compound(Box::new(data)),
+        }],
+    }
+}
+
+/// `minecraft:painting_variant` 注册表（官方 `requiredNonEmpty`，客户端校验非空）。
+#[must_use]
+pub fn painting_variant_registry() -> CRegistryData {
+    let mut data = NbtCompound::new();
+    data.insert("width", Nbt::Int(1));
+    data.insert("height", Nbt::Int(1));
+    data.insert("asset_id", Nbt::String("minecraft:kebab".to_owned()));
+    CRegistryData {
+        registry_id: "minecraft:painting_variant".to_owned(),
+        entries: vec![RegistryEntry {
+            id: "minecraft:kebab".to_owned(),
+            data: Nbt::Compound(Box::new(data)),
+        }],
+    }
+}
+
+/// `minecraft:chat_type` 注册表（聊天消息类型；Phase 1 发 1 个基础条目）。
+#[must_use]
+pub fn chat_type_registry() -> CRegistryData {
+    let mut parameters = NbtList::empty();
+    parameters.push(Nbt::String("sender".to_owned()));
+    parameters.push(Nbt::String("content".to_owned()));
+    let mut chat = NbtCompound::new();
+    chat.insert("translation_key", Nbt::String("chat.type.text".to_owned()));
+    chat.insert("parameters", Nbt::List(Box::new(parameters)));
+    let mut narration = NbtCompound::new();
+    narration.insert(
+        "translation_key",
+        Nbt::String("chat.type.text.narrate".to_owned()),
+    );
+    narration.insert("parameters", Nbt::List(Box::new(NbtList::empty())));
+    let mut data = NbtCompound::new();
+    data.insert("chat", Nbt::Compound(Box::new(chat)));
+    data.insert("narration", Nbt::Compound(Box::new(narration)));
+    CRegistryData {
+        registry_id: "minecraft:chat_type".to_owned(),
+        entries: vec![RegistryEntry {
+            id: "minecraft:chat".to_owned(),
+            data: Nbt::Compound(Box::new(data)),
+        }],
+    }
+}
+
+/// `minecraft:damage_type` 注册表（Phase 1 发 1 个基础条目）。
+#[must_use]
+pub fn damage_type_registry() -> CRegistryData {
+    let mut data = NbtCompound::new();
+    data.insert("message_id", Nbt::String("generic".to_owned()));
+    data.insert("scaling", Nbt::String("always".to_owned()));
+    data.insert("exhaustion", Nbt::Float(0.0));
+    CRegistryData {
+        registry_id: "minecraft:damage_type".to_owned(),
+        entries: vec![RegistryEntry {
+            id: "minecraft:generic".to_owned(),
+            data: Nbt::Compound(Box::new(data)),
+        }],
+    }
+}
+
+/// 官方 `RegistryLoader.SYNCED_REGISTRIES` 全部 11 个注册表（顺序同官方）。
+///
+/// `wolf_variant` / `painting_variant` 标记 `requiredNonEmpty`，客户端校验非空，
+/// 必须提供条目；其余 Phase 1 为空列表（客户端可容忍）。
+#[must_use]
+pub fn synced_registries() -> Vec<CRegistryData> {
+    vec![
+        biome_registry(),
+        chat_type_registry(),
+        empty_registry("minecraft:trim_pattern"),
+        empty_registry("minecraft:trim_material"),
+        wolf_variant_registry(),
+        painting_variant_registry(),
+        dimension_type_registry(),
+        damage_type_registry(),
+        empty_registry("minecraft:banner_pattern"),
+        empty_registry("minecraft:enchantment"),
+        empty_registry("minecraft:jukebox_song"),
+    ]
 }
 
 /// 启用的特性标志（`minecraft:vanilla`）。
