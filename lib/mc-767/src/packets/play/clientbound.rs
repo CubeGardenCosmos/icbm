@@ -60,7 +60,9 @@ pub struct CLevelChunkWithLight {
     pub x: i32,
     /// 区块 Z。
     pub z: i32,
-    /// 列高（256 列，值 = 最高匹配方块 y + 1）。
+    /// 维度最低 Y（heightmap 存储值 = 列高 − `min_y`）。
+    pub min_y: i32,
+    /// 列高（256 列，值 = 最高非空气方块 y + 1，绝对 Y）。
     pub world_surface_heights: [u16; HEIGHTMAP_COLUMNS],
     /// 自底向上的 section 列表。
     pub sections: Vec<ChunkSection>,
@@ -76,6 +78,7 @@ impl CLevelChunkWithLight {
     pub fn flat(
         x: i32,
         z: i32,
+        min_y: i32,
         heights: [u16; HEIGHTMAP_COLUMNS],
         sections: Vec<ChunkSection>,
     ) -> Self {
@@ -84,6 +87,7 @@ impl CLevelChunkWithLight {
         Self {
             x,
             z,
+            min_y,
             world_surface_heights: heights,
             sections,
             block_light: Vec::new(),
@@ -97,10 +101,10 @@ impl CLevelChunkWithLight {
         writer.write_i32_be(self.z);
 
         // Heightmaps（未命名 NBT：WORLD_SURFACE + MOTION_BLOCKING）
-        let motion = encode_heightmap(&self.world_surface_heights);
+        let motion = encode_heightmap(&self.world_surface_heights, self.min_y);
         let mut heightmap = NbtCompound::new();
         heightmap.insert("WORLD_SURFACE", Nbt::LongArray(Box::new(motion)));
-        let motion_blocking = encode_heightmap(&self.world_surface_heights);
+        let motion_blocking = encode_heightmap(&self.world_surface_heights, self.min_y);
         heightmap.insert("MOTION_BLOCKING", Nbt::LongArray(Box::new(motion_blocking)));
         writer
             .write_nbt_unnamed(&Nbt::Compound(Box::new(heightmap)))
@@ -125,27 +129,37 @@ impl CLevelChunkWithLight {
         // 方块实体（Phase 1 为空）
         writer.write_var_int(0);
 
-        // 光照掩码（对照 vanilla `LightData.java`：bit i ↔ 世界最低 section 起的
-        // 第 i 个 section，无“下方/上方”额外位；有数据入 inited 掩码，无数据入
-        // uninited 掩码）。flat 世界天空光全亮、方块光全空。
+        // 光照掩码（对照 vanilla `LightData.java`：掩码覆盖世界最低 section 前一个
+        // section 至世界上方一个 section，共 n+2 位：bit 0 = 世界下方 section，
+        // bit 1..=n = 世界 section，bit n+1 = 世界上方 section；下方/上方无光照
+        // 数据 → 写入空掩码）。flat 世界天空光全亮、方块光全空。
         let num_sections = self.sections.len();
         let mut sky_light_mask = 0i64;
         let mut block_light_mask = 0i64;
         let mut sky_light_empty_mask = 0i64;
         let mut block_light_empty_mask = 0i64;
 
+        // bit 0 = 世界下方 section（始终无数据）
+        sky_light_empty_mask |= 1;
+        block_light_empty_mask |= 1;
+
         for section_index in 0..num_sections {
+            let bit = 1i64 << (section_index + 1);
             if section_index < self.sky_light.len() {
-                sky_light_mask |= 1 << section_index;
+                sky_light_mask |= bit;
             } else {
-                sky_light_empty_mask |= 1 << section_index;
+                sky_light_empty_mask |= bit;
             }
             if section_index < self.block_light.len() {
-                block_light_mask |= 1 << section_index;
+                block_light_mask |= bit;
             } else {
-                block_light_empty_mask |= 1 << section_index;
+                block_light_empty_mask |= bit;
             }
         }
+
+        // bit n+1 = 世界上方 section（始终无数据）
+        sky_light_empty_mask |= 1i64 << (num_sections + 1);
+        block_light_empty_mask |= 1i64 << (num_sections + 1);
 
         writer.write_bitset(&[sky_light_mask]);
         writer.write_bitset(&[block_light_mask]);
@@ -789,7 +803,7 @@ mod tests {
             }
         }
         let heights = [4u16; 256];
-        let packet = CLevelChunkWithLight::flat(0, 0, heights, sections);
+        let packet = CLevelChunkWithLight::flat(0, 0, -64, heights, sections);
         let mut w = Writer::new();
         packet.encode(&mut w);
         let bytes = w.into_bytes();
@@ -814,16 +828,17 @@ mod tests {
         let data = r.read_bytes(data_len).unwrap();
         assert_eq!(data.len(), data_len);
         assert_eq!(r.read_var_int().unwrap(), 0); // 无方块实体
-        // 光照：vanilla 约定 bit i ↔ 世界底部起第 i 个 section（无 +1 偏移）；
-        // 24 个 section 全部有天空光 → sky mask 低 24 位全 1。
+        // 光照：vanilla `LightData` 约定掩码覆盖 n+2 个 section——bit 0 = 世界
+        // 下方，bit 1..=24 = 世界 section，bit 25 = 世界上方；flat 世界 24 个
+        // section 全部有天空光 → sky 掩码位 1..=24，block 空掩码位 0..=25。
         let sky_mask = r.read_bitset().unwrap();
-        assert_eq!(sky_mask[0] & 0xFF_FFFF, 0xFF_FFFF);
+        assert_eq!(sky_mask[0], 0x1FF_FFFE); // 位 1..=24
         let block_mask = r.read_bitset().unwrap();
         assert_eq!(block_mask[0], 0);
         let sky_empty = r.read_bitset().unwrap();
-        assert_eq!(sky_empty[0], 0);
+        assert_eq!(sky_empty[0], 0x200_0001); // 位 0 与位 25
         let block_empty = r.read_bitset().unwrap();
-        assert_eq!(block_empty[0] & 0xFF_FFFF, 0xFF_FFFF);
+        assert_eq!(block_empty[0], 0x3FF_FFFF); // 位 0..=25
     }
 
     #[test]

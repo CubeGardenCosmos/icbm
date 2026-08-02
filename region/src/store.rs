@@ -215,14 +215,15 @@ fn chunk_to_anvil(column: &ChunkColumn) -> ChunkNbt {
     }
     let mut chunk = ChunkNbt::new(column.x, column.z, bottom, sections);
     let heights = column.heightmap_heights();
+    let min_y = bottom * 16;
     chunk.heightmaps = vec![
         (
             "WORLD_SURFACE".to_owned(),
-            encode_heightmap(&heights).to_vec(),
+            encode_heightmap(&heights, min_y).to_vec(),
         ),
         (
             "MOTION_BLOCKING".to_owned(),
-            encode_heightmap(&heights).to_vec(),
+            encode_heightmap(&heights, min_y).to_vec(),
         ),
     ];
     chunk
@@ -293,7 +294,13 @@ fn build_network_chunk(column: &ChunkColumn) -> Vec<u8> {
     for section in &column.sections {
         sections.push(ChunkSection::from_block_ids(section, column.biome_id));
     }
-    let packet = CLevelChunkWithLight::flat(column.x, column.z, heights, sections);
+    let packet = CLevelChunkWithLight::flat(
+        column.x,
+        column.z,
+        column.bottom_section_y * 16,
+        heights,
+        sections,
+    );
     let mut writer = Writer::new();
     packet.encode(&mut writer);
     writer.into_bytes()

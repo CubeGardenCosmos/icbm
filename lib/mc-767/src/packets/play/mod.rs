@@ -112,22 +112,27 @@ pub mod dimension_names {
 pub const HEIGHTMAP_BITS: u32 = 9;
 /// 区块列数（16×16）。
 pub const HEIGHTMAP_COLUMNS: usize = 256;
-/// heightmap 长整型数量（256×9/64）。
-pub const HEIGHTMAP_LONGS: usize = 36;
+/// 每长整型列数（`64 / 9`，整数除法，对照 `PackedIntegerArray.java` 的
+/// `elementsPerLong = 64 / elementBits`）。
+pub const HEIGHTMAP_COLUMNS_PER_LONG: usize = 7;
+/// heightmap 长整型数量（`ceil(256 / 7) = 37`，对照 `PackedIntegerArray`
+/// 构造的 `(size + elementsPerLong - 1) / elementsPerLong`；非旧的 `256×9/64`）。
+pub const HEIGHTMAP_LONGS: usize = 37;
 
-/// 编码 heightmap 长整型数组（LSB-first 打包，值为列高 = 最高方块 y + 1）。
+/// 编码 heightmap 长整型数组（1.21.1 `PackedIntegerArray` 布局：第 `c` 列位于
+/// 第 `c/7` 个长整型的第 `(c%7)*9` 位，LSB-first，不跨长整型边界）。
+///
+/// 存储值 = 列高 − `min_y`，即 vanilla `Heightmap.set` 的
+/// `height - chunk.getBottomY()`（`height = 最高方块 y + 1`）；`heights` 传入
+/// 绝对列高（最高非空气方块 y + 1）。
 #[must_use]
-pub fn encode_heightmap(heights: &[u16; HEIGHTMAP_COLUMNS]) -> [i64; HEIGHTMAP_LONGS] {
+pub fn encode_heightmap(heights: &[u16; HEIGHTMAP_COLUMNS], min_y: i32) -> [i64; HEIGHTMAP_LONGS] {
     let mut longs = [0i64; HEIGHTMAP_LONGS];
     for (column, &height) in heights.iter().enumerate() {
-        let bit_pos = column * HEIGHTMAP_BITS as usize;
-        let long_index = bit_pos / 64;
-        let offset = bit_pos % 64;
-        longs[long_index] |= i64::from(height) << offset;
-        let spill = offset + HEIGHTMAP_BITS as usize;
-        if spill > 64 && long_index + 1 < HEIGHTMAP_LONGS {
-            longs[long_index + 1] |= i64::from(height) >> (64 - offset);
-        }
+        let stored = i32::from(height) - min_y;
+        let long_index = column / HEIGHTMAP_COLUMNS_PER_LONG;
+        let offset = (column % HEIGHTMAP_COLUMNS_PER_LONG) * HEIGHTMAP_BITS as usize;
+        longs[long_index] |= i64::from(stored) << offset;
     }
     longs
 }
@@ -239,21 +244,22 @@ impl Palette {
     }
 }
 
-/// 将索引数组 LSB-first 打包为 i64 数组。
+/// 将索引数组按 1.21.1 `PackedIntegerArray` 布局打包：每长整型容纳
+/// `64 / bits` 个元素（整数除法），元素不跨长整型边界；第 `i` 个元素位于
+/// 第 `i / per_long` 个长整型的第 `(i % per_long) * bits` 位（LSB-first）。
+///
+/// 与旧版 `BitStorage` 的“跨长整型 spill”布局不兼容（1.21 起 Mojang 以
+/// `PackedIntegerArray.java` 取代 `BitStorage`，网络与存档共用此布局）。
 #[must_use]
 pub fn pack_indices(values: &[u32], bits: u32) -> Vec<i64> {
-    let total_bits = values.len() * bits as usize;
-    let long_count = total_bits.div_ceil(64);
+    assert!(bits > 0 && bits <= 64, "pack bits out of range: {bits}");
+    let per_long = (64 / bits) as usize;
+    let long_count = values.len().div_ceil(per_long);
     let mut longs = vec![0u64; long_count];
     for (index, &value) in values.iter().enumerate() {
-        let bit_pos = index * bits as usize;
-        let long_index = bit_pos / 64;
-        let offset = bit_pos % 64;
+        let long_index = index / per_long;
+        let offset = (index % per_long) * bits as usize;
         longs[long_index] |= u64::from(value) << offset;
-        let spill = offset + bits as usize;
-        if spill > 64 && long_index + 1 < long_count {
-            longs[long_index + 1] |= u64::from(value) >> (64 - offset);
-        }
     }
     longs.iter().map(|&v| v as i64).collect()
 }
@@ -266,7 +272,8 @@ fn write_packed_indices(writer: &mut Writer, data: &[i64]) {
     }
 }
 
-/// 解包 LSB-first 打包数据（`count` 个值，每值 `bits` 位）。
+/// 解包 `PackedIntegerArray` 布局数据（`count` 个值，每值 `bits` 位；与
+/// [`pack_indices`] 互逆）。
 #[must_use]
 pub fn unpack_indices(data: &[i64], bits: u32, count: usize) -> Vec<u32> {
     let mask = if bits >= 64 {
@@ -274,20 +281,16 @@ pub fn unpack_indices(data: &[i64], bits: u32, count: usize) -> Vec<u32> {
     } else {
         (1u64 << bits) - 1
     };
+    let per_long = (64 / bits) as usize;
     let mut values = Vec::with_capacity(count);
     for index in 0..count {
-        let bit_pos = index * bits as usize;
-        let long_index = bit_pos / 64;
-        let offset = bit_pos % 64;
-        let mut value = if long_index < data.len() {
+        let long_index = index / per_long;
+        let offset = (index % per_long) * bits as usize;
+        let value = if long_index < data.len() {
             (data[long_index] as u64) >> offset
         } else {
             0
         };
-        let spill = offset + bits as usize;
-        if spill > 64 && long_index + 1 < data.len() {
-            value |= (data[long_index + 1] as u64) << (64 - offset);
-        }
         values.push((value & mask) as u32);
     }
     values
@@ -304,7 +307,10 @@ pub const fn ceil_log2(value: u32) -> u32 {
 
 #[cfg(test)]
 mod tests {
-    use super::{BlockPos, ceil_log2, encode_heightmap, encode_paletted_container};
+    use super::{
+        BlockPos, HEIGHTMAP_COLUMNS_PER_LONG, ceil_log2, encode_heightmap,
+        encode_paletted_container, unpack_indices,
+    };
     use crate::codec::{Reader, Writer};
 
     #[test]
@@ -331,11 +337,42 @@ mod tests {
 
     #[test]
     fn heightmap_encoding() {
+        // overworld min_y=-64，列高 4 → 存储值 4-(-64)=68
         let heights = [4u16; 256];
-        let longs = encode_heightmap(&heights);
-        assert_eq!(longs.len(), 36);
-        assert_eq!(longs[0], 0x100804020100804);
-        assert_eq!((longs[35] >> 55) & 0x1FF, 4); // 列 255 位于位 55..64
+        let longs = encode_heightmap(&heights, -64);
+        assert_eq!(longs.len(), 37); // 256/7 → 37（非 36）
+        // 列 0..6 位于长整型 0；每长整型 7 列
+        for column in 0..HEIGHTMAP_COLUMNS_PER_LONG {
+            let offset = column * 9;
+            assert_eq!((longs[0] >> offset) & 0x1FF, 68, "column {column}");
+        }
+        // 列 7 起在长整型 1：列 7 → 长整型 1 位 0
+        assert_eq!(longs[1] & 0x1FF, 68);
+        // 列 252..255 → 长整型 36（末字），位 0/9/18/27
+        assert_eq!(
+            longs[36],
+            (68i64) | (68i64 << 9) | (68i64 << 18) | (68i64 << 27)
+        );
+        // 单列非零：列 7 值 1（min_y=0 → 存储 1）只落在长整型 1 位 0
+        let mut sparse = [0u16; 256];
+        sparse[7] = 1;
+        let longs = encode_heightmap(&sparse, 0);
+        assert_eq!(longs[0], 0);
+        assert_eq!(longs[1] & 0x1FF, 1);
+        assert!(longs[1] & !0x1FF == 0);
+    }
+
+    #[test]
+    fn heightmap_round_trip() {
+        let mut heights = [0u16; 256];
+        for (i, h) in heights.iter_mut().enumerate() {
+            *h = u16::try_from((i * 37) % 385 + 1).unwrap();
+        }
+        let longs = encode_heightmap(&heights, -64);
+        let unpacked = unpack_indices(&longs, 9, 256);
+        for (column, &h) in heights.iter().enumerate() {
+            assert_eq!(unpacked[column], u32::from(h) + 64, "column {column}");
+        }
     }
 
     #[test]
@@ -354,7 +391,7 @@ mod tests {
 
     #[test]
     fn palette_array_two_entries() {
-        // 第 0 个为 air，其余为 grass（4096 个，4 位打包 → 256 longs）
+        // 第 0 个为 air，其余为 grass（4096 个，4 位打包 → 每长整型 16 个 → 256 longs）
         let mut values = vec![8i32; 4096];
         values[0] = 0;
         let mut w = Writer::new();
@@ -365,6 +402,32 @@ mod tests {
         assert_eq!(r.read_var_int().unwrap(), 2); // palette 数量
         assert_eq!(r.read_var_int().unwrap(), 0);
         assert_eq!(r.read_var_int().unwrap(), 8);
-        assert_eq!(r.read_var_int().unwrap(), 256); // 4096*4/64
+        let data_len = r.read_var_int().unwrap();
+        assert_eq!(data_len, 256); // 4096/16
+        let data: Vec<i64> = (0..data_len).map(|_| r.read_i64_be().unwrap()).collect();
+        assert!(r.is_empty());
+        // 解包回索引：第 0 个为 0，其余为 1（grass 的 palette 索引）
+        let indices = unpack_indices(&data, 4, 4096);
+        assert_eq!(indices[0], 0);
+        assert!(indices[1..].iter().all(|&i| i == 1));
+        // 长整型 0：索引 0=0 在低 4 位，其余 15 个索引 1
+        assert_eq!(data[0] & 0xFFFF_FFFF, 0x1111_1110);
+        assert_eq!(data[255], 0x1111_1111_1111_1111); // 末字全 1（4 位 16 个）
+    }
+
+    #[test]
+    fn palette_packed_layout_matches_vanilla() {
+        // 直接模式 15 位：每长整型 4 个（64/15），1024 个长整型（非 spill 的 960）
+        let values: Vec<u32> = (0..4096).map(|i| u32::try_from(i % 300).unwrap()).collect();
+        let packed = super::pack_indices(&values, 15);
+        assert_eq!(packed.len(), 1024);
+        let unpacked = unpack_indices(&packed, 15, 4096);
+        assert_eq!(unpacked, values);
+        // 生物群系 6 位：每长整型 10 个，64 元素 → 7 个长整型
+        let biomes: Vec<u32> = (0..64).map(|i| i % 5).collect();
+        let packed = super::pack_indices(&biomes, 6);
+        assert_eq!(packed.len(), 7);
+        let unpacked = unpack_indices(&packed, 6, 64);
+        assert_eq!(unpacked, biomes);
     }
 }

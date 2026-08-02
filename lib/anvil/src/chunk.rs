@@ -393,13 +393,14 @@ mod tests {
         }
         let mut chunk = ChunkNbt::new(x, z, -4, sections);
         let heights = [4u16; 256];
+        // sample_chunk 底部 section -4 → min_y=-64
         chunk.heightmaps.push((
             "WORLD_SURFACE".to_owned(),
-            encode_heightmap(&heights).to_vec(),
+            encode_heightmap(&heights, -64).to_vec(),
         ));
         chunk.heightmaps.push((
             "MOTION_BLOCKING".to_owned(),
-            encode_heightmap(&heights).to_vec(),
+            encode_heightmap(&heights, -64).to_vec(),
         ));
         chunk
     }
