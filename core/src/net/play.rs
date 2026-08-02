@@ -314,6 +314,7 @@ pub fn handle_play_packet(
         }
         play_ids::SERVERBOUND_USE_ITEM => {
             let _ = icbm_mc_767::packets::play::serverbound::SUseItem::decode(reader)?;
+            handle_use_item_ender_pearl(server, client)?;
         }
         play_ids::SERVERBOUND_SET_CREATIVE_MODE_SLOT => {
             let packet = icbm_mc_767::packets::play::serverbound::SSetCreativeModeSlot::decode(
@@ -578,15 +579,20 @@ pub fn update_position_for_teleport(
         pos.y = y;
         pos.z = z;
     })?;
-    // 同步客户端位置（绝对坐标、无标志位、新传送 ID）
+    // 同步客户端位置（绝对坐标、无标志位、新传送 ID）。yaw/pitch 先单次短锁
+    // 取出，避免在发送闭包内再次锁 position（与 receiver 线程的转发竞争）。
     let teleport_id = client.next_teleport_id();
+    let (yaw, pitch) = {
+        let position = client.position.lock().expect("position");
+        (position.yaw, position.pitch)
+    };
     client.send_encoded(CPlayerPosition::packet_id(), |w| {
         CPlayerPosition {
             x,
             y,
             z,
-            yaw: client.position.lock().expect("position").yaw,
-            pitch: client.position.lock().expect("position").pitch,
+            yaw,
+            pitch,
             flags: 0,
             teleport_id,
         }
@@ -800,6 +806,64 @@ const fn face_offset(face: i32) -> (i32, i32, i32) {
         4 => (-1, 0, 0),
         _ => (1, 0, 0),
     }
+}
+
+/// 使用末影珍珠：从眼睛位置沿视线方向射线检测（region 计算落点），
+/// 命中后直接传送（不加载区块、无实体投掷——对照需求“计算落点后直接传送”）。
+fn handle_use_item_ender_pearl(server: &Server, client: &Arc<Client>) -> Result<(), NetError> {
+    let held = client.held_item.lock().expect("held item").clone();
+    tracing::info!("[pearl] held={held:?}");
+    if held.as_deref() != Some("ender_pearl") {
+        return Ok(());
+    }
+    let (origin, dir) = {
+        let position = *client.position.lock().expect("position");
+        // 眼睛高度 +1.62（vanilla `Entity.getEyeHeight` 站立）；角度换算
+        let eye_y = position.y + 1.62;
+        let yaw = f64::from(position.yaw).to_radians();
+        let pitch = f64::from(position.pitch).to_radians();
+        let dx = -yaw.sin() * pitch.cos();
+        let dy = -pitch.sin();
+        let dz = yaw.cos() * pitch.cos();
+        ([position.x, eye_y, position.z], [dx, dy, dz])
+    };
+    let region = {
+        let position = client.position.lock().expect("position");
+        icbm_region::RegionId::from_overworld_chunk(position.chunk_x(), position.chunk_z())
+    };
+    server.ensure_region(region)?;
+    client.raycast_pending.store(true, std::sync::atomic::Ordering::Relaxed);
+    server.ipc.send(
+        &region.service_name(),
+        icbm_region::protocol::kind::BLOCK_RAYCAST,
+        &icbm_region::protocol::encode_block_raycast(origin, dir, 120.0),
+    )?;
+    // 等待响应（receiver 线程写入 pending_raycast；负载高时 region 响应可能
+    // 延迟，给足 3 秒避免测试/实际使用中误判未命中）
+    let deadline = Instant::now() + Duration::from_secs(3);
+    let hit = loop {
+        let result = client.pending_raycast.lock().expect("raycast").take();
+        if let Some(result) = result {
+            break result;
+        }
+        if Instant::now() > deadline {
+            client.raycast_pending.store(false, std::sync::atomic::Ordering::Relaxed);
+            break (false, 0.0, 0.0, 0.0);
+        }
+        std::thread::sleep(Duration::from_millis(5));
+    };
+    let (hit, x, y, z) = hit;
+    tracing::info!("[pearl] raycast hit={hit} ({x},{y},{z})");
+    if !hit {
+        return Ok(());
+    }
+    // 传送到命中方块上方 1 格（落点）
+    debug!(
+        name = %client.name.lock().expect("name"),
+        x, y, z, "ender pearl teleport"
+    );
+    update_position_for_teleport(server, client, x, y + 1.0, z)?;
+    Ok(())
 }
 
 /// 创造模式物品栏槽位更新：记录主手（槽 0）物品为手持物品。

@@ -93,15 +93,22 @@ impl FakeClient {
     }
 }
 
+/// 串行化测试锁：每个测试拉起完整 core+region 子进程，并行跑 14 个会把
+/// 宿主机压满（region 20 TPS 节拍漂移、datarouter 拥塞、socket 超时），
+/// 导致偶发失败。测试服务器持有该锁直到 Drop，保证同文件内测试串行。
+static SERVER_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
 struct TestServer {
     child: Child,
     addr: String,
     world_dir: std::path::PathBuf,
     shm_name: String,
+    _serial_guard: std::sync::MutexGuard<'static, ()>,
 }
 
 impl TestServer {
     fn start(name: &str) -> Self {
+        let _serial_guard = SERVER_LOCK.lock().unwrap_or_else(|poison| poison.into_inner());
         let world_dir =
             std::env::temp_dir().join(format!("icbm-chunk-test-{}-{name}", std::process::id()));
         let _ = std::fs::remove_dir_all(&world_dir);
@@ -140,6 +147,7 @@ impl TestServer {
             addr,
             world_dir,
             shm_name,
+            _serial_guard,
         }
     }
 }
@@ -695,6 +703,58 @@ fn data_command_and_command_block() {
     send_chat_command(&mut client, "data remove block 20 -60 20 Command");
     let remove_feedback = recv_chat_until(&mut client, "已从");
     assert!(remove_feedback.contains("Command"), "remove feedback: {remove_feedback}");
+}
+
+/// 末影珍珠：计算落点直接传送（region 射线检测，无实体投掷）。
+#[test]
+fn ender_pearl_teleports_to_landing_point() {
+    let mut server = TestServer::start("ender-pearl");
+    let mut client = FakeClient::connect(&server.addr);
+    join_to_play(&mut client);
+    client.recv_until(play_ids::CLIENTBOUND_CHUNK_BATCH_FINISHED, "initial batch");
+
+    // 一柱石头当作射线目标（从地面 -62 到 -58；射线沿 +x，z 保持 0）
+    send_chat_command(&mut client, "fill 10 -62 0 10 -58 0 stone");
+    recv_chat_until(&mut client, "已填充");
+    // 手持末影珍珠
+    send_chat_command(&mut client, "give diagplayer ender_pearl");
+    recv_chat_until(&mut client, "已给");
+
+    // 玩家站 (0,-60,0) 面向 +x（yaw=-90，pitch=0），眼睛高度 -58.38
+    let mut move_rot = Writer::new();
+    move_rot.write_f64_be(0.0);
+    move_rot.write_f64_be(-60.0);
+    move_rot.write_f64_be(0.0);
+    move_rot.write_f32_be(-90.0); // yaw：面向 +x
+    move_rot.write_f32_be(0.0); // pitch
+    move_rot.write_bool(true);
+    client.send(play_ids::SERVERBOUND_MOVE_POS_ROT, &move_rot.into_bytes());
+
+    // 使用物品（主手）→ 射线命中柱子 (10,-59,10) → 传送到 (10,-58,10)
+    let mut use_item = Writer::new();
+    use_item.write_var_int(0); // hand = main
+    use_item.write_var_int(0); // sequence
+    client.send(play_ids::SERVERBOUND_USE_ITEM, &use_item.into_bytes());
+
+    let deadline = Instant::now() + Duration::from_secs(15);
+    let teleport = loop {
+        if Instant::now() > deadline {
+            panic!("no ender pearl teleport");
+        }
+        let (id, payload) = client.recv();
+        if id == play_ids::CLIENTBOUND_PLAYER_POSITION {
+            let mut r = Reader::new(&payload);
+            let x = r.read_f64_be().unwrap();
+            let y = r.read_f64_be().unwrap();
+            let z = r.read_f64_be().unwrap();
+            if (x, z) != (0.0, 0.0) {
+                break (x, y, z);
+            }
+        }
+    };
+    assert_eq!(teleport.0, 10.0, "teleport x");
+    assert_eq!(teleport.1, -58.0, "teleport y (1 above hit block)");
+    assert_eq!(teleport.2, 0.0, "teleport z");
 }
 
 /// 服务端命令：`/gamemode creative`、`/gamerule`（含 level.dat 持久化）与

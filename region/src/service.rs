@@ -13,11 +13,12 @@ use uuid::Uuid;
 
 use crate::protocol::{
     CORE_SERVICE, DIM_OVERWORLD, Ipc, IpcError, IpcMessage, decode_block_nbt_get,
-    decode_block_nbt_resp, decode_block_nbt_set, decode_block_query, decode_block_update,
-    decode_chunk_request, decode_gamerule_update, decode_player_enter, decode_player_leave,
-    decode_player_move, decode_register_ack, decode_time_update, encode_block_nbt_resp,
-    encode_block_query_resp, encode_chunk_data, encode_command_execute, encode_entity_data,
-    encode_heartbeat, encode_register, encode_stats, kind,
+    decode_block_nbt_resp, decode_block_nbt_set, decode_block_query, decode_block_raycast,
+    decode_block_update, decode_chunk_request, decode_gamerule_update, decode_player_enter,
+    decode_player_leave, decode_player_move, decode_register_ack, decode_time_update,
+    encode_block_nbt_resp, encode_block_query_resp, encode_block_raycast_resp,
+    encode_chunk_data, encode_command_execute, encode_entity_data, encode_heartbeat,
+    encode_register, encode_stats, kind,
 };
 use crate::store::ChunkStore;
 use crate::{Face, RegionId};
@@ -627,6 +628,15 @@ impl RegionService {
                 let (dim, x, y, z, nbt) = decode_block_nbt_set(&message.body)?;
                 let _ = dim;
                 self.store.set_block_entity(x, y, z, nbt);
+            }
+            kind::BLOCK_RAYCAST => {
+                let (origin, dir, max) = decode_block_raycast(&message.body)?;
+                let (hit, x, y, z) = raycast_block(&mut self.store, origin, dir, max);
+                self.ipc.send(
+                    CORE_SERVICE,
+                    kind::BLOCK_RAYCAST_RESP,
+                    &encode_block_raycast_resp(hit, x, y, z),
+                )?;
             }
             kind::BLOCK_QUERY => {
                 let (dim, x, y, z) = decode_block_query(&message.body)?;
@@ -1410,6 +1420,51 @@ impl RegionService {
     }
 }
 
+/// 主世界最低 Y（`WorldHeight.min_y` 一致）。
+const OVERWORLD_MIN_Y: i32 = -64;
+
+/// 沿射线 DDA 步进找第一个非空气方块；返回命中方块坐标（未命中返回 false）。
+///
+/// 供末影珍珠落点计算（core 发起 `BLOCK_RAYCAST`）。只在整数格变化时查询，
+/// 最多 `max` 格；方向已归一化。
+fn raycast_block(
+    store: &mut ChunkStore,
+    origin: [f64; 3],
+    dir: [f64; 3],
+    max: f64,
+) -> (bool, f64, f64, f64) {
+    let mut x = origin[0];
+    let mut y = origin[1];
+    let mut z = origin[2];
+    let mut last_bx = x.floor() as i32;
+    let mut last_by = y.floor() as i32;
+    let mut last_bz = z.floor() as i32;
+    let mut distance = 0.0;
+    while distance < max {
+        distance += 0.1;
+        x += dir[0] * 0.1;
+        y += dir[1] * 0.1;
+        z += dir[2] * 0.1;
+        let bx = x.floor() as i32;
+        let by = y.floor() as i32;
+        let bz = z.floor() as i32;
+        if bx == last_bx && by == last_by && bz == last_bz {
+            continue;
+        }
+        last_bx = bx;
+        last_by = by;
+        last_bz = bz;
+        if by < OVERWORLD_MIN_Y {
+            continue;
+        }
+        let state = store.block_at(Face::Overworld, bx, by, bz).unwrap_or(0);
+        if state != 0 {
+            return (true, f64::from(bx), f64::from(by), f64::from(bz));
+        }
+    }
+    (false, x, y, z)
+}
+
 /// 运行 region（core 二进制 `--region` 模式的入口）。
 pub fn run_region(config: RegionConfig) -> Result<(), RegionError> {
     let mut service = RegionService::new(config)?;
@@ -1438,5 +1493,42 @@ mod tests {
             assert!((10.0..=20.0).contains(&tps), "tps was {tps}");
         }
         assert!(ticker.tick_count >= 30);
+    }
+}
+
+#[cfg(test)]
+mod raycast_tests {
+    use super::raycast_block;
+    use crate::store::ChunkStore;
+    use crate::{Face, RegionId};
+
+    fn temp_dir(name: &str) -> std::path::PathBuf {
+        let dir = std::env::temp_dir().join(format!("raycast-{}-{}", std::process::id(), name));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    #[test]
+    fn raycast_hits_pillar() {
+        let dir = temp_dir("pillar");
+        let mut store = ChunkStore::open(&dir, RegionId { rx: 0, rz: 0 }).unwrap();
+        for y in -62..=-58 {
+            store.set_block(Face::Overworld, 10, y, 0, 1).unwrap(); // stone
+        }
+        // 玩家眼睛 (0,-58.38,0) 面向 +x
+        let (hit, x, y, z) = raycast_block(&mut store, [0.0, -58.38, 0.0], [1.0, 0.0, 0.0], 120.0);
+        assert!(hit, "ray should hit the pillar");
+        assert_eq!((x as i32, y as i32, z as i32), (10, -59, 0));
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn raycast_misses_empty_space() {
+        let dir = temp_dir("empty");
+        let mut store = ChunkStore::open(&dir, RegionId { rx: 0, rz: 0 }).unwrap();
+        let (hit, _, _, _) = raycast_block(&mut store, [0.0, -58.38, 0.0], [1.0, 0.0, 0.0], 50.0);
+        assert!(!hit);
+        std::fs::remove_dir_all(&dir).unwrap();
     }
 }

@@ -186,6 +186,10 @@ pub struct Client {
     pub data_request_pending: std::sync::atomic::AtomicBool,
     /// `/data` 响应（`BLOCK_NBT_RESP` 写入）。
     pub pending_block_nbt: Mutex<Option<icbm_mc_767::nbt::Nbt>>,
+    /// 末影珍珠射线检测结果（`BLOCK_RAYCAST_RESP` 写入；None = 未请求）。
+    pub pending_raycast: Mutex<Option<(bool, f64, f64, f64)>>,
+    /// 末影珍珠射线请求挂起（receiver 据此路由响应）。
+    pub raycast_pending: std::sync::atomic::AtomicBool,
 }
 
 const STATE_HANDSHAKE: u8 = 0;
@@ -244,6 +248,8 @@ impl Client {
             pending_portal_block: std::sync::atomic::AtomicI32::new(-1),
             data_request_pending: std::sync::atomic::AtomicBool::new(false),
             pending_block_nbt: Mutex::new(None),
+            pending_raycast: Mutex::new(None),
+            raycast_pending: std::sync::atomic::AtomicBool::new(false),
         })
     }
 

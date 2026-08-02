@@ -14,8 +14,9 @@ use icbm_mc_767::packets::play_ids;
 use icbm_region::RegionId;
 use icbm_region::protocol::{
     DIM_OVERWORLD, Ipc, IpcError, decode_block_nbt_resp, decode_block_query_resp,
-    decode_chunk_data, decode_command_execute, decode_entity_data, decode_heartbeat,
-    decode_register, encode_register_ack, encode_unload, kind,
+    decode_block_raycast_resp, decode_chunk_data, decode_command_execute,
+    decode_entity_data, decode_heartbeat, decode_register, encode_register_ack,
+    encode_unload, kind,
 };
 use tracing::{debug, info, trace, warn};
 
@@ -658,6 +659,24 @@ fn handle_core_message(server: &Server, message: &icbm_region::protocol::IpcMess
                 // 命令方块触发：以控制台身份执行（反馈仅记录日志）
                 debug!(source = %message.source, %command, "command block executed via core");
                 server.handle_command(&format!("/{command}"));
+            }
+        }
+        kind::BLOCK_RAYCAST_RESP => {
+            if let Ok((hit, x, y, z)) = decode_block_raycast_resp(&message.body) {
+                // 路由到挂起末影珍珠检测的玩家（receiver 线程）
+                let players: Vec<Arc<crate::client::Client>> = {
+                    let world = server.world.lock().expect("world lock");
+                    world.players.values().cloned().collect()
+                };
+                for player in players {
+                    if player
+                        .raycast_pending
+                        .swap(false, std::sync::atomic::Ordering::Relaxed)
+                    {
+                        *player.pending_raycast.lock().expect("raycast") = Some((hit, x, y, z));
+                        break;
+                    }
+                }
             }
         }
         other => {

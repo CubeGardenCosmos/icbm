@@ -65,6 +65,10 @@ pub mod kind {
     pub const BLOCK_NBT_SET: u8 = 0x12;
     /// R→C：执行命令（`[u8 长][命令]`；命令方块触发，core 以控制台身份执行）。
     pub const COMMAND_EXECUTE: u8 = 0x13;
+    /// C→R：方块射线检测（`[f64 ox][f64 oy][f64 oz][f64 dx][f64 dy][f64 dz][f64 max]`）。
+    pub const BLOCK_RAYCAST: u8 = 0x14;
+    /// R→C：射线命中响应（`[u8 hit][f64 x][f64 y][f64 z]`；未命中 hit=0）。
+    pub const BLOCK_RAYCAST_RESP: u8 = 0x94;
 }
 
 /// IPC 错误。
@@ -673,6 +677,56 @@ pub fn decode_command_execute(body: &[u8]) -> Result<String, IpcError> {
         return Err(IpcError::Length("command execute", body.len()));
     }
     Ok(String::from_utf8_lossy(&body[1..1 + len]).into_owned())
+}
+
+/// `BLOCK_RAYCAST` 载荷：`[f64 ox][f64 oy][f64 oz][f64 dx][f64 dy][f64 dz][f64 max]`。
+#[must_use]
+pub fn encode_block_raycast(origin: [f64; 3], dir: [f64; 3], max: f64) -> Vec<u8> {
+    let mut out = Vec::with_capacity(56);
+    for v in origin.into_iter().chain(dir) {
+        out.extend_from_slice(&v.to_le_bytes());
+    }
+    out.extend_from_slice(&max.to_le_bytes());
+    out
+}
+
+/// 解析 `BLOCK_RAYCAST` 载荷。
+pub fn decode_block_raycast(body: &[u8]) -> Result<([f64; 3], [f64; 3], f64), IpcError> {
+    if body.len() < 56 {
+        return Err(IpcError::Length("block raycast", body.len()));
+    }
+    let mut origin = [0.0; 3];
+    let mut dir = [0.0; 3];
+    for (i, v) in origin.iter_mut().chain(dir.iter_mut()).enumerate() {
+        let off = i * 8;
+        *v = f64::from_le_bytes(body[off..off + 8].try_into().expect("slice"));
+    }
+    let max = f64::from_le_bytes(body[48..56].try_into().expect("slice"));
+    Ok((origin, dir, max))
+}
+
+/// `BLOCK_RAYCAST_RESP` 载荷：`[u8 hit][f64 x][f64 y][f64 z]`（未命中时坐标无效）。
+#[must_use]
+pub fn encode_block_raycast_resp(hit: bool, x: f64, y: f64, z: f64) -> Vec<u8> {
+    let mut out = Vec::with_capacity(25);
+    out.push(u8::from(hit));
+    out.extend_from_slice(&x.to_le_bytes());
+    out.extend_from_slice(&y.to_le_bytes());
+    out.extend_from_slice(&z.to_le_bytes());
+    out
+}
+
+/// 解析 `BLOCK_RAYCAST_RESP` 载荷。
+pub fn decode_block_raycast_resp(body: &[u8]) -> Result<(bool, f64, f64, f64), IpcError> {
+    if body.len() < 25 {
+        return Err(IpcError::Length("block raycast resp", body.len()));
+    }
+    Ok((
+        body[0] != 0,
+        f64::from_le_bytes(body[1..9].try_into().expect("slice")),
+        f64::from_le_bytes(body[9..17].try_into().expect("slice")),
+        f64::from_le_bytes(body[17..25].try_into().expect("slice")),
+    ))
 }
 
 #[cfg(test)]
