@@ -333,7 +333,7 @@ fn read_payload(reader: &mut Reader<'_>, tag: TagId, depth: usize) -> Result<Nbt
             reader.read_f64_be().map_err(|_| NbtError::Eof)?,
         )),
         TagId::ByteArray => {
-            let len = usize::try_from(reader.read_var_int().map_err(|_| NbtError::Eof)?)
+            let len = usize::try_from(reader.read_i32_be().map_err(|_| NbtError::Eof)?)
                 .map_err(|_| NbtError::InvalidCesu8)?;
             let mut values = Vec::with_capacity(len);
             for _ in 0..len {
@@ -344,7 +344,7 @@ fn read_payload(reader: &mut Reader<'_>, tag: TagId, depth: usize) -> Result<Nbt
         TagId::String => Ok(Nbt::String(read_string(reader)?)),
         TagId::List => {
             let element_tag = read_tag_id(reader)?;
-            let len = usize::try_from(reader.read_var_int().map_err(|_| NbtError::Eof)?)
+            let len = usize::try_from(reader.read_i32_be().map_err(|_| NbtError::Eof)?)
                 .map_err(|_| NbtError::InvalidCesu8)?;
             let mut values = Vec::with_capacity(len);
             for _ in 0..len {
@@ -357,7 +357,7 @@ fn read_payload(reader: &mut Reader<'_>, tag: TagId, depth: usize) -> Result<Nbt
         }
         TagId::Compound => Ok(Nbt::Compound(Box::new(read_compound(reader, depth)?))),
         TagId::IntArray => {
-            let len = usize::try_from(reader.read_var_int().map_err(|_| NbtError::Eof)?)
+            let len = usize::try_from(reader.read_i32_be().map_err(|_| NbtError::Eof)?)
                 .map_err(|_| NbtError::InvalidCesu8)?;
             let mut values = Vec::with_capacity(len);
             for _ in 0..len {
@@ -366,7 +366,7 @@ fn read_payload(reader: &mut Reader<'_>, tag: TagId, depth: usize) -> Result<Nbt
             Ok(Nbt::IntArray(values.into_boxed_slice()))
         }
         TagId::LongArray => {
-            let len = usize::try_from(reader.read_var_int().map_err(|_| NbtError::Eof)?)
+            let len = usize::try_from(reader.read_i32_be().map_err(|_| NbtError::Eof)?)
                 .map_err(|_| NbtError::InvalidCesu8)?;
             let mut values = Vec::with_capacity(len);
             for _ in 0..len {
@@ -420,7 +420,7 @@ fn write_payload(writer: &mut Writer, value: &Nbt, depth: usize) {
         Nbt::Float(v) => writer.write_f32_be(*v),
         Nbt::Double(v) => writer.write_f64_be(*v),
         Nbt::ByteArray(values) => {
-            writer.write_var_int(i32::try_from(values.len()).expect("byte array exceeds i32"));
+            writer.write_i32_be(i32::try_from(values.len()).expect("byte array exceeds i32"));
             for &v in values {
                 writer.write_i8(v);
             }
@@ -433,7 +433,7 @@ fn write_payload(writer: &mut Writer, value: &Nbt, depth: usize) {
                 list.tag
             };
             writer.write_u8(tag.id());
-            writer.write_var_int(i32::try_from(list.values.len()).expect("list exceeds i32"));
+            writer.write_i32_be(i32::try_from(list.values.len()).expect("list exceeds i32"));
             for v in &list.values {
                 write_payload(writer, v, depth + 1);
             }
@@ -447,13 +447,13 @@ fn write_payload(writer: &mut Writer, value: &Nbt, depth: usize) {
             writer.write_u8(TagId::End.id());
         }
         Nbt::IntArray(values) => {
-            writer.write_var_int(i32::try_from(values.len()).expect("int array exceeds i32"));
+            writer.write_i32_be(i32::try_from(values.len()).expect("int array exceeds i32"));
             for &v in values {
                 writer.write_i32_be(v);
             }
         }
         Nbt::LongArray(values) => {
-            writer.write_var_int(i32::try_from(values.len()).expect("long array exceeds i32"));
+            writer.write_i32_be(i32::try_from(values.len()).expect("long array exceeds i32"));
             for &v in values {
                 writer.write_i64_be(v);
             }
