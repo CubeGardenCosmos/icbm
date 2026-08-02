@@ -570,6 +570,7 @@ impl RegionService {
         Ok(())
     }
 
+    #[allow(clippy::too_many_lines)] // IPC 消息分发 match 逐条对应协议
     fn handle_message(&mut self, message: &IpcMessage) -> Result<(), RegionError> {
         match message.kind {
             kind::PLAYER_ENTER => {
@@ -1225,10 +1226,11 @@ impl RegionService {
     /// 生成：仅在夜晚（`world_time % 24000 ∈ [13000, 23000)`）且 `doMobSpawning`
     /// 开启时按概率生成，上限 `MAX_CREEPERS`。AI：寻找最近玩家（16 格内），
     /// 向其靠近；3 格内点燃引信（广播实体状态闪烁），30 tick 后爆炸。
+    #[allow(clippy::too_many_lines)] // 生成 + 追逐 + 引信 + 爆炸的事件流水
     fn tick_creepers(&mut self) -> Result<(), RegionError> {
         let night = {
             let phase = self.world_time.rem_euclid(24_000);
-            phase >= NIGHT_START && phase < NIGHT_END
+            (NIGHT_START..NIGHT_END).contains(&phase)
         };
         if self.gamerule_bool("doMobSpawning")
             && night
@@ -1274,7 +1276,7 @@ impl RegionService {
             if let Some((px, py, pz)) = nearest {
                 let dx = px - creeper.x;
                 let dz = pz - creeper.z;
-                let horizontal = (dx * dx + dz * dz).sqrt();
+                let horizontal = dx.hypot(dz);
                 if horizontal <= CREEPER_FUSE_RANGE {
                     creeper.fuse = CREEPER_FUSE_TICKS;
                     fuse_starts.push(creeper.entity_id);
@@ -1562,7 +1564,7 @@ mod raycast_tests {
     }
 }
 
-/// 活塞方块访问适配器（ChunkStore → BlockAccess）。
+/// 活塞方块访问适配器（`ChunkStore` → `BlockAccess`）。
 struct PistonStoreAccess<'a>(&'a mut ChunkStore);
 
 impl crate::pistons::BlockAccess for PistonStoreAccess<'_> {

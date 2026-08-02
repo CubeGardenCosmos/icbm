@@ -676,7 +676,7 @@ pub fn decode_command_execute(body: &[u8]) -> Result<String, IpcError> {
     if body.len() < 1 + len {
         return Err(IpcError::Length("command execute", body.len()));
     }
-    Ok(String::from_utf8_lossy(&body[1..1 + len]).into_owned())
+    Ok(String::from_utf8_lossy(&body[1..=len]).into_owned())
 }
 
 /// `BLOCK_RAYCAST` 载荷：`[f64 ox][f64 oy][f64 oz][f64 dx][f64 dy][f64 dz][f64 max]`。

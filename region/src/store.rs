@@ -72,9 +72,9 @@ pub struct ChunkStore {
     redstone_dirty: std::collections::HashSet<(i32, i32)>,
     /// 方块实体 NBT（世界坐标 → NBT；命令方块命令等 `/data` 操作目标）。
     block_entities: std::collections::HashMap<(i32, i32, i32), icbm_mc_767::nbt::Nbt>,
-    /// 命令方块位置（`set_block` 维护；tick_command_blocks 遍历用，避免全量扫描）。
+    /// 命令方块位置（`set_block` 维护；`tick_command_blocks` 遍历用，避免全量扫描）。
     command_blocks: std::collections::HashSet<(i32, i32, i32)>,
-    /// 活塞位置（`set_block` 维护；tick_pistons 遍历用）。
+    /// 活塞位置（`set_block` 维护；`tick_pistons` 遍历用）。
     pistons: std::collections::HashSet<(i32, i32, i32)>,
 }
 
@@ -301,6 +301,7 @@ impl ChunkStore {
     }
 
     /// 读取方块实体 NBT（不存在返回 `None`）。
+    #[must_use]
     pub fn block_entity(&self, x: i32, y: i32, z: i32) -> Option<&icbm_mc_767::nbt::Nbt> {
         self.block_entities.get(&(x, y, z))
     }
@@ -335,11 +336,13 @@ impl ChunkStore {
     }
 
     /// 命令方块位置列表。
+    #[must_use]
     pub fn command_block_positions(&self) -> Vec<(i32, i32, i32)> {
         self.command_blocks.iter().copied().collect()
     }
 
     /// 活塞位置列表。
+    #[must_use]
     pub fn piston_positions(&self) -> Vec<(i32, i32, i32)> {
         self.pistons.iter().copied().collect()
     }

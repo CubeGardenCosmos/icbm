@@ -400,11 +400,13 @@ impl Client {
         }
         let name = self.name.lock().expect("name").clone();
         if stored.is_empty() {
-            *stored = locale.to_owned();
+            stored.clear();
+            stored.push_str(locale);
             debug!(name = %name, locale, "player language set");
         } else {
             let previous: String = stored.clone();
-            *stored = locale.to_owned();
+            stored.clear();
+            stored.push_str(locale);
             debug!(name = %name, previous = %previous, locale, "player language changed");
         }
     }

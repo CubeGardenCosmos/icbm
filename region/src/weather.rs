@@ -97,8 +97,8 @@ impl WeatherState {
             let mut raining = self.raining;
             if self.clear_time > 0 {
                 self.clear_time -= 1;
-                self.thunder_time = if thundering { 0 } else { 1 };
-                self.rain_time = if raining { 0 } else { 1 };
+                self.thunder_time = i64::from(!thundering);
+                self.rain_time = i64::from(!raining);
                 thundering = false;
                 raining = false;
             } else {
@@ -140,10 +140,10 @@ impl WeatherState {
         // 梯度插值（雨/雷 → 1，否则 → 0；每 tick 0.01，钳制 0..1）
         let prev_rain = self.rain_gradient;
         let prev_thunder = self.thunder_gradient;
-        self.rain_gradient = (self.rain_gradient + if self.raining { 0.01 } else { -0.01 })
-            .clamp(0.0, 1.0);
+        self.rain_gradient =
+            (self.rain_gradient + (f32::from(self.raining) * 0.02 - 0.01)).clamp(0.0, 1.0);
         self.thunder_gradient =
-            (self.thunder_gradient + if self.thundering { 0.01 } else { -0.01 }).clamp(0.0, 1.0);
+            (self.thunder_gradient + (f32::from(self.thundering) * 0.02 - 0.01)).clamp(0.0, 1.0);
         if self.rain_gradient != prev_rain {
             events.push((GAME_EVENT_RAIN_GRADIENT, self.rain_gradient));
         }

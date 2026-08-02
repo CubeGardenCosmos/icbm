@@ -63,6 +63,18 @@ offset 1: 载荷（按 kind 定义，全部小端）
 | 0x08  | REGION_STATS       | C → R     | 空载荷；region 立即回 0x09                                           |
 | 0x09  | REGION_STATS_RESP  | R → C     | `[f32 tps][f32 avg_tps_ms][u32 tick_count][u8 sleeping][u32 loaded_chunks]` |
 | 0x0A  | ENTITY_DATA        | R → C     | `[u8 dim][i32 rx][i32 rz][i32 packet_id][bytes：clientbound 包载荷]`；core 转发给该区域玩家 |
+| 0x0B  | BLOCK_UPDATE       | C → R     | `[u8 dim][i32 x][i32 y][i32 z][i32 state_id]`（`/setblock`/`/fill`）       |
+| 0x0D  | BLOCK_QUERY        | C → R     | `[u8 dim][i32 x][i32 y][i32 z]`（方块查询 → 0x8D）                         |
+| 0x8D  | BLOCK_QUERY_RESP   | R → C     | `[u8 dim][i32 x][i32 y][i32 z][i32 state_id]`                              |
+| 0x0E  | GAMERULE_UPDATE    | C → R     | `[u8 名长][名][u8 值长][值]`                                                |
+| 0x0F  | PLAYER_MOVE        | C → R     | `[u128 uuid][f64 x][f64 y][f64 z]`（玩家位置同步，敌对生物追踪；core 节流约 4 次/秒） |
+| 0x10  | TIME_UPDATE        | C → R     | `[i64 tick][u8 add]`（`/time set/add`；add=1 表示累加）                     |
+| 0x11  | BLOCK_NBT_GET      | C → R     | `[u8 dim][i32 x][i32 y][i32 z]`（方块实体 NBT 读取 → 0x91）                 |
+| 0x91  | BLOCK_NBT_RESP     | R → C     | `[u8 dim][i32 x][i32 y][i32 z][u8 has][NBT]`（`/data get block`）           |
+| 0x12  | BLOCK_NBT_SET      | C → R     | `[u8 dim][i32 x][i32 y][i32 z][NBT]`（`/data merge/remove block`）          |
+| 0x13  | COMMAND_EXECUTE    | R → C     | `[u8 长][命令]`（命令方块触发，core 以控制台身份执行）                      |
+| 0x14  | BLOCK_RAYCAST      | C → R     | `[f64 ox][f64 oy][f64 oz][f64 dx][f64 dy][f64 dz][f64 max]`（射线检测 → 0x94；末影珍珠落点） |
+| 0x94  | BLOCK_RAYCAST_RESP | R → C     | `[u8 hit][f64 x][f64 y][f64 z]`（命中方块坐标；未命中 hit=0）               |
 
 ## 生命周期
 
@@ -76,10 +88,14 @@ offset 1: 载荷（按 kind 定义，全部小端）
    `REGION_HEARTBEAT`（含 TPS 与沉睡状态）。
 4. 玩家进出：core 发送 `PLAYER_ENTER` / `PLAYER_LEAVE`；region 在无玩家时进入沉睡（停止 tick），持续 30 秒后由 core 发送 `REGION_UNLOAD` 卸载。
 5. 区块数据：core 收到客户端进入时向所在 region 发 `CHUNK_REQUEST`，region 从 `lib/anvil` 读取或 flat 生成后返回 `CHUNK_DATA`（网络序列化），core 转发给客户端；改动经 `lib/anvil` 写回 `.mca`。
-6. 实体：region 模拟漫游 Creeper（Phase 1 测试信号），经 `ENTITY_DATA` 把
+6. 实体：region 模拟 Creeper 敌对生物（夜晚生成、追逐/引爆），经 `ENTITY_DATA` 把
    `ADD_ENTITY`/`MOVE_ENTITY_POS` 等 clientbound 包发给 core，core 转发给位于
    该区域的玩家；region 卸载时 core 按实体 ID 段发 `REMOVE_ENTITIES` 清理客户端实体。
-7. switch 异常退出/扩容重启时，既有 Frontend 在下一次 touch/send 时自动重注册；region 侧由 `send_retry` 对 BUSY/FULL/AGAIN 短退避重试。
+7. 方块交互：`/setblock`/`/fill`（BLOCK_UPDATE）、方块查询（BLOCK_QUERY，传送门/屏障检测）、
+   方块实体 NBT（BLOCK_NBT_GET/SET，`/data` 与命令方块 Command）、末影珍珠落点
+   （BLOCK_RAYCAST）均经 IPC 到 region；命令方块被红石供电后经 COMMAND_EXECUTE
+   交回 core 以控制台身份执行。
+8. switch 异常退出/扩容重启时，既有 Frontend 在下一次 touch/send 时自动重注册；region 侧由 `send_retry` 对 BUSY/FULL/AGAIN 短退避重试。
 
 ## 错误处理
 

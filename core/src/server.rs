@@ -545,6 +545,7 @@ fn remove_region_entities(server: &Server, entity_base: i32) {
 }
 
 /// 处理一条来自 region 的消息。
+#[allow(clippy::too_many_lines)] // IPC 消息分发 match 逐条对应协议
 fn handle_core_message(server: &Server, message: &icbm_region::protocol::IpcMessage) {
     match message.kind {
         kind::REGION_REGISTER => {

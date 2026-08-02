@@ -17,8 +17,8 @@ pub struct CropKind {
 }
 
 /// 全部可生长作物（vanilla 全局状态 ID，对照 master 生成数据：
-/// wheat 4278 / carrots 8595 / potatoes 8603 / beetroots 12509 /
-/// pumpkin_stem 6821 / melon_stem 6829 / cocoa 7419）。
+/// `wheat` 4278 / `carrots` 8595 / `potatoes` 8603 / `beetroots` 12509 /
+/// `pumpkin_stem` 6821 / `melon_stem` 6829 / `cocoa` 7419）。
 pub const CROPS: [CropKind; 7] = [
     CropKind { base: ids::WHEAT_AGE_0, max_age: 7 },
     CropKind { base: ids::CARROTS_AGE_0, max_age: 7 },

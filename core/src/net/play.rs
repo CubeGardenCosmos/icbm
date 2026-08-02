@@ -514,7 +514,7 @@ fn update_position(
             .elapsed()
             >= Duration::from_millis(250)
     {
-        check_barrier_blocked(server, client, &region, uuid)?;
+        check_barrier_blocked(server, client, region, uuid)?;
         *client.last_barrier_check.lock().expect("last barrier check") = Instant::now();
     }
     // 传送门检测（节流：约每 0.5 秒一次，避免每 tick 查询 region）
@@ -524,12 +524,12 @@ fn update_position(
 
 /// 屏障拦截：查询玩家位置方块，命中屏障（10366）时回退到最近合法位置。
 ///
-/// 对照需求：鞘翅/创造飞行不能快速穿过屏障；乘船（MOVE_VEHICLE）时不经过
+/// 对照需求：鞘翅/创造飞行不能快速穿过屏障；乘船（`MOVE_VEHICLE`）时不经过
 /// 本检查（客户端在船上发 `VehicleMoveC2SPacket`），水面乘船自然放行。
 fn check_barrier_blocked(
     server: &Server,
     client: &Arc<Client>,
-    region: &icbm_region::RegionId,
+    region: icbm_region::RegionId,
     uuid: uuid::Uuid,
 ) -> Result<(), NetError> {
     let (bx, by, bz) = {

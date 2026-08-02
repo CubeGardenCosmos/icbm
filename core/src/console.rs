@@ -451,19 +451,20 @@ impl Server {
                     path,
                     nbt,
                 } => {
-                    let feedback = if let Some(client) = self
+                    let first_client = self
                         .world
                         .lock()
                         .expect("world lock")
                         .players
                         .values()
                         .next()
-                        .cloned()
-                    {
-                        apply_data(self, &client, action, x, y, z, path.as_deref(), nbt.as_deref())
-                    } else {
-                        "控制台执行 /data 需要在线玩家作为响应通道".to_owned()
-                    };
+                        .cloned();
+                    let feedback = first_client.map_or_else(
+                        || "控制台执行 /data 需要在线玩家作为响应通道".to_owned(),
+                        |client| {
+                            apply_data(self, &client, action, x, y, z, path.as_deref(), nbt.as_deref())
+                        },
+                    );
                     info!("{feedback}");
                 }
             }
@@ -874,6 +875,7 @@ pub fn apply_enchant(server: &Server, target: &str, enchantment: &str, level: i3
 /// 执行 `/time set/add`：把世界时间同步到所有 region（`TIME_UPDATE`）。
 ///
 /// 返回反馈字符串；`None` 表示参数非法。
+#[must_use]
 pub fn apply_time(server: &Server, set: Option<i64>, add: Option<i64>) -> Option<String> {
     let regions: Vec<icbm_region::RegionId> = {
         let world = server.world.lock().expect("world lock");
@@ -903,6 +905,7 @@ pub fn apply_time(server: &Server, set: Option<i64>, add: Option<i64>) -> Option
 ///
 /// 读写经 `BLOCK_NBT_GET`/`BLOCK_NBT_SET` IPC 到所在 region；`get` 的响应由
 /// receiver 线程写入 `client.pending_block_nbt` 后在此轮询读取。
+#[allow(clippy::too_many_arguments, clippy::too_many_lines)] // /data 三动作共享
 pub fn apply_data(
     server: &Server,
     client: &std::sync::Arc<crate::client::Client>,
@@ -955,7 +958,7 @@ pub fn apply_data(
                 return format!("[{x},{y},{z}] 的方块实体数据不可用");
             };
             let text = nbt_to_snbt(&nbt);
-            let shown = path.map_or(text.clone(), |p| {
+            let shown = path.map_or(text, |p| {
                 path_value(&nbt, p).map_or_else(|| "路径不存在".to_owned(), nbt_to_snbt)
             });
             format!("[{x},{y},{z}] 的方块实体数据: {shown}")
@@ -1072,25 +1075,20 @@ pub fn apply_data(
 fn path_value<'a>(nbt: &'a icbm_mc_767::nbt::Nbt, path: &str) -> Option<&'a icbm_mc_767::nbt::Nbt> {
     let mut current = nbt;
     for part in path.split('.') {
-        let (key, index) = match part.find('[') {
-            Some(bracket) => {
-                let key = &part[..bracket];
-                let index = part[bracket + 1..].trim_end_matches(']').parse::<usize>().ok();
-                (key, index)
-            }
-            None => (part, None),
-        };
+        let (key, index) = part.find('[').map_or((part, None), |bracket| {
+            (
+                &part[..bracket],
+                part[bracket + 1..].trim_end_matches(']').parse::<usize>().ok(),
+            )
+        });
         match current {
             icbm_mc_767::nbt::Nbt::Compound(compound) => {
-                if let Some(index) = index {
+                if let Some(index) = index
+                    && let Some(icbm_mc_767::nbt::Nbt::List(list)) = compound.get(key)
+                {
                     // 形如 `a[0]` 且 a 是列表
-                    if let Some(list) = compound.get(key) {
-                        if let icbm_mc_767::nbt::Nbt::List(list) = list {
-                            current = list.values.get(index)?;
-                            continue;
-                        }
-                    }
-                    return None;
+                    current = list.values.get(index)?;
+                    continue;
                 }
                 current = compound.get(key)?;
             }

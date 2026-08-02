@@ -640,7 +640,7 @@ impl SnbtParser {
                 self.next(); // 开引号
                 Ok(Nbt::String(self.parse_string_body()?))
             }
-            Some('t') | Some('f') => {
+            Some('t' | 'f') => {
                 // true / false
                 let word = self.parse_word();
                 match word.as_str() {
@@ -876,7 +876,7 @@ mod snbt_tests {
 
     #[test]
     fn snbt_nested() {
-        let nbt = parse_snbt(r#"{outer:{inner:[1,2,3]}}"#).unwrap();
+        let nbt = parse_snbt(r"{outer:{inner:[1,2,3]}}").unwrap();
         let Nbt::Compound(c) = nbt else { panic!() };
         let Nbt::Compound(inner) = c.get("outer").unwrap() else { panic!() };
         let Nbt::List(list) = inner.get("inner").unwrap() else { panic!() };
@@ -885,7 +885,7 @@ mod snbt_tests {
 
     #[test]
     fn snbt_typed_arrays_and_floats() {
-        let nbt = parse_snbt(r#"{a:[B;1b,2b],b:[I;3,4],c:1.5,d:2f}"#).unwrap();
+        let nbt = parse_snbt(r"{a:[B;1b,2b],b:[I;3,4],c:1.5,d:2f}").unwrap();
         let Nbt::Compound(c) = nbt else { panic!() };
         assert_eq!(c.get("a"), Some(&Nbt::ByteArray(vec![1, 2].into_boxed_slice())));
         assert_eq!(c.get("b"), Some(&Nbt::IntArray(vec![3, 4].into_boxed_slice())));
@@ -895,7 +895,7 @@ mod snbt_tests {
 
     #[test]
     fn snbt_compound_list() {
-        let nbt = parse_snbt(r#"[{a:1},{a:2}]"#).unwrap();
+        let nbt = parse_snbt(r"[{a:1},{a:2}]").unwrap();
         let Nbt::List(list) = nbt else { panic!() };
         assert_eq!(list.values.len(), 2);
         let Nbt::Compound(first) = &list.values[0] else { panic!() };
@@ -933,7 +933,7 @@ pub fn nbt_to_snbt(nbt: &Nbt) -> String {
         ),
         Nbt::IntArray(values) => format!(
             "[I;{}]",
-            values.iter().map(|v| v.to_string()).collect::<Vec<_>>().join(",")
+            values.iter().map(i32::to_string).collect::<Vec<_>>().join(",")
         ),
         Nbt::LongArray(values) => format!(
             "[L;{}]",

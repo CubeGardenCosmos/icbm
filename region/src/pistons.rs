@@ -118,6 +118,7 @@ pub struct PistonAction {
 ///
 /// `block_at`/`set_block` 由调用方（region store）提供；`last_powered` 为上次
 /// 供电快照（调用方维护），返回新的快照。
+#[allow(clippy::implicit_hasher)] // 内部状态快照，hasher 无关紧要
 pub fn tick_pistons(
     pistons: &[(i32, i32, i32)],
     last_powered: &mut HashMap<(i32, i32, i32), bool>,
@@ -145,9 +146,7 @@ pub fn tick_pistons(
             }
         } else if !powered && extended {
             // 下降沿缩回
-            if let Some(action) = retract_piston(access, (x, y, z), base, facing) {
-                actions.push(action);
-            }
+            actions.push(retract_piston(access, (x, y, z), base, facing));
         }
     }
     actions
@@ -221,8 +220,7 @@ fn extend_piston(
                 .iter()
                 .rev()
                 .find(|(_, s)| is_coral_fan(*s) || *s == ids::TNT)
-                .map(|(_, s)| *s)
-                .unwrap_or(dup_state)
+                .map_or(dup_state, |(_, s)| *s)
         };
         // 副本放在链末端之后的空位（tip 已是链末块前移后的位置）
         let dup_pos = (tip.0 + dx, tip.1 + dy, tip.2 + dz);
@@ -230,7 +228,9 @@ fn extend_piston(
         updates.push((dup_pos, dup_state));
     }
     // 链首置为活塞头
-    let head_pos = chain.first().map(|(p, _)| *p).unwrap_or((x + dx, y + dy, z + dz));
+    let head_pos = chain
+        .first()
+        .map_or((x + dx, y + dy, z + dz), |(p, _)| *p);
     let head_state = piston_head_state(facing);
     access.set_block(head_pos.0, head_pos.1, head_pos.2, head_state);
     updates.push((head_pos, head_state));
@@ -252,7 +252,7 @@ fn retract_piston(
     (x, y, z): (i32, i32, i32),
     base: i32,
     facing: usize,
-) -> Option<PistonAction> {
+) -> PistonAction {
     let (dx, dy, dz) = facing_offset(facing);
     let mut updates = Vec::new();
     // 移除活塞头
@@ -276,12 +276,12 @@ fn retract_piston(
     let new_state = piston_state(base, facing, false);
     access.set_block(x, y, z, new_state);
     updates.push(((x, y, z), new_state));
-    Some(PistonAction {
+    PistonAction {
         pos: (x, y, z),
         extending: false,
         new_state,
         updates,
-    })
+    }
 }
 
 #[cfg(test)]
