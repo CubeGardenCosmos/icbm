@@ -237,7 +237,7 @@ impl RegionService {
         // Phase 1 世界 tick 为空（无实体/方块更新），仅维持 TPS 与心跳
         let tps = self.ticker.end();
         if self.ticker.should_heartbeat() {
-            self.send_heartbeat(tps)?;
+            self.send_heartbeat(tps);
             self.ticker.mark_heartbeat();
         }
         self.ticker.wait_next();
@@ -252,7 +252,7 @@ impl RegionService {
     fn tick_sleeping(&mut self) -> Result<(), RegionError> {
         self.drain_messages()?;
         if self.ticker.should_heartbeat() {
-            self.send_heartbeat(0.0)?;
+            self.send_heartbeat(0.0);
             self.ticker.mark_heartbeat();
         }
         std::thread::sleep(Duration::from_millis(100));
@@ -263,9 +263,11 @@ impl RegionService {
         Ok(())
     }
 
-    fn send_heartbeat(&self, tps: f32) -> Result<(), RegionError> {
+    fn send_heartbeat(&self, tps: f32) {
         let sleeping = self.state == RegionState::Sleeping;
-        self.ipc.send(
+        // 心跳可短暂丢失：不致命，下一 tick 继续；避免 datarouter
+        // 暂时性满/忙导致 region 进程退出。
+        if let Err(err) = self.ipc.send_retry(
             CORE_SERVICE,
             kind::REGION_HEARTBEAT,
             &encode_heartbeat(
@@ -274,8 +276,9 @@ impl RegionService {
                 self.store.loaded_count(),
                 self.ticker.tick_count,
             ),
-        )?;
-        Ok(())
+        ) {
+            warn!(%err, "heartbeat send failed, skipped");
+        }
     }
 
     /// 排空 IPC 消息队列并处理。
@@ -353,7 +356,7 @@ impl RegionService {
                 let chunk_x = cx + dx;
                 let chunk_z = cz + dz;
                 let payload = self.store.network_chunk_payload(face, chunk_x, chunk_z)?;
-                self.ipc.send(
+                self.ipc.send_retry(
                     CORE_SERVICE,
                     kind::CHUNK_DATA,
                     &encode_chunk_data(face.byte(), chunk_x, chunk_z, &payload),

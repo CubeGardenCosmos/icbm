@@ -107,6 +107,22 @@ impl Ipc {
             .map_err(IpcError::Datarouter)
     }
 
+    /// 发送并对暂时性满/忙（BUSY/FULL/AGAIN）短退避重试，避免大块
+    /// 数据突发时（如 81 区块一次性下发超过 channel 容量）region 崩溃。
+    pub fn send_retry(&self, target: &str, kind: u8, body: &[u8]) -> Result<(), IpcError> {
+        let mut attempts = 0;
+        loop {
+            match self.send(target, kind, body) {
+                Ok(()) => return Ok(()),
+                Err(IpcError::Datarouter(code)) if matches!(code, 3 | 4 | 6) && attempts < 30 => {
+                    attempts += 1;
+                    std::thread::sleep(std::time::Duration::from_millis(20));
+                }
+                Err(err) => return Err(err),
+            }
+        }
+    }
+
     /// 接收一帧（超时返回 `Ok(None)`）。
     pub fn recv(&self, timeout_ms: u32) -> Result<Option<IpcMessage>, IpcError> {
         let message = match self.frontend.recv(timeout_ms) {
