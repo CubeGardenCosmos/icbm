@@ -939,7 +939,7 @@ pub fn apply_data(
                 client.data_request_pending.store(false, std::sync::atomic::Ordering::Relaxed);
                 return "无法发送方块 NBT 读取请求".to_owned();
             }
-            let deadline = std::time::Instant::now() + std::time::Duration::from_millis(500);
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(3);
             let response = loop {
                 let nbt = client.pending_block_nbt.lock().expect("block nbt").take();
                 if nbt.is_some() {
@@ -979,7 +979,7 @@ pub fn apply_data(
                     z,
                 ),
             );
-            let deadline = std::time::Instant::now() + std::time::Duration::from_millis(500);
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(3);
             let existing = loop {
                 let nbt = client.pending_block_nbt.lock().expect("block nbt").take();
                 if nbt.is_some() {
@@ -1032,7 +1032,7 @@ pub fn apply_data(
                     z,
                 ),
             );
-            let deadline = std::time::Instant::now() + std::time::Duration::from_millis(500);
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(3);
             let existing = loop {
                 let nbt = client.pending_block_nbt.lock().expect("block nbt").take();
                 if nbt.is_some() {

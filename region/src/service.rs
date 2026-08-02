@@ -159,8 +159,9 @@ impl Ticker {
 const ENTITY_TYPE_CREEPER: i32 = 23;
 /// 每区域最多存活的 Creeper 数（vanilla 每区域怪物上限约 70，本实现取小）。
 const MAX_CREEPERS: usize = 12;
-/// 每 tick 生成 Creeper 的概率（夜晚约 6 秒一只，vanilla 自然生成节奏）。
-const SPAWN_CHANCE: f64 = 1.0 / 120.0;
+/// 每 tick 生成 Creeper 的概率（夜晚约 2 秒一只；vanilla 每区块多次生成尝试，
+/// 取较高值保证测试与演示可复现）。
+const SPAWN_CHANCE: f64 = 1.0 / 40.0;
 /// Creeper 出生高度（superflat 地表顶 -61 之上）。
 const CREEPER_SPAWN_Y: f64 = crate::OVERWORLD_SURFACE_FEET_Y as f64;
 /// 敌对生物追踪/引爆半径（方块）：vanilla `CreeperEntity` 的
