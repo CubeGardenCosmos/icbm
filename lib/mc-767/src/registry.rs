@@ -39,6 +39,14 @@ pub mod names {
     pub const COBBLESTONE: &str = "minecraft:cobblestone";
     /// 下界传送门方块。
     pub const NETHER_PORTAL: &str = "minecraft:nether_portal";
+    /// 红石线。
+    pub const REDSTONE_WIRE: &str = "minecraft:redstone_wire";
+    /// 红石火把。
+    pub const REDSTONE_TORCH: &str = "minecraft:redstone_torch";
+    /// 红石灯。
+    pub const REDSTONE_LAMP: &str = "minecraft:redstone_lamp";
+    /// 红石块。
+    pub const REDSTONE_BLOCK: &str = "minecraft:redstone_block";
 }
 
 use crate::packets::play::block_state_ids as ids;
@@ -63,6 +71,10 @@ pub const fn state_id_to_name(id: i32) -> Option<&'static str> {
         ids::OAK_PLANKS => Some(names::OAK_PLANKS),
         ids::COBBLESTONE => Some(names::COBBLESTONE),
         ids::NETHER_PORTAL => Some(names::NETHER_PORTAL),
+        ids::REDSTONE_WIRE => Some(names::REDSTONE_WIRE),
+        ids::REDSTONE_TORCH_OFF => Some(names::REDSTONE_TORCH),
+        ids::REDSTONE_LAMP => Some(names::REDSTONE_LAMP),
+        ids::REDSTONE_BLOCK => Some(names::REDSTONE_BLOCK),
         _ => None,
     }
 }
@@ -87,6 +99,10 @@ pub fn name_to_state_id(name: &str) -> Option<i32> {
         names::OAK_PLANKS => Some(ids::OAK_PLANKS),
         names::COBBLESTONE => Some(ids::COBBLESTONE),
         names::NETHER_PORTAL => Some(ids::NETHER_PORTAL),
+        names::REDSTONE_WIRE => Some(ids::REDSTONE_WIRE),
+        names::REDSTONE_TORCH => Some(ids::REDSTONE_TORCH_OFF),
+        names::REDSTONE_LAMP => Some(ids::REDSTONE_LAMP),
+        names::REDSTONE_BLOCK => Some(ids::REDSTONE_BLOCK),
         _ => None,
     }
 }

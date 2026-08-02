@@ -9,6 +9,7 @@ pub mod fluids;
 pub mod mobs;
 pub mod portal;
 pub mod protocol;
+pub mod redstone;
 pub mod service;
 pub mod store;
 

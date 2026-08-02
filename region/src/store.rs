@@ -68,6 +68,8 @@ pub struct ChunkStore {
     loaded: u32,
     /// 被 `set_block` 修改的主世界区块（流体 tick 用，处理后清空）。
     dirty: std::collections::HashSet<(i32, i32)>,
+    /// 含红石方块的主世界区块（红石 tick 用）。
+    redstone_dirty: std::collections::HashSet<(i32, i32)>,
 }
 
 impl ChunkStore {
@@ -84,6 +86,7 @@ impl ChunkStore {
             nether: HashMap::new(),
             loaded: 0,
             dirty: std::collections::HashSet::new(),
+            redstone_dirty: std::collections::HashSet::new(),
         })
     }
 
@@ -236,6 +239,9 @@ impl ChunkStore {
         }
         if face == Face::Overworld {
             self.dirty.insert((cx, cz));
+            if crate::redstone::is_redstone_block(state_id) {
+                self.redstone_dirty.insert((cx, cz));
+            }
         }
         Ok((cx, cz))
     }
@@ -263,6 +269,13 @@ impl ChunkStore {
     pub fn dirty_overworld_chunks(&mut self) -> Vec<(i32, i32)> {
         let chunks: Vec<(i32, i32)> = self.dirty.iter().copied().collect();
         self.dirty.clear();
+        chunks
+    }
+
+    /// 含红石方块的主世界区块（红石 tick 用），并清空标记。
+    pub fn redstone_chunks(&mut self) -> Vec<(i32, i32)> {
+        let chunks: Vec<(i32, i32)> = self.redstone_dirty.iter().copied().collect();
+        self.redstone_dirty.clear();
         chunks
     }
 }

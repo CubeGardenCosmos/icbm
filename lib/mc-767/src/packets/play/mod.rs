@@ -84,6 +84,18 @@ pub mod block_state_ids {
     pub const COBBLESTONE: i32 = 14;
     /// 下界传送门方块（axis=x，默认态）。
     pub const NETHER_PORTAL: i32 = 5864;
+    /// 红石线（power=0，默认态；power 0..15 → 4138..4153）。
+    pub const REDSTONE_WIRE: i32 = 4138;
+    /// 红石火把（熄灭态）。
+    pub const REDSTONE_TORCH_OFF: i32 = 5738;
+    /// 红石火把（点亮态）。
+    pub const REDSTONE_TORCH_ON: i32 = 5739;
+    /// 红石灯（熄灭态）。
+    pub const REDSTONE_LAMP: i32 = 7418;
+    /// 红石灯（点亮态）。
+    pub const REDSTONE_LAMP_ON: i32 = 7419;
+    /// 红石块（强电源）。
+    pub const REDSTONE_BLOCK: i32 = 9223;
 }
 
 /// 1.21.1 生物群系网络 ID（icbm 服务器自定义注册表顺序）。

@@ -457,6 +457,7 @@ impl RegionService {
         self.drain_messages()?;
         self.flush_chunks()?;
         self.tick_fluids()?;
+        self.tick_redstone()?;
         self.tick_entities()?;
         self.tick_mobs()?;
         // Phase 1 世界 tick：仅随机漫游 Creeper（region 存活信号）
@@ -752,6 +753,91 @@ impl RegionService {
             self.send_entity_packet(play_ids::CLIENTBOUND_ADD_ENTITY, |w| {
                 add.encode(w);
             })?;
+        }
+        Ok(())
+    }
+
+    /// 红石 tick：对脏区块内的红石线计算供电、红石灯根据相邻信号点亮/熄灭。
+    fn tick_redstone(&mut self) -> Result<(), RegionError> {
+        use crate::redstone::{compute_wire_power, lamp_should_light, wire_power, wire_state};
+        use icbm_mc_767::packets::play::block_state_ids as ids;
+        let chunks = self.store.redstone_chunks();
+        if chunks.is_empty() {
+            return Ok(());
+        }
+        // 1. 先收集所有红石线位置与当前强度（快照，避免 tick 中反复查询）
+        let mut wires: Vec<(i32, i32, i32, i32)> = Vec::new();
+        let mut lamps: Vec<(i32, i32, i32)> = Vec::new();
+        let mut snapshot: std::collections::HashMap<(i32, i32, i32), i32> =
+            std::collections::HashMap::new();
+        for (cx, cz) in &chunks {
+            for x in cx * 16..cx * 16 + 16 {
+                for z in cz * 16..cz * 16 + 16 {
+                    for y in -64..319 {
+                        let state = self
+                            .store
+                            .block_at(Face::Overworld, x, y, z)
+                            .unwrap_or(0);
+                        snapshot.insert((x, y, z), state);
+                        if wire_power(state).is_some() {
+                            wires.push((x, y, z, state));
+                        } else if state == ids::REDSTONE_LAMP || state == ids::REDSTONE_LAMP_ON {
+                            lamps.push((x, y, z));
+                        }
+                    }
+                }
+            }
+        }
+        // 2. 计算每条红石线的信号强度（考虑电源与相邻线衰减）
+        let mut wire_updates: Vec<(i32, i32, i32, i32)> = Vec::new();
+        for (x, y, z, _) in wires {
+            let neighbors = [(x + 1, y, z), (x - 1, y, z), (x, y, z + 1), (x, y, z - 1)]
+                .into_iter()
+                .map(|(nx, ny, nz)| snapshot.get(&(nx, ny, nz)).copied().unwrap_or(0))
+                .collect::<Vec<_>>();
+            let power = compute_wire_power(neighbors);
+            let current = snapshot.get(&(x, y, z)).copied().unwrap_or(0);
+            if wire_power(current) != Some(power) {
+                wire_updates.push((x, y, z, wire_state(power)));
+            }
+        }
+        // 3. 红石灯：相邻信号 ≥ 1 点亮
+        let mut lamp_updates: Vec<(i32, i32, i32, i32)> = Vec::new();
+        for (x, y, z) in lamps {
+            let neighbors = [
+                (x + 1, y, z),
+                (x - 1, y, z),
+                (x, y, z + 1),
+                (x, y, z - 1),
+                (x, y + 1, z),
+                (x, y - 1, z),
+            ]
+            .into_iter()
+            .map(|(nx, ny, nz)| snapshot.get(&(nx, ny, nz)).copied().unwrap_or(0))
+            .collect::<Vec<_>>();
+            let power = compute_wire_power(neighbors);
+            let lit = lamp_should_light(power);
+            let target = if lit { ids::REDSTONE_LAMP_ON } else { ids::REDSTONE_LAMP };
+            let current = snapshot.get(&(x, y, z)).copied().unwrap_or(0);
+            if current != target {
+                lamp_updates.push((x, y, z, target));
+            }
+        }
+        // 4. 应用更新并广播
+        for (x, y, z, state) in wire_updates.into_iter().chain(lamp_updates) {
+            if self
+                .store
+                .set_block(Face::Overworld, x, y, z, state)
+                .is_ok()
+            {
+                let packet = icbm_mc_767::packets::play::clientbound::CBlockUpdate {
+                    position: icbm_mc_767::packets::play::BlockPos::new(x, y, z),
+                    state_id: state,
+                };
+                self.send_entity_packet(play_ids::CLIENTBOUND_BLOCK_UPDATE, |w| {
+                    packet.encode(w);
+                })?;
+            }
         }
         Ok(())
     }
