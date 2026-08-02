@@ -291,10 +291,13 @@ fn full_join_flow_status_login_config_play() {
     let reg = client.recv_until(play_ids::CLIENTBOUND_CUSTOM_PAYLOAD, "minecraft:register");
     let mut r = Reader::new(&reg);
     assert_eq!(r.read_string().unwrap(), "minecraft:register");
-    let channels = r.read_string().unwrap();
+    // payload 为 NUL 分隔的原始通道名（对照 DinnerboneProtocolUtils.writeChannels）
+    let channels = r.read_rest();
     assert!(
-        channels.contains("icbm_client:state_subscription"),
-        "register channels: {channels}"
+        channels
+            .split(|&b| b == 0)
+            .any(|part| part == b"icbm_client:state_subscription"),
+        "register channels: {channels:?}"
     );
 
     // 初始区块即将到来

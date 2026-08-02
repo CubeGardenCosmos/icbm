@@ -648,11 +648,16 @@ pub fn enter_play(server: &Server, client: &Arc<Client>) -> Result<(), NetError>
 
     // 服务器声明可接收 `icbm_client:state_subscription`（C2S 通道）。
     // 对照 ICBM Client 协议：服务端进入 Play 后用原版 `minecraft:register` 声明。
+    //
+    // 原版 `minecraft:register` payload 是 NUL 分隔的原始通道名序列（对照
+    // `DinnerboneProtocolUtils.writeChannels` 与 master 分支
+    // `SUBSCRIPTION_CHANNEL_REGISTRATION`），不得写成 VarInt 长度前缀字符串——
+    // 那会把长度字节 `0x1E` 读进通道名导致客户端 `ResourceLocationException`。
     client.send_encoded(
         icbm_mc_767::packets::play_ids::CLIENTBOUND_CUSTOM_PAYLOAD,
         |w| {
             w.write_string("minecraft:register");
-            w.write_string("icbm_client:state_subscription");
+            w.write_slice(b"icbm_client:state_subscription\0");
         },
     )?;
 
@@ -852,30 +857,23 @@ pub fn offline_uuid(name: &str) -> Uuid {
     Uuid::from_bytes(bytes)
 }
 
-/// 解析原版 `minecraft:register` payload（VarInt 长度 + NUL 分隔通道列表）。
+/// 解析原版 `minecraft:register` payload（NUL 分隔的通道名列表）。
+///
+/// 对照 `DinnerboneProtocolUtils.readChannels`（逐字节读至 NUL，缓冲末尾再结算）与
+/// master 分支 `registered_channel_contains`：payload 是原始 UTF-8 通道名序列，
+/// 通道间以 `NUL`(0x00) 分隔，无长度前缀；非法 UTF-8 片段按 master 语义忽略
+/// （不授予任何能力）。
 #[must_use]
 pub fn register_channels(data: &[u8]) -> Vec<String> {
-    let mut reader = icbm_mc_767::codec::Reader::new(data);
-    let Ok(len) = reader.read_var_int() else {
-        return Vec::new();
-    };
-    let Ok(len) = usize::try_from(len) else {
-        return Vec::new();
-    };
-    let rest = reader.read_rest();
-    if rest.len() < len {
-        return Vec::new();
-    }
-    rest[..len]
-        .split(|&b| b == 0)
+    data.split(|&b| b == 0)
         .filter(|part| !part.is_empty())
-        .map(|part| String::from_utf8_lossy(part).into_owned())
+        .filter_map(|part| std::str::from_utf8(part).ok().map(str::to_owned))
         .collect()
 }
 
 #[cfg(test)]
 mod tests {
-    use super::offline_uuid;
+    use super::{offline_uuid, register_channels};
 
     #[test]
     fn offline_uuid_is_stable() {
@@ -886,5 +884,35 @@ mod tests {
         // 版本 3、IETF 变体
         assert_eq!(a.get_version_num(), 3);
         assert_eq!(a.get_variant(), uuid::Variant::RFC4122);
+    }
+
+    #[test]
+    fn register_payload_is_nul_separated_raw_bytes() {
+        // 对照 `DinnerboneProtocolUtils.readChannels` 与 master 分支
+        // `registered_channel_contains`：payload 是 NUL 分隔的原始通道名，无长度前缀。
+        assert_eq!(
+            register_channels(b"minecraft:brand\0icbm_client:state_snapshot\0"),
+            vec![
+                "minecraft:brand".to_owned(),
+                "icbm_client:state_snapshot".to_owned()
+            ]
+        );
+    }
+
+    #[test]
+    fn register_payload_rejects_length_prefix_and_bad_utf8() {
+        // 旧实现把通道名写成 VarInt 长度前缀字符串：`0x1E`(30) 是长度字节，
+        // NeoForge 客户端会把它读进通道名导致 `ResourceLocationException`，
+        // 解析结果不得等于原通道名。
+        let channels = register_channels(b"\x1Eicbm_client:state_subscription");
+        assert!(
+            !channels
+                .iter()
+                .any(|ch| ch == "icbm_client:state_subscription"),
+            "length-prefixed channel must not match: {channels:?}"
+        );
+        // 非法 UTF-8 片段不授予能力（master 语义）。
+        let channels = register_channels(b"\xff\0icbm_client:state_snapshot\0");
+        assert!(channels.iter().any(|ch| ch == "icbm_client:state_snapshot"));
     }
 }
