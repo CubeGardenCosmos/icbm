@@ -134,10 +134,10 @@ pub struct SChunkBatchReceived {
 }
 
 impl SChunkBatchReceived {
-    /// 解码。
+    /// 解码（对照 `AcknowledgeChunksC2SPacket.java`：`VarInt`）。
     pub fn decode(reader: &mut Reader<'_>) -> Result<Self, CodecError> {
         Ok(Self {
-            batch_size: reader.read_i32_be()?,
+            batch_size: reader.read_var_int()?,
         })
     }
 
@@ -360,19 +360,19 @@ pub struct SPlayerAction {
     pub status: i32,
     /// 动作位置。
     pub location: BlockPos,
-    /// 方块面。
-    pub face: i8,
+    /// 方块面（Direction 枚举 VarInt：0=下，1=上，2=北，3=南，4=西，5=东）。
+    pub face: i32,
     /// 序列号。
     pub sequence: i32,
 }
 
 impl SPlayerAction {
-    /// 解码。
+    /// 解码（对照 `PlayerActionC2SPacket.java`：direction 为 `VarInt` 枚举）。
     pub fn decode(reader: &mut Reader<'_>) -> Result<Self, CodecError> {
         Ok(Self {
             status: reader.read_var_int()?,
             location: BlockPos::from_long(reader.read_i64_be()?),
-            face: reader.read_i8()?,
+            face: reader.read_var_int()?,
             sequence: reader.read_var_int()?,
         })
     }
@@ -489,7 +489,7 @@ mod tests {
         let mut w = Writer::new();
         w.write_var_int(2);
         w.write_i64_be(BlockPos::new(10, 64, -5).as_long());
-        w.write_i8(1);
+        w.write_var_int(1);
         w.write_var_int(7);
         let bytes = w.into_bytes();
         let packet = decode_round_trip(&bytes, SPlayerAction::decode);

@@ -125,28 +125,30 @@ impl CLevelChunkWithLight {
         // 方块实体（Phase 1 为空）
         writer.write_var_int(0);
 
-        // 光照掩码
+        // 光照掩码（对照 vanilla `LightData.java`：bit i ↔ 世界最低 section 起的
+        // 第 i 个 section，无“下方/上方”额外位；有数据入 inited 掩码，无数据入
+        // uninited 掩码）。flat 世界天空光全亮、方块光全空。
         let num_sections = self.sections.len();
         let mut sky_light_mask = 0i64;
+        let mut block_light_mask = 0i64;
         let mut sky_light_empty_mask = 0i64;
         let mut block_light_empty_mask = 0i64;
 
-        sky_light_empty_mask |= 1 << 0;
-        block_light_empty_mask |= 1 << 0;
         for section_index in 0..num_sections {
-            let bit = section_index + 1;
             if section_index < self.sky_light.len() {
-                sky_light_mask |= 1 << bit;
+                sky_light_mask |= 1 << section_index;
             } else {
-                sky_light_empty_mask |= 1 << bit;
+                sky_light_empty_mask |= 1 << section_index;
             }
-            block_light_empty_mask |= 1 << bit;
+            if section_index < self.block_light.len() {
+                block_light_mask |= 1 << section_index;
+            } else {
+                block_light_empty_mask |= 1 << section_index;
+            }
         }
-        sky_light_empty_mask |= 1 << (num_sections + 1);
-        block_light_empty_mask |= 1 << (num_sections + 1);
 
         writer.write_bitset(&[sky_light_mask]);
-        writer.write_bitset(&[0]); // block light mask 恒空
+        writer.write_bitset(&[block_light_mask]);
         writer.write_bitset(&[sky_light_empty_mask]);
         writer.write_bitset(&[block_light_empty_mask]);
 
@@ -332,9 +334,9 @@ pub struct CChunkBatchFinished {
 }
 
 impl CChunkBatchFinished {
-    /// 编码载荷。
+    /// 编码载荷（对照 `ChunkSentS2CPacket.java`：`VarInt`）。
     pub fn encode(&self, writer: &mut Writer) {
-        writer.write_i32_be(self.batch_size);
+        writer.write_var_int(self.batch_size);
     }
 
     /// 包 ID。
@@ -812,9 +814,16 @@ mod tests {
         let data = r.read_bytes(data_len).unwrap();
         assert_eq!(data.len(), data_len);
         assert_eq!(r.read_var_int().unwrap(), 0); // 无方块实体
-        // 光照：sky mask = bits 1..=24
+        // 光照：vanilla 约定 bit i ↔ 世界底部起第 i 个 section（无 +1 偏移）；
+        // 24 个 section 全部有天空光 → sky mask 低 24 位全 1。
         let sky_mask = r.read_bitset().unwrap();
-        assert_eq!(sky_mask[0] & 0x1FF_FFFF, 0x1FF_FFFE);
+        assert_eq!(sky_mask[0] & 0xFF_FFFF, 0xFF_FFFF);
+        let block_mask = r.read_bitset().unwrap();
+        assert_eq!(block_mask[0], 0);
+        let sky_empty = r.read_bitset().unwrap();
+        assert_eq!(sky_empty[0], 0);
+        let block_empty = r.read_bitset().unwrap();
+        assert_eq!(block_empty[0] & 0xFF_FFFF, 0xFF_FFFF);
     }
 
     #[test]
