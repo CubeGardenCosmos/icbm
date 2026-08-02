@@ -71,6 +71,21 @@ pub fn name_to_state_id(name: &str) -> Option<i32> {
     }
 }
 
+/// 粒子类型名（不含 `minecraft:` 前缀）→ 网络注册表 ID。
+///
+/// 数据来自 vanilla 1.21.1 `ParticleTypes` 注册序（`ParticleTypes.PACKET_CODEC`
+/// 即 `Registries.PARTICLE_TYPE` 的注册序）。客户端内置全部粒子；本表只列
+/// 服务端可能发送的简单粒子（`SimpleParticleType`，无附加数据）。
+#[must_use]
+pub fn particle_id(name: &str) -> Option<i32> {
+    match name {
+        "explosion" => Some(22),
+        "explosion_emitter" => Some(21),
+        "large_smoke" => Some(49),
+        _ => None,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::{name_to_state_id, state_id_to_name};

@@ -9,16 +9,20 @@ use crate::packets::play::{
     BlockPos, HEIGHTMAP_COLUMNS, encode_heightmap, encode_paletted_container,
 };
 use crate::packets::play_ids::{
-    CLIENTBOUND_ADD_ENTITY, CLIENTBOUND_BUNDLE_DELIMITER, CLIENTBOUND_CHANGE_DIFFICULTY,
+    CLIENTBOUND_ADD_ENTITY, CLIENTBOUND_ADD_EXPERIENCE_ORB, CLIENTBOUND_ANIMATE,
+    CLIENTBOUND_BLOCK_UPDATE, CLIENTBOUND_BUNDLE_DELIMITER, CLIENTBOUND_CHANGE_DIFFICULTY,
     CLIENTBOUND_CHUNK_BATCH_FINISHED, CLIENTBOUND_CHUNK_BATCH_START,
-    CLIENTBOUND_COMMAND_SUGGESTIONS, CLIENTBOUND_COMMANDS, CLIENTBOUND_DISCONNECT,
+    CLIENTBOUND_COMMAND_SUGGESTIONS, CLIENTBOUND_COMMANDS, CLIENTBOUND_CONTAINER_SET_SLOT,
+    CLIENTBOUND_DISCONNECT, CLIENTBOUND_ENTITY_EVENT, CLIENTBOUND_EXPLOSION,
     CLIENTBOUND_FORGET_LEVEL_CHUNK, CLIENTBOUND_GAME_EVENT, CLIENTBOUND_KEEP_ALIVE,
     CLIENTBOUND_LEVEL_CHUNK_WITH_LIGHT, CLIENTBOUND_LOGIN, CLIENTBOUND_MOVE_ENTITY_POS,
     CLIENTBOUND_MOVE_ENTITY_POS_ROT, CLIENTBOUND_PING, CLIENTBOUND_PLAYER_ABILITIES,
     CLIENTBOUND_PLAYER_INFO_REMOVE, CLIENTBOUND_PLAYER_INFO_UPDATE, CLIENTBOUND_PLAYER_POSITION,
-    CLIENTBOUND_REMOVE_ENTITIES, CLIENTBOUND_SET_CHUNK_CACHE_CENTER,
-    CLIENTBOUND_SET_CHUNK_CACHE_RADIUS, CLIENTBOUND_SET_DEFAULT_SPAWN_POSITION,
-    CLIENTBOUND_SYSTEM_CHAT, CLIENTBOUND_UPDATE_TAGS,
+    CLIENTBOUND_REMOVE_ENTITIES, CLIENTBOUND_RESPAWN, CLIENTBOUND_SECTION_BLOCKS_UPDATE,
+    CLIENTBOUND_SET_CHUNK_CACHE_CENTER, CLIENTBOUND_SET_CHUNK_CACHE_RADIUS,
+    CLIENTBOUND_SET_DEFAULT_SPAWN_POSITION, CLIENTBOUND_SET_ENTITY_MOTION,
+    CLIENTBOUND_SET_EXPERIENCE, CLIENTBOUND_SET_HEALTH, CLIENTBOUND_SET_TIME,
+    CLIENTBOUND_SOUND, CLIENTBOUND_SOUND_ENTITY, CLIENTBOUND_SYSTEM_CHAT, CLIENTBOUND_UPDATE_TAGS,
 };
 
 /// 区块 section 的网络数据（4096 个方块状态 ID + 64 个生物群系 ID）。
@@ -1010,6 +1014,614 @@ pub mod flat_biomes {
     pub const NETHER: i32 = biome_ids::NETHER_WASTES;
     /// 末地平坦生物群系。
     pub const END: i32 = biome_ids::THE_END;
+}
+
+/// 物品网络编码（1.21.1 `ItemStack.OPTIONAL_PACKET_CODEC`）。
+///
+/// 字段：`VarInt count`（0 = 空栈）→ `VarInt item_id + 1`（`registryEntry`：
+/// 引用条目写 `raw_id + 1`，直接条目写 0）→ `ComponentChanges`（`VarInt 添加数`
+/// + `VarInt 移除数` + 组件数据）。
+///
+/// 本实现支持：空栈、无组件栈、`minecraft:enchantments` 组件（附魔系统用）。
+/// 其余组件类型（`max_stack_size`/`attribute_modifiers` 等）不在服务端显式写入——
+/// 客户端对缺失组件应用物品默认值，与 vanilla 下发省略默认组件一致。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CItemStack {
+    /// 物品注册表名（如 `minecraft:stone`；空 = 空栈）。
+    pub item: Option<String>,
+    /// 数量。
+    pub count: i32,
+    /// 附魔（enchantments 组件，顺序即服务端收到的顺序）。
+    pub enchantments: Vec<(String, i32)>,
+    /// 是否在工具提示中显示附魔。
+    pub show_in_tooltip: bool,
+}
+
+impl CItemStack {
+    /// 空栈。
+    #[must_use]
+    pub const fn empty() -> Self {
+        Self {
+            item: None,
+            count: 0,
+            enchantments: Vec::new(),
+            show_in_tooltip: true,
+        }
+    }
+
+    /// 构造指定物品（无组件）。
+    #[must_use]
+    pub fn of(item: &str, count: i32) -> Self {
+        Self {
+            item: Some(item.to_owned()),
+            count,
+            enchantments: Vec::new(),
+            show_in_tooltip: true,
+        }
+    }
+
+    /// 是否为栈空。
+    #[must_use]
+    pub const fn is_empty(&self) -> bool {
+        self.item.is_none()
+    }
+
+    /// 编码载荷（`ItemStack.OPTIONAL_PACKET_CODEC`）。
+    pub fn encode(&self, writer: &mut Writer) {
+        let Some(item) = &self.item else {
+            writer.write_var_int(0);
+            return;
+        };
+        writer.write_var_int(self.count);
+        // registryEntry：raw_id + 1（直接条目用 0，本实现不使用）
+        let id = crate::item_ids::item_id(item).expect("unregistered item");
+        writer.write_var_int(id + 1);
+        // ComponentChanges：无组件时写 (0, 0)；有附魔时写 (1, 0) + enchantments
+        if self.enchantments.is_empty() {
+            writer.write_var_int(0);
+            writer.write_var_int(0);
+        } else {
+            writer.write_var_int(1);
+            writer.write_var_int(0);
+            // `minecraft:enchantments` 组件注册序（DataComponentTypes.java 第 10 个
+            // register，网络 ID = 9）
+            writer.write_var_int(9);
+            encode_enchantments(writer, &self.enchantments, self.show_in_tooltip);
+        }
+    }
+}
+
+/// 编码 `ItemEnchantmentsComponent.PACKET_CODEC`：`map(VarInt 条数, {ENTRY, VarInt})`
+/// + `Bool showInTooltip`（对照 `ItemEnchantmentsComponent.java`）。
+fn encode_enchantments(writer: &mut Writer, enchantments: &[(String, i32)], show: bool) {
+    writer.write_var_int(i32::try_from(enchantments.len()).expect("enchantments exceed i32"));
+    for (name, level) in enchantments {
+        // Enchantment.ENTRY_PACKET_CODEC = registryEntry：raw_id + 1
+        let id = crate::enchantment_ids::enchantment_id(name).expect("unregistered enchantment");
+        writer.write_var_int(id + 1);
+        writer.write_var_int(*level);
+    }
+    writer.write_bool(show);
+}
+
+/// Clientbound：单方块更新（0x09 `BlockUpdateS2CPacket`）。
+///
+/// 字段：`BlockPos` → `VarInt state_id`（对照 `BlockUpdateS2CPacket.java`：
+/// `BlockPos.PACKET_CODEC` + `PacketCodecs.entryOf(Block.STATE_IDS)`）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct CBlockUpdate {
+    /// 方块位置。
+    pub position: BlockPos,
+    /// 新方块状态 ID。
+    pub state_id: i32,
+}
+
+impl CBlockUpdate {
+    /// 编码载荷。
+    pub fn encode(&self, writer: &mut Writer) {
+        writer.write_i64_be(self.position.as_long());
+        writer.write_var_int(self.state_id);
+    }
+
+    /// 包 ID。
+    #[must_use]
+    pub const fn packet_id() -> i32 {
+        CLIENTBOUND_BLOCK_UPDATE
+    }
+}
+
+/// Clientbound：区块内多方块更新（0x49 `ChunkDeltaUpdateS2CPacket`）。
+///
+/// 字段：`i64 section 位置（x<<42 | z<<20 | y）` → `VarInt 数量` →
+/// 每项 `VarLong(state_id << 12 | 区块内相对位置)`，相对位置 = `(y<<8|z<<4|x)`
+/// 的 12 位（对照 `ChunkDeltaUpdateS2CPacket.java` 与 master `CMultiBlockUpdate`）。
+#[derive(Debug, Clone, Default)]
+pub struct CSectionBlocksUpdate {
+    /// 区块 section 位置（方块坐标）：x/z 为区块坐标（16 方块）、y 为 section 索引。
+    pub section: BlockPos,
+    /// 更新列表（位置 + 新状态 ID）。
+    pub updates: Vec<(BlockPos, i32)>,
+}
+
+impl CSectionBlocksUpdate {
+    /// 编码载荷。
+    pub fn encode(&self, writer: &mut Writer) {
+        let x = self.section.x as i64 & 0x3FF_FFFF;
+        let z = self.section.z as i64 & 0x3FF_FFFF;
+        let y = i64::from(self.section.y) & 0xFFF;
+        writer.write_i64_be((x << 42) | (z << 20) | y);
+        writer.write_var_int(
+            i32::try_from(self.updates.len()).expect("updates exceed i32"),
+        );
+        for (pos, state) in &self.updates {
+            let local_x = pos.x & 0xF;
+            let local_y = pos.y & 0xF;
+            let local_z = pos.z & 0xF;
+            let relative = ((local_y << 8) | (local_z << 4) | local_x) as i64;
+            writer.write_var_long((i64::from(*state) << 12) | relative);
+        }
+    }
+
+    /// 包 ID。
+    #[must_use]
+    pub const fn packet_id() -> i32 {
+        CLIENTBOUND_SECTION_BLOCKS_UPDATE
+    }
+}
+
+/// 声音分类（`SoundCategory.java` 枚举序）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[repr(i32)]
+pub enum SoundCategory {
+    Master = 0,
+    Music = 1,
+    Records = 2,
+    Weather = 3,
+    Blocks = 4,
+    Hostile = 5,
+    Neutral = 6,
+    Players = 7,
+    Ambient = 8,
+    Voice = 9,
+}
+
+/// Clientbound：世界声音（0x68 `PlaySoundS2CPacket`）。
+///
+/// 字段：`SoundEvent`（registryEntry：VarInt id+1）→ `VarInt category` →
+/// `i32 x*8/y*8/z*8` → `f32 volume` → `f32 pitch` → `i64 seed`（对照
+/// `PlaySoundS2CPacket.java`，`COORDINATE_SCALE = 8.0`）。
+#[derive(Debug, Clone)]
+pub struct CPlaySound {
+    /// 声音事件名（`minecraft:` 前缀省略，如 `entity.cow.ambient`）。
+    pub sound: String,
+    /// 分类。
+    pub category: SoundCategory,
+    /// 位置（方块）。
+    pub x: f64,
+    /// 位置。
+    pub y: f64,
+    /// 位置。
+    pub z: f64,
+    /// 音量。
+    pub volume: f32,
+    /// 音调。
+    pub pitch: f32,
+    /// 随机种子。
+    pub seed: i64,
+}
+
+impl CPlaySound {
+    /// 编码载荷。
+    pub fn encode(&self, writer: &mut Writer) {
+        let id = crate::sound_events::sound_id(&self.sound).expect("unregistered sound");
+        writer.write_var_int(id + 1);
+        writer.write_var_int(self.category as i32);
+        writer.write_i32_be((self.x * 8.0) as i32);
+        writer.write_i32_be((self.y * 8.0) as i32);
+        writer.write_i32_be((self.z * 8.0) as i32);
+        writer.write_f32_be(self.volume);
+        writer.write_f32_be(self.pitch);
+        writer.write_i64_be(self.seed);
+    }
+
+    /// 包 ID。
+    #[must_use]
+    pub const fn packet_id() -> i32 {
+        CLIENTBOUND_SOUND
+    }
+}
+
+/// Clientbound：实体声音（0x67 `PlaySoundFromEntityS2CPacket`）。
+///
+/// 字段：`SoundEvent` → `VarInt category` → `VarInt entity_id` →
+/// `f32 volume` → `f32 pitch` → `i64 seed`（对照 `PlaySoundFromEntityS2CPacket.java`）。
+#[derive(Debug, Clone)]
+pub struct CEntitySound {
+    /// 声音事件名。
+    pub sound: String,
+    /// 分类。
+    pub category: SoundCategory,
+    /// 实体 ID。
+    pub entity_id: i32,
+    /// 音量。
+    pub volume: f32,
+    /// 音调。
+    pub pitch: f32,
+    /// 随机种子。
+    pub seed: i64,
+}
+
+impl CEntitySound {
+    /// 编码载荷。
+    pub fn encode(&self, writer: &mut Writer) {
+        let id = crate::sound_events::sound_id(&self.sound).expect("unregistered sound");
+        writer.write_var_int(id + 1);
+        writer.write_var_int(self.category as i32);
+        writer.write_var_int(self.entity_id);
+        writer.write_f32_be(self.volume);
+        writer.write_f32_be(self.pitch);
+        writer.write_i64_be(self.seed);
+    }
+
+    /// 包 ID。
+    #[must_use]
+    pub const fn packet_id() -> i32 {
+        CLIENTBOUND_SOUND_ENTITY
+    }
+}
+
+/// Clientbound：槽位更新（0x15 `ScreenHandlerSlotUpdateS2CPacket`）。
+///
+/// 字段：`i8 sync_id` → `VarInt revision` → `i16 slot` → `ItemStack`（对照
+/// `ScreenHandlerSlotUpdateS2CPacket.java`）。玩家物品栏  = -2
+/// （`UPDATE_PLAYER_INVENTORY_SYNC_ID`）。
+#[derive(Debug, Clone)]
+pub struct CSetSlot {
+    /// 容器窗口 ID（-2 = 玩家物品栏）。
+    pub sync_id: i8,
+    /// 修订号（客户端忽略大部分场景）。
+    pub revision: i32,
+    /// 槽位。
+    pub slot: i16,
+    /// 物品。
+    pub stack: CItemStack,
+}
+
+impl CSetSlot {
+    /// 编码载荷。
+    pub fn encode(&self, writer: &mut Writer) {
+        writer.write_i8(self.sync_id);
+        writer.write_var_int(self.revision);
+        writer.write_i16_be(self.slot);
+        self.stack.encode(writer);
+    }
+
+    /// 包 ID。
+    #[must_use]
+    pub const fn packet_id() -> i32 {
+        CLIENTBOUND_CONTAINER_SET_SLOT
+    }
+}
+
+/// Clientbound：实体动画（0x03 `EntityAnimationS2CPacket`）。
+#[derive(Debug, Clone, Copy)]
+pub struct CEntityAnimation {
+    /// 实体 ID。
+    pub entity_id: i32,
+    /// 动画 ID。
+    pub animation: u8,
+}
+
+impl CEntityAnimation {
+    /// 挥主手。
+    pub const ANIMATION_SWING_MAIN_ARM: u8 = 0;
+    /// 受击。
+    pub const ANIMATION_HURT: u8 = 1;
+
+    /// 编码载荷。
+    pub fn encode(&self, writer: &mut Writer) {
+        writer.write_var_int(self.entity_id);
+        writer.write_u8(self.animation);
+    }
+
+    /// 包 ID。
+    #[must_use]
+    pub const fn packet_id() -> i32 {
+        CLIENTBOUND_ANIMATE
+    }
+}
+
+/// Clientbound：实体状态/事件（0x1F `EntityStatusS2CPacket`）。
+#[derive(Debug, Clone, Copy)]
+pub struct CEntityStatus {
+    /// 实体 ID。
+    pub entity_id: i32,
+    /// 状态 ID。
+    pub status: i8,
+}
+
+impl CEntityStatus {
+    /// 编码载荷。
+    pub fn encode(&self, writer: &mut Writer) {
+        writer.write_i32_be(self.entity_id);
+        writer.write_i8(self.status);
+    }
+
+    /// 包 ID。
+    #[must_use]
+    pub const fn packet_id() -> i32 {
+        CLIENTBOUND_ENTITY_EVENT
+    }
+}
+
+/// Clientbound：设置实体速度（0x5A `EntityVelocityUpdateS2CPacket`）。
+///
+/// 字段：`VarInt entity_id` → `i16 vx/vy/vz`（单位 1/8000 方块/秒，对照
+/// `EntityVelocityUpdateS2CPacket.java` 的 `(int)(velocity * 8000)`）。
+#[derive(Debug, Clone, Copy)]
+pub struct CEntityVelocity {
+    /// 实体 ID。
+    pub entity_id: i32,
+    /// X 速度（方块/秒）。
+    pub vx: f64,
+    /// Y 速度。
+    pub vy: f64,
+    /// Z 速度。
+    pub vz: f64,
+}
+
+impl CEntityVelocity {
+    /// 编码载荷。
+    pub fn encode(&self, writer: &mut Writer) {
+        writer.write_var_int(self.entity_id);
+        writer.write_i16_be(velocity_component(self.vx));
+        writer.write_i16_be(velocity_component(self.vy));
+        writer.write_i16_be(velocity_component(self.vz));
+    }
+
+    /// 包 ID。
+    #[must_use]
+    pub const fn packet_id() -> i32 {
+        CLIENTBOUND_SET_ENTITY_MOTION
+    }
+}
+
+/// 速度分量 → 网络 i16（1/8000 方块/秒，钳制 ±3.9）。
+#[must_use]
+pub fn velocity_component(velocity: f64) -> i16 {
+    (velocity.clamp(-3.9, 3.9) * 8000.0) as i16
+}
+
+/// Clientbound：设置经验（0x5C `ExperienceBarUpdateS2CPacket`）。
+#[derive(Debug, Clone, Copy)]
+pub struct CSetExperience {
+    /// 经验条进度（0..1）。
+    pub progress: f32,
+    /// 等级。
+    pub level: i32,
+    /// 总经验。
+    pub total_experience: i32,
+}
+
+impl CSetExperience {
+    /// 编码载荷。
+    pub fn encode(&self, writer: &mut Writer) {
+        writer.write_f32_be(self.progress);
+        writer.write_var_int(self.level);
+        writer.write_var_int(self.total_experience);
+    }
+
+    /// 包 ID。
+    #[must_use]
+    pub const fn packet_id() -> i32 {
+        CLIENTBOUND_SET_EXPERIENCE
+    }
+}
+
+/// Clientbound：设置生命/饥饿（0x5D `HealthUpdateS2CPacket`）。
+#[derive(Debug, Clone, Copy)]
+pub struct CSetHealth {
+    /// 生命值。
+    pub health: f32,
+    /// 饥饿值。
+    pub food: i32,
+    /// 饱和度。
+    pub saturation: f32,
+}
+
+impl CSetHealth {
+    /// 编码载荷。
+    pub fn encode(&self, writer: &mut Writer) {
+        writer.write_f32_be(self.health);
+        writer.write_var_int(self.food);
+        writer.write_f32_be(self.saturation);
+    }
+
+    /// 包 ID。
+    #[must_use]
+    pub const fn packet_id() -> i32 {
+        CLIENTBOUND_SET_HEALTH
+    }
+}
+
+/// Clientbound：世界时间（0x64 `WorldTimeUpdateS2CPacket`）。
+#[derive(Debug, Clone, Copy)]
+pub struct CUpdateTime {
+    /// 世界年龄（tick）。
+    pub game_time: i64,
+    /// 昼夜时间（tick；负数冻结昼夜循环）。
+    pub day_time: i64,
+}
+
+impl CUpdateTime {
+    /// 编码载荷。
+    pub fn encode(&self, writer: &mut Writer) {
+        writer.write_i64_be(self.game_time);
+        writer.write_i64_be(self.day_time);
+    }
+
+    /// 包 ID。
+    #[must_use]
+    pub const fn packet_id() -> i32 {
+        CLIENTBOUND_SET_TIME
+    }
+}
+
+/// Clientbound：经验球生成（0x02 `ExperienceOrbSpawnS2CPacket`）。
+#[derive(Debug, Clone, Copy)]
+pub struct CAddExperienceOrb {
+    /// 实体 ID。
+    pub entity_id: i32,
+    /// X。
+    pub x: f64,
+    /// Y。
+    pub y: f64,
+    /// Z。
+    pub z: f64,
+    /// 经验值。
+    pub count: i16,
+}
+
+impl CAddExperienceOrb {
+    /// 编码载荷（对照 `ExperienceOrbSpawnS2CPacket.java`：entityId → x/y/z → count）。
+    pub fn encode(&self, writer: &mut Writer) {
+        writer.write_var_int(self.entity_id);
+        writer.write_f64_be(self.x);
+        writer.write_f64_be(self.y);
+        writer.write_f64_be(self.z);
+        writer.write_i16_be(self.count);
+    }
+
+    /// 包 ID。
+    #[must_use]
+    pub const fn packet_id() -> i32 {
+        CLIENTBOUND_ADD_EXPERIENCE_ORB
+    }
+}
+
+/// 爆炸破坏类型（`Explosion.DestructionType` 枚举序，VarInt）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[repr(i32)]
+pub enum ExplosionDestructionType {
+    Keep = 0,
+    Destroy = 1,
+    DestroyWithDecay = 2,
+    TriggerBlock = 3,
+}
+
+/// Clientbound：爆炸（0x20 `ExplosionS2CPacket`）。
+///
+/// 字段（对照 `ExplosionS2CPacket.java`）：`f64 x/y/z` → `f32 radius` →
+/// `VarInt 受影响方块数` + 每项 `i8` 相对中心偏移 → `f32` 玩家速度 ×3 →
+/// `VarInt` 破坏类型 → 粒子 ×2（`ParticleTypes.PACKET_CODEC`，简单粒子 = registryEntry
+/// `VarInt id+1`）→ `SoundEvent`（registryEntry `VarInt id+1`）。
+#[derive(Debug, Clone)]
+pub struct CExplosion {
+    /// 爆炸中心。
+    pub x: f64,
+    /// 爆炸中心。
+    pub y: f64,
+    /// 爆炸中心。
+    pub z: f64,
+    /// 半径。
+    pub radius: f32,
+    /// 受影响方块（破坏区域，绝对坐标）。
+    pub affected_blocks: Vec<BlockPos>,
+    /// 玩家速度（方块/秒，爆炸推力）。
+    pub player_velocity: [f32; 3],
+    /// 破坏类型。
+    pub destruction_type: ExplosionDestructionType,
+    /// 粒子（`explosion_emitter`/`explosion` 等，registryEntry id+1）。
+    pub particle: String,
+    /// 发射粒子。
+    pub emitter_particle: String,
+    /// 爆炸声音事件。
+    pub sound: String,
+}
+
+impl CExplosion {
+    /// 编码载荷。
+    pub fn encode(&self, writer: &mut Writer) {
+        writer.write_f64_be(self.x);
+        writer.write_f64_be(self.y);
+        writer.write_f64_be(self.z);
+        writer.write_f32_be(self.radius);
+        let cx = self.x.floor() as i64;
+        let cy = self.y.floor() as i64;
+        let cz = self.z.floor() as i64;
+        writer.write_var_int(
+            i32::try_from(self.affected_blocks.len()).expect("affected blocks exceed i32"),
+        );
+        for pos in &self.affected_blocks {
+            writer.write_i8((i64::from(pos.x) - cx) as i8);
+            writer.write_i8((i64::from(pos.y) - cy) as i8);
+            writer.write_i8((i64::from(pos.z) - cz) as i8);
+        }
+        writer.write_f32_be(self.player_velocity[0]);
+        writer.write_f32_be(self.player_velocity[1]);
+        writer.write_f32_be(self.player_velocity[2]);
+        writer.write_var_int(self.destruction_type as i32);
+        let particle_id = crate::registry::particle_id(&self.particle).expect("unregistered particle");
+        writer.write_var_int(particle_id + 1);
+        let emitter_id =
+            crate::registry::particle_id(&self.emitter_particle).expect("unregistered particle");
+        writer.write_var_int(emitter_id + 1);
+        let sound_id = crate::sound_events::sound_id(&self.sound).expect("unregistered sound");
+        writer.write_var_int(sound_id + 1);
+    }
+
+    /// 包 ID。
+    #[must_use]
+    pub const fn packet_id() -> i32 {
+        CLIENTBOUND_EXPLOSION
+    }
+}
+
+/// Clientbound：玩家重生/维度切换（0x47 `PlayerRespawnS2CPacket`）。
+///
+/// 字段：`CommonPlayerSpawnInfo`（与 `CLogin` 的 `spawn_data` 同构，编码见
+/// `CommonPlayerSpawnInfo.java`）→ `i8 flag`（`KEEP_ATTRIBUTES`=1/`KEEP_TRACKED_DATA`=2）。
+#[derive(Debug, Clone)]
+pub struct CRespawn {
+    /// 出生信息（维度、模式、种子等）。
+    pub spawn_data: PlayerSpawnData,
+    /// 保留数据标志（`KEEP_ATTRIBUTES` | `KEEP_TRACKED_DATA`）。
+    pub data_kept: i8,
+}
+
+impl CRespawn {
+    /// 保留属性（速度等）。
+    pub const KEEP_ATTRIBUTES: i8 = 1;
+    /// 保留实体数据（背包等）。
+    pub const KEEP_TRACKED_DATA: i8 = 2;
+
+    /// 编码载荷（`CommonPlayerSpawnInfo.write` 字段顺序同 `CLogin` 的 `spawn_data`）。
+    pub fn encode(&self, writer: &mut Writer) {
+        let s = &self.spawn_data;
+        writer.write_var_int(s.dimension_type + 1);
+        writer.write_string(&s.dimension_name);
+        writer.write_i64_be(s.hashed_seed);
+        writer.write_u8(s.game_mode);
+        writer.write_i8(s.previous_gamemode);
+        writer.write_bool(s.is_debug);
+        writer.write_bool(s.is_flat);
+        match &s.death_dimension {
+            Some((name, pos)) => {
+                writer.write_bool(true);
+                writer.write_string(name);
+                writer.write_i64_be(pos.as_long());
+            }
+            None => writer.write_bool(false),
+        }
+        writer.write_var_int(s.portal_cooldown);
+        writer.write_i8(self.data_kept);
+    }
+
+    /// 包 ID。
+    #[must_use]
+    pub const fn packet_id() -> i32 {
+        CLIENTBOUND_RESPAWN
+    }
 }
 
 #[cfg(test)]

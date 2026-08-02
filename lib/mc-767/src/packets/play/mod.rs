@@ -6,7 +6,7 @@ pub mod serverbound;
 use crate::codec::Writer;
 
 /// 世界坐标 BlockPos（网络编码为打包 i64：x/z 各 26 位、y 12 位）。
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
 pub struct BlockPos {
     /// X。
     pub x: i32,

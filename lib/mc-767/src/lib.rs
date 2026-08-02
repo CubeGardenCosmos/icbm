@@ -8,9 +8,12 @@
 //! 版本快照：协议 767、DataVersion 3955（见 [`protocol`]）。
 
 pub mod codec;
+pub mod enchantment_ids;
+pub mod item_ids;
 pub mod nbt;
 pub mod packets;
 pub mod registry;
+pub mod sound_events;
 
 /// 固定版本快照（对照 `net.minecraft.SharedConstants` 与 master `util/src/version.rs`）。
 pub mod protocol {
