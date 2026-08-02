@@ -16,7 +16,7 @@ use icbm_region::protocol::{
     DIM_OVERWORLD, Ipc, IpcError, decode_chunk_data, decode_entity_data, decode_heartbeat,
     decode_register, encode_register_ack, encode_unload, kind,
 };
-use tracing::{info, warn};
+use tracing::{info, trace, warn};
 
 use crate::client::{Client, NetError};
 use crate::config::ServerConfig;
@@ -336,7 +336,7 @@ fn spawn_receiver(server: &Server) {
                             .is_multiple_of(10)
                     {
                         // CHUNK_DATA 计数（诊断，每 10 个一条）
-                        info!(
+                        trace!(
                             count = server.chunk_diag.load(Ordering::Relaxed),
                             "core chunk data"
                         );

@@ -91,7 +91,8 @@ struct TestServer {
 impl TestServer {
     /// `name` 用于区分并行测试实例（世界目录与 datarouter shm 名需唯一）。
     fn start(name: &str) -> Self {
-        let world_dir = std::env::temp_dir().join(format!("icbm-join-test-{}-{}", std::process::id(), name));
+        let world_dir =
+            std::env::temp_dir().join(format!("icbm-join-test-{}-{}", std::process::id(), name));
         let _ = std::fs::remove_dir_all(&world_dir);
         std::fs::create_dir_all(&world_dir).unwrap();
 
@@ -349,6 +350,19 @@ fn full_join_flow_status_login_config_play() {
         "register channels: {channels:?}"
     );
 
+    // 位置同步：先于区块批次发送（对照 vanilla `PlayerManager#onPlayerConnect` 的
+    // `requestTeleport`）。客户端本地玩家初始在默认共享出生点 (8,64,8)，若延迟到
+    // 批次后才同步会从高空坠入虚空。
+    let pos = client.recv_until(play_ids::CLIENTBOUND_PLAYER_POSITION, "player position");
+    let mut r = Reader::new(&pos);
+    let _x = r.read_f64_be().unwrap();
+    let _y = r.read_f64_be().unwrap();
+    let _z = r.read_f64_be().unwrap();
+    let _yaw = r.read_f32_be().unwrap();
+    let _pitch = r.read_f32_be().unwrap();
+    assert_eq!(r.read_u8().unwrap(), 0); // flags
+    let _teleport_id = r.read_var_int().unwrap();
+
     // 初始区块即将到来
     let ev = client.recv_until(play_ids::CLIENTBOUND_GAME_EVENT, "initial chunks coming");
     let mut r = Reader::new(&ev);
@@ -370,17 +384,6 @@ fn full_join_flow_status_login_config_play() {
     assert!(!batch_finished.is_empty());
     let mut r = Reader::new(&batch_finished);
     assert_eq!(r.read_var_int().unwrap(), total as i32);
-    // 位置同步（批次完成后服务器发 PlayerPosition）
-    let pos = client.recv_until(play_ids::CLIENTBOUND_PLAYER_POSITION, "player position");
-    let mut r = Reader::new(&pos);
-    let _x = r.read_f64_be().unwrap();
-    let _y = r.read_f64_be().unwrap();
-    let _z = r.read_f64_be().unwrap();
-    let _yaw = r.read_f32_be().unwrap();
-    let _pitch = r.read_f32_be().unwrap();
-    assert_eq!(r.read_u8().unwrap(), 0); // flags
-    let _teleport_id = r.read_var_int().unwrap();
-
     // 玩家已进入世界：respond to a keep-alive to prove the session is live
     let ka = client.recv_until(play_ids::CLIENTBOUND_KEEP_ALIVE, "keep alive");
     let mut r = Reader::new(&ka);

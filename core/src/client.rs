@@ -27,7 +27,7 @@ use icbm_mc_767::packets::play_ids;
 use icbm_mc_767::packets::status::{CPongResponse, CStatusResponse, SPingRequest, SStatusRequest};
 use icbm_mc_767::packets::status_ids;
 use icbm_region::RegionId;
-use tracing::{debug, info, warn};
+use tracing::{debug, info, trace, warn};
 use uuid::Uuid;
 
 use crate::net::play::handle_play_packet;
@@ -265,7 +265,7 @@ impl Client {
             let tail = items[items.len() - 24..].join(" ");
             items = vec![format!("{head} ... {tail}")];
         }
-        info!("tx log: {}", items.join(" "));
+        trace!("tx log: {}", items.join(" "));
     }
 
     /// 发送仅由编码函数定义的包。
@@ -722,26 +722,21 @@ pub fn enter_play(server: &Server, client: &Arc<Client>) -> Result<(), NetError>
             .insert(*client.uuid.lock().expect("uuid"), Arc::clone(client));
     }
     // 玩家所在 region（实体/区块转发用；先于区块加载设置，避免进服早期
-    // region 发来的实体包被丢弃）
+    // region 发来的实体包被丢弃）。Y>400 虚拟区不关联任何 region（core 接管）。
     {
         let position = client.position.lock().expect("position");
-        let region = RegionId::from_overworld_chunk(position.chunk_x(), position.chunk_z());
-        let mut world = server.world.lock().expect("world lock");
-        let _ = world
-            .player_regions
-            .insert(*client.uuid.lock().expect("uuid"), region);
-    }
-    // 区块加载（先发“区块即将到达”让客户端显示加载界面）
-    client.send_encoded(CGameEvent::packet_id(), |w| {
-        CGameEvent {
-            event: CGameEvent::EVENT_INITIAL_CHUNKS_COMING,
-            value: 0.0,
+        if position.y <= crate::net::play::VIRTUAL_ZONE_MIN_Y {
+            let region = RegionId::from_overworld_chunk(position.chunk_x(), position.chunk_z());
+            let mut world = server.world.lock().expect("world lock");
+            let _ = world
+                .player_regions
+                .insert(*client.uuid.lock().expect("uuid"), region);
         }
-        .encode(w);
-    })?;
-    crate::net::play::load_initial_chunks(server, client)?;
-
-    // 位置与传送确认
+    }
+    // 位置与传送确认：先于区块加载发送，对照 vanilla `PlayerManager#onPlayerConnect`
+    // 的 `requestTeleport`（位置包在 chunk 批次之前）。客户端本地玩家初始位置是
+    // 默认共享出生点 (8,64,8)（`AbstractClientPlayer` 取 `Level.getSharedSpawnPos`）；
+    // 若把位置延迟到区块批次结束后才同步，加载界面结束后会从高空坠入虚空。
     let position = *client.position.lock().expect("position");
     let teleport_id = client.teleport_id.fetch_add(1, Ordering::Relaxed);
     client.send_encoded(CPlayerPosition::packet_id(), |w| {
@@ -758,6 +753,16 @@ pub fn enter_play(server: &Server, client: &Arc<Client>) -> Result<(), NetError>
     })?;
     // 传送后重置速度基准，避免把进服位移计入速度
     client.reset_move_baseline();
+
+    // 区块加载（先发“区块即将到达”让客户端显示加载界面）
+    client.send_encoded(CGameEvent::packet_id(), |w| {
+        CGameEvent {
+            event: CGameEvent::EVENT_INITIAL_CHUNKS_COMING,
+            value: 0.0,
+        }
+        .encode(w);
+    })?;
+    crate::net::play::load_initial_chunks(server, client)?;
 
     let name = client.name.lock().expect("name").clone();
     info!(name = %name, "player entered the world");
@@ -805,7 +810,9 @@ fn send_join_sequence(server: &Server, client: &Arc<Client>) -> Result<(), NetEr
     client.send_encoded(CSetChunkCacheCenter::packet_id(), |w| {
         CSetChunkCacheCenter { chunk_x, chunk_z }.encode(w);
     })?;
-    let radius = client.view_distance.load(Ordering::Relaxed);
+    // 区块缓存半径 = 服务端可视距离（对照 vanilla `ChunkLoadDistanceS2CPacket`）；
+    // 不得用客户端上报的可视距离，否则进服请求范围会被客户端渲染距离撑大。
+    let radius = crate::net::play::effective_view_distance(server);
     client.send_encoded(CSetChunkCacheRadius::packet_id(), |w| {
         CSetChunkCacheRadius { radius }.encode(w);
     })?;

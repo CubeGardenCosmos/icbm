@@ -22,19 +22,41 @@ use crate::client::{Client, NetError, Position};
 use crate::server::Server;
 use crate::world::ChunkPending;
 
+/// Y>400 虚拟区：该高度活动不加载/不模拟任何 region（core 接管，对照 README
+/// 「Y > 400 活动时不加载任何 region」与 master「Y>400 虚拟服务器」设计）。
+pub const VIRTUAL_ZONE_MIN_Y: f64 = 400.0;
+
+/// 服务端视角的区块半径（客户端可视距离只影响其渲染，不扩大服务端发送半径；
+/// 对照 vanilla `PlayerManager.viewDistance` 与 `ServerChunkLoadingManager`）。
+///
+/// 此前进服请求用客户端上报的可视距离（最大 32），65×65=4225 区块按 region
+/// 每 tick 8 块约需 26 秒，是进服“长时间坠入虚空”的直接原因之一。
+#[must_use]
+pub fn effective_view_distance(server: &Server) -> i32 {
+    server.config.view_distance.clamp(2, 32)
+}
+
 /// 进服时加载初始区块（拉起 region → 请求 → 等待转发完成）。
+///
+/// 玩家位于 Y>400 虚拟区时 core 接管：不拉起 region、不请求区块、不通知进入；
+/// 回落由 [`update_position`] 负责。
 pub fn load_initial_chunks(server: &Server, client: &Arc<Client>) -> Result<(), NetError> {
-    let (chunk_x, chunk_z) = {
+    let (chunk_x, chunk_z, above) = {
         let position = client.position.lock().expect("position");
-        (position.chunk_x(), position.chunk_z())
+        (
+            position.chunk_x(),
+            position.chunk_z(),
+            position.y > VIRTUAL_ZONE_MIN_Y,
+        )
     };
+    if above {
+        debug!(name = %client.name.lock().expect("name"), "join in virtual zone above 400, core takes over");
+        return Ok(());
+    }
     let region_id = RegionId::from_overworld_chunk(chunk_x, chunk_z);
     server.ensure_region(region_id)?;
 
-    let radius = client
-        .view_distance
-        .load(std::sync::atomic::Ordering::Relaxed)
-        .clamp(2, 32);
+    let radius = effective_view_distance(server);
     let side = 2 * radius + 1;
     let total = usize::try_from(side).expect("radius").pow(2);
 
@@ -94,13 +116,14 @@ pub fn request_chunks_around(
     chunk_x: i32,
     chunk_z: i32,
 ) -> Result<(), NetError> {
+    // Y>400 虚拟区不加载 region（core 接管）；调用方已保证，此处防御性跳过
+    if client.position.lock().expect("position").y > VIRTUAL_ZONE_MIN_Y {
+        return Ok(());
+    }
     let region_id = RegionId::from_overworld_chunk(chunk_x, chunk_z);
     server.ensure_region(region_id)?;
 
-    let radius = client
-        .view_distance
-        .load(std::sync::atomic::Ordering::Relaxed)
-        .clamp(2, 32);
+    let radius = effective_view_distance(server);
     let side = 2 * radius + 1;
     let total = usize::try_from(side).expect("radius").pow(2);
     {
@@ -281,55 +304,92 @@ pub fn handle_play_packet(
     Ok(())
 }
 
-/// 更新玩家位置；跨 region 时通知新旧 region，移动超出已发中心时补充区块。
+/// 更新玩家位置；处理跨 region 与 Y>400 虚拟区（core 接管）迁移。
+///
+/// 归属以 `player_regions` 为准：Y≤400 时记录所在 region；Y>400 时不保留条目
+/// （虚拟区不加载/不模拟任何 region，对照 README「Y > 400 活动时不加载任何
+/// region」）。升入虚拟区时通知原 region 离开（无玩家即沉睡），回落时拉起
+/// 精确落点 region 并立即补视野区块，避免落在未加载地形。
 fn update_position(
     server: &Server,
     client: &Arc<Client>,
     apply: impl FnOnce(&mut Position),
 ) -> Result<(), NetError> {
-    let old_region = {
-        let position = client.position.lock().expect("position");
-        RegionId::from_overworld_chunk(position.chunk_x(), position.chunk_z())
-    };
+    let uuid = *client.uuid.lock().expect("uuid");
+    let old_region = server
+        .world
+        .lock()
+        .expect("world lock")
+        .player_regions
+        .get(&uuid)
+        .copied();
     let mut position = client.position.lock().expect("position");
     apply(&mut position);
+    let y = position.y;
     drop(position);
     client.note_move();
 
-    let new_region = {
-        let position = client.position.lock().expect("position");
-        RegionId::from_overworld_chunk(position.chunk_x(), position.chunk_z())
-    };
     let (chunk_x, chunk_z) = {
         let position = client.position.lock().expect("position");
         (position.chunk_x(), position.chunk_z())
     };
-    let region_changed = old_region != new_region;
-    if region_changed {
-        server.notify_player_leave(client, &old_region)?;
-        server.ensure_region(new_region)?;
-        server.notify_player_enter(client, &new_region)?;
-        {
-            let mut world = server.world.lock().expect("world lock");
-            let _ = world
-                .player_regions
-                .insert(*client.uuid.lock().expect("uuid"), new_region);
-        }
-        // 跨区后以新 region 为中心预拉相邻 3×3，提前启动子进程并生成地形
-        preload_neighbor_regions(server, client);
-    }
+    let new_region =
+        (y <= VIRTUAL_ZONE_MIN_Y).then(|| RegionId::from_overworld_chunk(chunk_x, chunk_z));
 
-    // 客户端可视中心落后超过 view/2 区块，或跨区：重新请求视野区块
-    let view = client
-        .view_distance
-        .load(std::sync::atomic::Ordering::Relaxed)
-        .clamp(2, 32);
-    let needs_chunks = region_changed || {
-        let center = *client.chunk_center.lock().expect("chunk center");
-        (chunk_x - center.0).abs() > view / 2 || (chunk_z - center.1).abs() > view / 2
-    };
-    if needs_chunks {
-        request_chunks_around(server, client, chunk_x, chunk_z)?;
+    match (old_region, new_region) {
+        (Some(old), Some(new)) if old != new => {
+            // 跨 region（地面带）：先通知旧区离开，拉起/复用新区并通知进入，
+            // 再预拉相邻 3×3 并重发视野区块，避免调入未加载地形。
+            server.notify_player_leave(client, &old)?;
+            server.ensure_region(new)?;
+            server.notify_player_enter(client, &new)?;
+            {
+                let mut world = server.world.lock().expect("world lock");
+                let _ = world.player_regions.insert(uuid, new);
+            }
+            preload_neighbor_regions(server, client);
+            request_chunks_around(server, client, chunk_x, chunk_z)?;
+        }
+        (Some(old), None) => {
+            // 升入 Y>400 虚拟区：core 接管，通知原 region 离开（无玩家即沉睡），
+            // 不再加载/请求任何 region 区块。
+            server.notify_player_leave(client, &old)?;
+            server
+                .world
+                .lock()
+                .expect("world lock")
+                .player_regions
+                .remove(&uuid);
+            debug!(
+                name = %client.name.lock().expect("name"),
+                y, "player entered virtual zone above 400, core takes over"
+            );
+        }
+        (None, Some(new)) => {
+            // 从虚拟区回落：拉起/复用精确落点 region、通知进入并立即补视野
+            // 区块，保证玩家落地时有地形可站。
+            server.ensure_region(new)?;
+            server.notify_player_enter(client, &new)?;
+            {
+                let mut world = server.world.lock().expect("world lock");
+                let _ = world.player_regions.insert(uuid, new);
+            }
+            preload_neighbor_regions(server, client);
+            request_chunks_around(server, client, chunk_x, chunk_z)?;
+        }
+        (Some(_), Some(_)) | (None, None) => {
+            // 同一 region / 均在虚拟区：仅在地面带按区块中心漂移补区块。
+            if new_region.is_some() {
+                let view = effective_view_distance(server);
+                let needs_chunks = {
+                    let center = *client.chunk_center.lock().expect("chunk center");
+                    (chunk_x - center.0).abs() > view / 2 || (chunk_z - center.1).abs() > view / 2
+                };
+                if needs_chunks {
+                    request_chunks_around(server, client, chunk_x, chunk_z)?;
+                }
+            }
+        }
     }
     Ok(())
 }
@@ -632,9 +692,13 @@ fn handle_custom_payload(
 /// 可选 regionId → 可选 processId → 可选速度 → 可选 TPS → `VarInt` 刷新间隔。
 pub fn send_icbm_snapshot(server: &Server, client: &Arc<Client>) {
     let position = client.position.lock().expect("position");
+    let uuid = *client.uuid.lock().expect("uuid");
     let region_id = RegionId::from_overworld_chunk(position.chunk_x(), position.chunk_z());
     let world = server.world.lock().expect("world lock");
-    let (region, region_name, process_id, tps) =
+    // Y>400 虚拟区（core 接管）不关联任何 region：快照不报告 region/TPS，
+    // 客户端据此显示“无区域”状态。
+    let in_region = position.y <= VIRTUAL_ZONE_MIN_Y && world.player_regions.contains_key(&uuid);
+    let (region, region_name, process_id, tps) = if in_region {
         world
             .regions
             .get(&region_id)
@@ -649,7 +713,10 @@ pub fn send_icbm_snapshot(server: &Server, client: &Arc<Client>) {
                     Some(entry.pid.to_string()),
                     entry.tps,
                 )
-            });
+            })
+    } else {
+        (None, None, None, 0.0)
+    };
     let sequence = client.icbm_sequence.fetch_add(1, Ordering::Relaxed) + 1;
     let speed = *client.speed.lock().expect("speed");
     let _ = client.send_encoded(

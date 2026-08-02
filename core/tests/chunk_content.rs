@@ -67,6 +67,30 @@ impl FakeClient {
             }
         }
     }
+
+    /// 非阻塞读一帧；超时/无数据返回 None（配合 `set_read_timeout` 用）。
+    fn recv_opt(&mut self) -> Option<(i32, Vec<u8>)> {
+        loop {
+            match decode_frame(&self.buffer, self.compression_threshold) {
+                Ok(Some((id, payload, consumed))) => {
+                    self.buffer.drain(..consumed);
+                    return Some((id, payload));
+                }
+                Ok(None) => {
+                    let mut chunk = [0u8; 8192];
+                    match self.stream.read(&mut chunk) {
+                        Ok(0) | Err(_) => return None, // 对端关闭/超时/中断
+                        Ok(n) => self.buffer.extend_from_slice(&chunk[..n]),
+                    }
+                }
+                Err(_) => return None,
+            }
+        }
+    }
+
+    fn set_read_timeout(&self, timeout: Duration) {
+        self.stream.set_read_timeout(Some(timeout)).unwrap();
+    }
 }
 
 struct TestServer {
@@ -242,6 +266,7 @@ fn chunk_terrain_matches_vanilla_flat() {
     client.recv_until(play_ids::CLIENTBOUND_SET_DEFAULT_SPAWN_POSITION, "spawn");
     client.recv_until(play_ids::CLIENTBOUND_COMMANDS, "commands");
     client.recv_until(play_ids::CLIENTBOUND_CUSTOM_PAYLOAD, "register");
+    client.recv_until(play_ids::CLIENTBOUND_PLAYER_POSITION, "position");
     client.recv_until(play_ids::CLIENTBOUND_GAME_EVENT, "chunks coming");
     client.recv_until(play_ids::CLIENTBOUND_CHUNK_BATCH_START, "batch start");
 
@@ -314,9 +339,8 @@ fn crossing_region_border_loads_new_region_chunks() {
     let mut client = FakeClient::connect(&server.addr);
     join_to_play(&mut client);
 
-    // 等初始区块批次完成
+    // 等初始区块批次完成（位置已在 join_to_play 消费）
     client.recv_until(play_ids::CLIENTBOUND_CHUNK_BATCH_FINISHED, "initial batch");
-    client.recv_until(play_ids::CLIENTBOUND_PLAYER_POSITION, "initial position");
 
     // 跨区：从 (0,4,0) 走到 (600,4,0)（x=512 是 region 0 与 1 的边界）
     let mut move_packet = Writer::new();
@@ -347,6 +371,182 @@ fn crossing_region_border_loads_new_region_chunks() {
     );
     let mut r = Reader::new(&finished);
     assert_eq!(r.read_var_int().unwrap(), 289); // (2*8+1)^2
+}
+
+/// 在 `duration` 内持续非阻塞读包，断言未出现 `forbidden` 中的包 ID（用于
+/// 验证 Y>400 虚拟区不触发区块缓存中心更新 / 区块批次）。
+fn assert_no_packet_within(
+    client: &mut FakeClient,
+    duration: Duration,
+    forbidden: &[i32],
+    what: &str,
+) {
+    client.set_read_timeout(Duration::from_millis(200));
+    let deadline = Instant::now() + duration;
+    while Instant::now() < deadline {
+        let Some((id, _)) = client.recv_opt() else {
+            continue;
+        };
+        assert!(
+            !forbidden.contains(&id),
+            "unexpected packet {id:#x} during {what} (forbidden: {forbidden:?})"
+        );
+    }
+    client.set_read_timeout(Duration::from_secs(10));
+}
+
+/// 玩家 Y>400 虚拟区（core 接管）：不加载/请求任何 region，不更新区块缓存
+/// 中心；回落至 Y≤400 后才拉起/复用精确落点 region 并补视野区块。
+#[allow(clippy::too_many_lines)]
+#[test]
+fn above_400_virtual_zone_defers_region_loading() {
+    let server = TestServer::start("virtual-zone");
+    let mut client = FakeClient::connect(&server.addr);
+    join_to_play(&mut client);
+    // 排空初始批次（位置包已在 join_to_play 消费）
+    client.recv_until(play_ids::CLIENTBOUND_CHUNK_BATCH_FINISHED, "initial batch");
+
+    // 升到 Y=500（>400，虚拟区）并跨过 region 边界 x=512：core 应接管，
+    // 不得更新区块缓存中心、不得发起新批次、不得加载新 region。
+    let mut move_up = Writer::new();
+    move_up.write_f64_be(600.0);
+    move_up.write_f64_be(500.0);
+    move_up.write_f64_be(0.0);
+    move_up.write_bool(true);
+    client.send(play_ids::SERVERBOUND_MOVE_POS, &move_up.into_bytes());
+    assert_no_packet_within(
+        &mut client,
+        Duration::from_millis(1200),
+        &[
+            play_ids::CLIENTBOUND_SET_CHUNK_CACHE_CENTER,
+            play_ids::CLIENTBOUND_CHUNK_BATCH_START,
+        ],
+        "virtual zone above 400",
+    );
+
+    // 回落到 Y=4（≤400）：拉起/复用落点 region（1,0），更新区块缓存中心并补区块
+    let mut move_down = Writer::new();
+    move_down.write_f64_be(600.0);
+    move_down.write_f64_be(4.0);
+    move_down.write_f64_be(0.0);
+    move_down.write_bool(true);
+    client.send(play_ids::SERVERBOUND_MOVE_POS, &move_down.into_bytes());
+    let center = client.recv_until(
+        play_ids::CLIENTBOUND_SET_CHUNK_CACHE_CENTER,
+        "descend chunk cache center",
+    );
+    let mut r = Reader::new(&center);
+    let cx = r.read_var_int().unwrap();
+    let cz = r.read_var_int().unwrap();
+    assert_eq!((cx, cz), (37, 0));
+    client.recv_until(
+        play_ids::CLIENTBOUND_CHUNK_BATCH_START,
+        "descend batch start",
+    );
+    let finished = client.recv_until(
+        play_ids::CLIENTBOUND_CHUNK_BATCH_FINISHED,
+        "descend batch finished",
+    );
+    let mut r = Reader::new(&finished);
+    assert_eq!(r.read_var_int().unwrap(), 289);
+}
+
+/// 初始区块批次半径以服务端可视距离为准（对照 vanilla `ChunkLoadDistance`），
+/// 不得被客户端上报的渲染距离（最大 32 → 65×65=4225 块）撑大。
+#[allow(clippy::too_many_lines)]
+#[test]
+fn initial_batch_capped_by_server_view_distance() {
+    let server = TestServer::start("view-cap");
+    let mut client = FakeClient::connect(&server.addr);
+
+    let mut intent = Writer::new();
+    intent.write_var_int(PROTOCOL_VERSION);
+    intent.write_string("127.0.0.1");
+    intent.write_u16_be(25565);
+    intent.write_var_int(2);
+    client.send(0x00, &intent.into_bytes());
+    let mut start = Writer::new();
+    start.write_string("farview");
+    start.write_uuid(&Uuid::nil());
+    client.send(login_ids::SERVERBOUND_START, &start.into_bytes());
+    let (cid, payload) = client.recv();
+    assert_eq!(cid, login_ids::CLIENTBOUND_COMPRESSION);
+    let mut r = Reader::new(&payload);
+    client.compression_threshold = Some(r.read_var_int().unwrap());
+    client.recv_until(login_ids::CLIENTBOUND_SUCCESS, "success");
+    client.send(login_ids::SERVERBOUND_ACKNOWLEDGED, &[]);
+    client.recv_until(
+        icbm_mc_767::packets::config_ids::CLIENTBOUND_CUSTOM_PAYLOAD,
+        "brand",
+    );
+    client.recv_until(
+        icbm_mc_767::packets::config_ids::CLIENTBOUND_UPDATE_ENABLED_FEATURES,
+        "features",
+    );
+    client.recv_until(
+        icbm_mc_767::packets::config_ids::CLIENTBOUND_KNOWN_PACKS,
+        "packs",
+    );
+    let mut packs = Writer::new();
+    packs.write_var_int(0);
+    client.send(
+        icbm_mc_767::packets::config_ids::SERVERBOUND_KNOWN_PACKS,
+        &packs.into_bytes(),
+    );
+    for i in 0..11 {
+        client.recv_until(
+            icbm_mc_767::packets::config_ids::CLIENTBOUND_REGISTRY_DATA,
+            &format!("reg {i}"),
+        );
+    }
+    client.recv_until(
+        icbm_mc_767::packets::config_ids::CLIENTBOUND_UPDATE_TAGS,
+        "tags",
+    );
+    client.recv_until(
+        icbm_mc_767::packets::config_ids::CLIENTBOUND_FINISH_CONFIGURATION,
+        "finish",
+    );
+    // 客户端上报渲染距离 32（配置阶段 0x00 ClientInformation）
+    let mut info = Writer::new();
+    info.write_string("zh_cn");
+    info.write_i8(32);
+    info.write_u8(0); // chat mode
+    info.write_bool(true); // chat colors
+    info.write_u8(0xFF); // skin parts
+    info.write_u8(0); // main hand
+    info.write_bool(false); // text filtering
+    info.write_bool(true); // allow server listing
+    client.send(
+        icbm_mc_767::packets::config_ids::SERVERBOUND_CLIENT_INFORMATION,
+        &info.into_bytes(),
+    );
+    client.send(
+        icbm_mc_767::packets::config_ids::SERVERBOUND_FINISH_CONFIGURATION,
+        &[],
+    );
+
+    client.recv_until(play_ids::CLIENTBOUND_LOGIN, "login");
+    let radius = client.recv_until(play_ids::CLIENTBOUND_SET_CHUNK_CACHE_RADIUS, "radius");
+    let mut r = Reader::new(&radius);
+    assert_eq!(
+        r.read_var_int().unwrap(),
+        8,
+        "radius must be server view distance"
+    );
+    client.recv_until(play_ids::CLIENTBOUND_CHANGE_DIFFICULTY, "difficulty");
+    client.recv_until(play_ids::CLIENTBOUND_PLAYER_ABILITIES, "abilities");
+    client.recv_until(play_ids::CLIENTBOUND_PLAYER_INFO_UPDATE, "info");
+    client.recv_until(play_ids::CLIENTBOUND_SET_DEFAULT_SPAWN_POSITION, "spawn");
+    client.recv_until(play_ids::CLIENTBOUND_COMMANDS, "commands");
+    client.recv_until(play_ids::CLIENTBOUND_CUSTOM_PAYLOAD, "register");
+    client.recv_until(play_ids::CLIENTBOUND_PLAYER_POSITION, "position");
+    client.recv_until(play_ids::CLIENTBOUND_GAME_EVENT, "chunks coming");
+    client.recv_until(play_ids::CLIENTBOUND_CHUNK_BATCH_START, "batch start");
+    let finished = client.recv_until(play_ids::CLIENTBOUND_CHUNK_BATCH_FINISHED, "batch finished");
+    let mut r = Reader::new(&finished);
+    // 服务端可视距离 8 → (2*8+1)^2 = 289，而不是客户端上报的 65^2
+    assert_eq!(r.read_var_int().unwrap(), 289);
 }
 
 /// region 模拟层随机生成漫游 Creeper（region 存活信号）：客户端应收到
@@ -392,7 +592,6 @@ fn player_commands_gamemode_gamerule_bmtool() {
     let mut client = FakeClient::connect(&server.addr);
     join_to_play(&mut client);
     client.recv_until(play_ids::CLIENTBOUND_CHUNK_BATCH_FINISHED, "initial batch");
-    client.recv_until(play_ids::CLIENTBOUND_PLAYER_POSITION, "initial position");
 
     // /gamemode creative → 能力包更新（FLAG_CREATIVE = 0x08）
     send_chat_command(&mut client, "gamemode creative");
@@ -470,7 +669,6 @@ fn run_command_tab_completion() {
     let mut client = FakeClient::connect(&server.addr);
     join_to_play(&mut client);
     client.recv_until(play_ids::CLIENTBOUND_CHUNK_BATCH_FINISHED, "initial batch");
-    client.recv_until(play_ids::CLIENTBOUND_PLAYER_POSITION, "initial position");
 
     // 顶层命令："/" 列出全部命令（升序）。
     let texts = request_suggestions(&mut client, "/", 1);
@@ -615,6 +813,8 @@ fn join_to_play(client: &mut FakeClient) {
     client.recv_until(play_ids::CLIENTBOUND_SET_DEFAULT_SPAWN_POSITION, "spawn");
     client.recv_until(play_ids::CLIENTBOUND_COMMANDS, "commands");
     client.recv_until(play_ids::CLIENTBOUND_CUSTOM_PAYLOAD, "register");
+    // 位置同步先于区块批次（对照 vanilla `requestTeleport`）
+    client.recv_until(play_ids::CLIENTBOUND_PLAYER_POSITION, "position");
     client.recv_until(play_ids::CLIENTBOUND_GAME_EVENT, "chunks coming");
     client.recv_until(play_ids::CLIENTBOUND_CHUNK_BATCH_START, "batch start");
 }
