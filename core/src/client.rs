@@ -13,6 +13,7 @@ use std::time::{Duration, Instant};
 use icbm_gameplay_minecraft::commands::GameMode;
 use icbm_mc_767::ConnectionState;
 use icbm_mc_767::codec::{Reader, Writer};
+use icbm_mc_767::nbt::{Nbt, NbtCompound};
 use icbm_mc_767::packets::decode_frame;
 use icbm_mc_767::packets::handshake::SIntent;
 use icbm_mc_767::packets::login::{
@@ -275,10 +276,16 @@ impl Client {
     }
 
     /// 发送系统聊天。
+    ///
+    /// 内容按官方 1.20.5+ 格式编码为 NBT 组件 `{text: ...}`（客户端
+    /// `FriendlyByteBuf.readNbt` 解析），非裸 JSON 字符串——裸字符串会让客户端
+    /// 把首字节当 NBT 标签 ID 而断线（`Invalid tag id`）。
     pub fn send_system_chat(&self, message: &str, overlay: bool) -> Result<(), NetError> {
-        let json = serde_json::json!({ "text": message }).to_string();
+        let mut component = NbtCompound::new();
+        component.insert("text", Nbt::String(message.to_owned()));
         self.send_encoded(play_ids::CLIENTBOUND_SYSTEM_CHAT, |w| {
-            w.write_string(&json);
+            w.write_nbt_unnamed(&Nbt::Compound(Box::new(component)))
+                .expect("system chat component must encode");
             w.write_bool(overlay);
         })
     }

@@ -703,9 +703,12 @@ impl CSetDefaultSpawnPosition {
 }
 
 /// Clientbound：系统聊天（0x6C）。
+///
+/// 内容为纯文本；网络序列化为 NBT 组件（`{text: ...}`，客户端
+/// `FriendlyByteBuf.readNbt` 解析），非裸 JSON 字符串。
 #[derive(Debug, Clone)]
 pub struct CSystemChat {
-    /// 内容 JSON 文本组件。
+    /// 内容纯文本。
     pub content: String,
     /// 是否覆盖模式（Action Bar）。
     pub overlay: bool,
@@ -714,7 +717,11 @@ pub struct CSystemChat {
 impl CSystemChat {
     /// 编码载荷。
     pub fn encode(&self, writer: &mut Writer) {
-        writer.write_string(&self.content);
+        let mut component = NbtCompound::new();
+        component.insert("text", Nbt::String(self.content.clone()));
+        writer
+            .write_nbt_unnamed(&Nbt::Compound(Box::new(component)))
+            .expect("system chat component must encode");
         writer.write_bool(self.overlay);
     }
 
@@ -761,7 +768,30 @@ pub mod flat_biomes {
 mod tests {
     use super::*;
     use crate::codec::Reader;
+    use crate::nbt::Nbt;
     use crate::packets::play::{HEIGHTMAP_LONGS, block_state_ids};
+
+    #[test]
+    fn system_chat_encodes_nbt_component() {
+        // 1.21.1 `GameMessageS2CPacket`：内容为 NBT 组件（`TextCodecs`），
+        // 客户端 `readNbt` 解析；裸字符串会让首字节被当成 NBT 标签 ID。
+        let packet = CSystemChat {
+            content: "hello 世界".to_owned(),
+            overlay: false,
+        };
+        let mut w = Writer::new();
+        packet.encode(&mut w);
+        let bytes = w.into_bytes();
+        let mut r = Reader::new(&bytes);
+        let nbt = r.read_nbt().unwrap().unwrap();
+        let compound = match nbt {
+            Nbt::Compound(c) => c,
+            other => panic!("expected compound {other:?}"),
+        };
+        assert_eq!(compound.get_string("text"), Some("hello 世界"));
+        assert!(!r.read_bool().unwrap());
+        assert!(r.is_empty());
+    }
 
     #[test]
     fn chunk_data_encodes_flat_section() {
