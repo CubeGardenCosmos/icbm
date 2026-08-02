@@ -28,7 +28,7 @@ use icbm_mc_767::packets::play_ids;
 use crate::net::crypto::AesCfb8;
 use icbm_mc_767::packets::status::{CPongResponse, CStatusResponse, SPingRequest, SStatusRequest};
 use icbm_mc_767::packets::status_ids;
-use icbm_region::RegionId;
+use icbm_region::{OVERWORLD_SURFACE_FEET_Y, RegionId};
 use tracing::{debug, info, trace, warn};
 use uuid::Uuid;
 
@@ -150,6 +150,8 @@ pub struct Client {
     pub view_distance: AtomicI32,
     /// 当前维度（0=主世界，1=地狱，2=末地）。
     pub dimension: AtomicU8,
+    /// 客户端语言标签（`ClientInformation.locale`，如 `zh_cn`；进服打印，变更 debug）。
+    pub locale: Mutex<String>,
     /// 主手手持物品（`give`/创造模式设置；放置方块用）。
     pub held_item: Mutex<Option<String>>,
     /// 是否存活（连接可继续）。
@@ -199,7 +201,7 @@ impl Client {
             gamemode: Mutex::new(GameMode::Survival),
             position: Mutex::new(Position {
                 x: 0.0,
-                y: 4.0,
+                y: f64::from(OVERWORLD_SURFACE_FEET_Y),
                 z: 0.0,
                 yaw: 0.0,
                 pitch: 0.0,
@@ -208,7 +210,7 @@ impl Client {
             last_move: Mutex::new((
                 Position {
                     x: 0.0,
-                    y: 4.0,
+                    y: f64::from(OVERWORLD_SURFACE_FEET_Y),
                     z: 0.0,
                     yaw: 0.0,
                     pitch: 0.0,
@@ -218,6 +220,7 @@ impl Client {
             chunk_center: Mutex::new((0, 0)),
             view_distance: AtomicI32::new(8),
             dimension: AtomicU8::new(0),
+            locale: Mutex::new(String::new()),
             held_item: Mutex::new(None),
             alive: AtomicBool::new(true),
             keep_alive: Mutex::new(None),
@@ -353,11 +356,30 @@ impl Client {
             .is_some_and(|(_, sent)| sent.elapsed() > timeout)
     }
 
+    /// 更新客户端语言（`ClientInformation.locale`）。
+    ///
+    /// 首次设置（进服）静默记录；游戏中变更输出 DEBUG（默认日志级别 INFO
+    /// 不显示，满足"服务器默认不输出变更，仅在玩家加入时输出一次"）。
+    pub fn set_locale(&self, locale: &str) {
+        let mut stored = self.locale.lock().expect("locale");
+        if stored.as_str() == locale {
+            return;
+        }
+        let name = self.name.lock().expect("name").clone();
+        if stored.is_empty() {
+            *stored = locale.to_owned();
+            debug!(name = %name, locale, "player language set");
+        } else {
+            let previous: String = stored.clone();
+            *stored = locale.to_owned();
+            debug!(name = %name, previous = %previous, locale, "player language changed");
+        }
+    }
+
     /// 记录一次位置更新并估算移动速度（方块/秒，3D 距离/间隔，EMA 平滑）。
     ///
     /// 间隔超出 [20ms, 2s] 视为传送/停滞：只更新基准不改变速度。
-    pub fn note_move(&self) {let now = Instant::now();
-        let position = *self.position.lock().expect("position");
+    pub fn note_move(&self) {let now = Instant::now();        let position = *self.position.lock().expect("position");
         let mut last = self.last_move.lock().expect("last move");
         let dt = now.duration_since(last.1).as_secs_f64();
         if (0.02..=2.0).contains(&dt) {
@@ -598,6 +620,7 @@ fn handle_serverbound(
         ConnectionState::Config => match id {
             icbm_mc_767::packets::config_ids::SERVERBOUND_CLIENT_INFORMATION => {
                 let info = icbm_mc_767::packets::config::SClientInformation::decode(&mut reader)?;
+                client.set_locale(&info.locale);
                 client
                     .view_distance
                     .store(i32::from(info.view_distance), Ordering::Relaxed);
@@ -942,7 +965,28 @@ pub fn enter_play(server: &Server, client: &Arc<Client>) -> Result<(), NetError>
     crate::net::play::load_initial_chunks(server, client)?;
 
     let name = client.name.lock().expect("name").clone();
-    info!(name = %name, "player entered the world");
+    let uuid = *client.uuid.lock().expect("uuid");
+    let position = *client.position.lock().expect("position");
+    let dimension = client.dimension.load(Ordering::Relaxed);
+    let dimension_name = match dimension {
+        1 => "minecraft:the_nether",
+        2 => "minecraft:the_end",
+        _ => "minecraft:overworld",
+    };
+    let ip = client.peer_ip().unwrap_or_else(|| "unknown".to_owned());
+    let locale = client.locale.lock().expect("locale").clone();
+    let locale = if locale.is_empty() { "unknown".to_owned() } else { locale };
+    info!(
+        name = %name,
+        %uuid,
+        %ip,
+        dimension = %dimension_name,
+        locale = %locale,
+        x = position.x,
+        y = position.y,
+        z = position.z,
+        "player entered the world"
+    );
     Ok(())
 }
 

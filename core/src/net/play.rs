@@ -258,6 +258,7 @@ pub fn handle_play_packet(
         }
         play_ids::SERVERBOUND_CLIENT_INFORMATION => {
             let info = icbm_mc_767::packets::play::serverbound::SClientInformation::decode(reader)?;
+            client.set_locale(&info.locale);
             client.view_distance.store(
                 i32::from(info.view_distance),
                 std::sync::atomic::Ordering::Relaxed,
