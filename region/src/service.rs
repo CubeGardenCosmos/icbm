@@ -158,8 +158,6 @@ const ENTITY_TYPE_CREEPER: i32 = 23;
 const MAX_CREEPERS: usize = 12;
 /// 每 tick 生成 Creeper 的概率（约 6 秒一只）。
 const SPAWN_CHANCE: f64 = 1.0 / 120.0;
-/// 每 tick 游走的概率。
-const WANDER_CHANCE: f64 = 1.0 / 3.0;
 /// Creeper 出生高度（flat 地表 y=3 之上）。
 const CREEPER_SPAWN_Y: f64 = 4.0;
 
@@ -175,6 +173,8 @@ struct Creeper {
     z: f64,
     /// 偏航角（度）。
     yaw: f32,
+    /// 上次移动方向（1/4 方向索引；避免连续折返，寻路更自然）。
+    last_dir: u8,
 }
 
 /// region 服务。
@@ -193,6 +193,8 @@ pub struct RegionService {
     entity_base: i32,
     /// 区域内非玩家实体（掉落物/TNT）。
     entities: crate::entities::EntityManager,
+    /// 区域内友好生物（牛/猪/鸡/羊）。
+    mobs: crate::mobs::MobManager,
     /// 区域内漫游 Creeper（region 存活信号）。
     creepers: Vec<Creeper>,
     /// xorshift64 状态（种子取自区域坐标，固定种子可复现）。
@@ -319,6 +321,7 @@ impl RegionService {
             pending_chunks: std::collections::VecDeque::new(),
             entity_base: 0,
             entities: crate::entities::EntityManager::new(),
+            mobs: crate::mobs::MobManager::new(),
             creepers: Vec::new(),
             rng: rng | 1,
         })
@@ -387,6 +390,7 @@ impl RegionService {
         self.flush_chunks()?;
         self.tick_fluids()?;
         self.tick_entities()?;
+        self.tick_mobs()?;
         // Phase 1 世界 tick：仅随机漫游 Creeper（region 存活信号）
         self.tick_creepers()?;
         let tps = self.ticker.end();
@@ -672,6 +676,63 @@ impl RegionService {
         Ok(())
     }
 
+    /// 友好生物 tick：生成（未达上限时）、随机游走、环境音效广播。
+    fn tick_mobs(&mut self) -> Result<(), RegionError> {
+        let min_x = f64::from(self.config.id.rx) * 512.0;
+        let min_z = f64::from(self.config.id.rz) * 512.0;
+        let max_x = min_x + 512.0;
+        let max_z = min_z + 512.0;
+        // 生成：约每 2 秒尝试一只（上限由 MobManager 控制）
+        if self.rand_f64() < 1.0 / 40.0 {
+            let entity_id = self.entity_base + 2000 + i32::try_from(self.mobs.len())
+                .unwrap_or(i32::MAX);
+            if self.mobs.try_spawn(entity_id, min_x, max_x, min_z, max_z) {
+                let mob = self.mobs.mobs.last().expect("just spawned").clone();
+                let add = icbm_mc_767::packets::play::clientbound::CAddEntity {
+                    entity_id: mob.entity_id,
+                    uuid: mob.uuid,
+                    entity_type: mob.kind.entity_type_id(),
+                    x: mob.x,
+                    y: mob.ground_y(),
+                    z: mob.z,
+                    pitch: 0.0,
+                    yaw: mob.yaw,
+                };
+                self.send_entity_packet(play_ids::CLIENTBOUND_ADD_ENTITY, |w| {
+                    add.encode(w);
+                })?;
+            }
+        }
+        // 游走 + 环境音效
+        let (moves, sounds) = self.mobs.tick(min_x, max_x, min_z, max_z);
+        for (entity_id, dx, dz) in moves {
+            let packet = icbm_mc_767::packets::play::clientbound::CMoveEntityPos {
+                entity_id,
+                delta_x: dx,
+                delta_y: 0,
+                delta_z: dz,
+                on_ground: true,
+            };
+            self.send_entity_packet(play_ids::CLIENTBOUND_MOVE_ENTITY_POS, |w| {
+                packet.encode(w);
+            })?;
+        }
+        for (entity_id, kind) in sounds {
+            let sound = icbm_mc_767::packets::play::clientbound::CEntitySound {
+                sound: kind.ambient_sound().to_owned(),
+                category: icbm_mc_767::packets::play::clientbound::SoundCategory::Neutral,
+                entity_id,
+                volume: 1.0,
+                pitch: 1.0,
+                seed: self.next_random() as i64,
+            };
+            self.send_entity_packet(play_ids::CLIENTBOUND_SOUND_ENTITY, |w| {
+                sound.encode(w);
+            })?;
+        }
+        Ok(())
+    }
+
     /// 随机漫游 Creeper：随机生成新个体并让已有个体游走。
     fn tick_creepers(&mut self) -> Result<(), RegionError> {
         if self.creepers.len() < MAX_CREEPERS && self.rand_f64() < SPAWN_CHANCE {
@@ -680,14 +741,19 @@ impl RegionService {
         let min_x = f64::from(self.config.id.rx) * 512.0;
         let min_z = f64::from(self.config.id.rz) * 512.0;
         // 先预掷随机数再逐个体决策，避免同时借用 self.rng 与 self.creepers。
-        let rolls: Vec<(bool, u64)> = (0..self.creepers.len())
-            .map(|_| (self.rand_f64() < WANDER_CHANCE, self.next_random() % 4))
+        let rolls: Vec<(f64, u64)> = (0..self.creepers.len())
+            .map(|_| (self.rand_f64(), self.next_random() % 4))
             .collect();
         let mut moves: Vec<(i32, i16, i16)> = Vec::new();
-        for (creeper, (wander, dir)) in self.creepers.iter_mut().zip(rolls) {
-            if !wander {
+        for (creeper, (roll, dir_roll)) in self.creepers.iter_mut().zip(rolls) {
+            // 降低游走概率并排除折返：更像友好生物的随机漫步
+            if roll < 0.7 {
                 continue;
             }
+            let candidates: Vec<u8> = (0..4u8)
+                .filter(|&dir| (dir + 2) % 4 != creeper.last_dir || creeper.last_dir == 4)
+                .collect();
+            let dir = candidates[(dir_roll as usize) % candidates.len()];
             let (dx, dz) = match dir {
                 0 => (1, 0),
                 1 => (-1, 0),
@@ -704,6 +770,7 @@ impl RegionService {
             }
             creeper.x = next_x;
             creeper.z = next_z;
+            creeper.last_dir = dir;
             moves.push((creeper.entity_id, (dx * 4096) as i16, (dz * 4096) as i16));
         }
         for (entity_id, delta_x, delta_z) in moves {
@@ -733,6 +800,7 @@ impl RegionService {
             x: f64::from(cx * 16) + self.rand_f64() * 16.0,
             z: f64::from(cz * 16) + self.rand_f64() * 16.0,
             yaw: (self.rand_f64() * 360.0) as f32,
+            last_dir: 4, // 初始无方向
         };
         self.send_entity_packet(play_ids::CLIENTBOUND_ADD_ENTITY, |w| {
             CAddEntity {
