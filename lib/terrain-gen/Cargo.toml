@@ -3,6 +3,10 @@ name = "icbm-terrain-gen"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
+description = "Terrain generators for icbm (Phase 1: flat/superflat for all dimensions)"
+
+[dependencies]
+icbm-mc-767 = { path = "../mc-767" }
 
 [lints]
 workspace = true

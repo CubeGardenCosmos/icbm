@@ -129,6 +129,9 @@ version = "0.1.0-dev+1.21.1"
 [[package]]
 name = "icbm-terrain-gen"
 version = "0.1.0-dev+1.21.1"
+dependencies = [
+ "icbm-mc-767",
+]
 
 [[package]]
 name = "itoa"

@@ -142,44 +142,100 @@ pub fn encode_paletted_container(
     storage_bits: impl Fn(u32) -> u32,
     direct_bits: u32,
 ) {
-    // 保序去重得到 palette
-    let mut palette: Vec<i32> = Vec::new();
-    let mut indices: Vec<u32> = Vec::with_capacity(values.len());
-    for &value in values {
-        if let Some(idx) = palette.iter().position(|&v| v == value) {
-            indices.push(idx as u32);
+    Palette::from_ids(values, array_max_bits, &storage_bits, direct_bits).encode(writer);
+}
+
+/// 解析后的 palette（条目 + 打包数据），网络与存档共用。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Palette {
+    /// 存储位数（0 = 单值）。
+    pub bits: u32,
+    /// palette 条目（直接模式为空）。
+    pub entries: Vec<i32>,
+    /// 打包数据（LSB-first；单值模式为空）。
+    pub data: Vec<i64>,
+}
+
+impl Palette {
+    /// 从原始值构造（按 1.21.1 `PaletteProvider` 规则）。
+    #[must_use]
+    pub fn from_ids(
+        ids: &[i32],
+        array_max_bits: u32,
+        storage_bits: &impl Fn(u32) -> u32,
+        direct_bits: u32,
+    ) -> Self {
+        let mut entries: Vec<i32> = Vec::new();
+        let mut indices: Vec<u32> = Vec::with_capacity(ids.len());
+        for &value in ids {
+            if let Some(idx) = entries.iter().position(|&v| v == value) {
+                indices.push(idx as u32);
+            } else {
+                entries.push(value);
+                indices.push(entries.len() as u32 - 1);
+            }
+        }
+
+        let bits = ceil_log2(entries.len() as u32);
+        if bits == 0 {
+            return Self {
+                bits: 0,
+                entries,
+                data: Vec::new(),
+            };
+        }
+        if bits <= array_max_bits {
+            let storage = storage_bits(bits);
+            Self {
+                bits: storage,
+                entries,
+                data: pack_indices(&indices, storage),
+            }
         } else {
-            palette.push(value);
-            indices.push(palette.len() as u32 - 1);
+            Self {
+                bits: direct_bits,
+                entries: Vec::new(),
+                data: pack_indices(
+                    &ids.iter().map(|&v| v as u32).collect::<Vec<_>>(),
+                    direct_bits,
+                ),
+            }
         }
     }
 
-    let bits = ceil_log2(palette.len() as u32);
-    match bits {
-        0 => {
+    /// 方块 palette（1.21.1：0 单值 / 1-4 → 4 位 / 5-8 → bimap / >8 → 15 位）。
+    #[must_use]
+    pub fn for_blocks(ids: &[i32]) -> Self {
+        Self::from_ids(ids, 8, &|bits| bits.max(4), 15)
+    }
+
+    /// 生物群系 palette（1.21.1：0 单值 / 1-3 → 数组 / >3 → 6 位）。
+    #[must_use]
+    pub fn for_biomes(ids: &[i32]) -> Self {
+        Self::from_ids(ids, 3, &|bits| bits, 6)
+    }
+
+    /// 写出网络载荷。
+    pub fn encode(&self, writer: &mut Writer) {
+        if self.bits == 0 {
             writer.write_u8(0);
-            writer.write_var_int(palette[0]);
+            writer.write_var_int(self.entries[0]);
+            return;
         }
-        b if b <= array_max_bits => {
-            let storage = storage_bits(b);
-            writer.write_u8(storage as u8);
-            writer.write_var_int(i32::try_from(palette.len()).expect("palette exceeds i32"));
-            for id in &palette {
+        writer.write_u8(self.bits as u8);
+        if !self.entries.is_empty() {
+            writer.write_var_int(i32::try_from(self.entries.len()).expect("palette exceeds i32"));
+            for id in &self.entries {
                 writer.write_var_int(*id);
             }
-            write_packed_indices(writer, &indices, storage);
         }
-        _ => {
-            writer.write_u8(direct_bits as u8);
-            // 直接模式：packed 数据即为全局 ID
-            let direct: Vec<u32> = values.iter().map(|&v| v as u32).collect();
-            write_packed_indices(writer, &direct, direct_bits);
-        }
+        write_packed_indices(writer, &self.data);
     }
 }
 
-/// 将索引数组 LSB-first 打包为 i64 数组并写出。
-fn write_packed_indices(writer: &mut Writer, values: &[u32], bits: u32) {
+/// 将索引数组 LSB-first 打包为 i64 数组。
+#[must_use]
+pub fn pack_indices(values: &[u32], bits: u32) -> Vec<i64> {
     let total_bits = values.len() * bits as usize;
     let long_count = total_bits.div_ceil(64);
     let mut longs = vec![0u64; long_count];
@@ -193,9 +249,14 @@ fn write_packed_indices(writer: &mut Writer, values: &[u32], bits: u32) {
             longs[long_index + 1] |= u64::from(value) >> (64 - offset);
         }
     }
-    writer.write_var_int(i32::try_from(long_count).expect("long array exceeds i32"));
-    for value in longs {
-        writer.write_i64_be(value as i64);
+    longs.iter().map(|&v| v as i64).collect()
+}
+
+/// 将打包后的 i64 数组写出（VarInt 长度 + 大端 i64）。
+fn write_packed_indices(writer: &mut Writer, data: &[i64]) {
+    writer.write_var_int(i32::try_from(data.len()).expect("long array exceeds i32"));
+    for value in data {
+        writer.write_i64_be(*value);
     }
 }
 
