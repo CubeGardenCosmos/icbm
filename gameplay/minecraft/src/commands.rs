@@ -80,9 +80,10 @@ pub enum Command {
 
 /// 解析命令行的第一段（`/gamemode ...` / `/gamerule ...` / `/help`）。
 ///
+/// 前导 `/` 可选（游戏内聊天发送 `/` 开头；控制台输入不带）；
 /// 非本命名空间命令返回 `None`（由 icbm 命名空间或 core 处理）。
 pub fn parse_command(line: &str) -> Option<Command> {
-    let line = line.strip_prefix('/')?.trim();
+    let line = line.strip_prefix('/').unwrap_or(line).trim();
     let mut parts = line.split_whitespace();
     let name = parts.next()?;
     match name {
@@ -161,6 +162,21 @@ mod tests {
         );
         assert_eq!(parse_command("/gamemode"), None);
         assert_eq!(parse_command("/gamemode bogus"), None);
+        // 控制台输入无前导 `/`（游戏内聊天带 `/`）：两者等价。
+        assert_eq!(
+            parse_command("gamemode creative"),
+            Some(Command::GameMode {
+                mode: GameMode::Creative,
+                target: None
+            })
+        );
+        assert_eq!(
+            parse_command("gamerule keepInventory true"),
+            Some(Command::GameRule {
+                rule: "keepInventory".to_owned(),
+                value: Some("true".to_owned()),
+            })
+        );
     }
 
     #[test]

@@ -13,7 +13,7 @@ pub enum BmToolCommand {
 /// 解析 `/bmtool ...` 行；非本命令返回 `None`。
 #[must_use]
 pub fn parse_bmtool(line: &str) -> Option<BmToolCommand> {
-    let line = line.strip_prefix('/')?.trim();
+    let line = line.strip_prefix('/').unwrap_or(line).trim();
     let mut parts = line.split_whitespace();
     if parts.next()? != "bmtool" {
         return None;
