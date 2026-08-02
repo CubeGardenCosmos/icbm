@@ -378,7 +378,10 @@ fn forward_chunk_data(server: &Server, body: &[u8]) {
             .is_ok();
 
     if !send_ok {
-        warn!("chunk forwarding failed, dropping pending");
+        warn!(
+            "chunk forwarding failed: start_ok={start_ok} data_len={} needs_start={needs_start}",
+            data.len()
+        );
         server.world.lock().expect("world lock").chunk_pending = None;
         return;
     }

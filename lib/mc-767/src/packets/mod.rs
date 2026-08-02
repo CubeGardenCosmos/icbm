@@ -196,7 +196,12 @@ pub fn decode_frame(
     compression_threshold: Option<i32>,
 ) -> Result<Option<(i32, Vec<u8>, usize)>, FrameError> {
     let mut reader = Reader::new(buffer);
-    let data_len = reader.read_var_int().map_err(FrameError::Codec)?;
+    // 空缓冲或不足一个 VarInt 时视为“等待更多数据”，而非错误。
+    let data_len = match reader.read_var_int() {
+        Ok(v) => v,
+        Err(_) if buffer.is_empty() => return Ok(None),
+        Err(e) => return Err(FrameError::Codec(e)),
+    };
     if data_len < 0 {
         return Err(FrameError::InvalidLength(data_len as usize));
     }

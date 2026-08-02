@@ -241,7 +241,7 @@ impl CLogin {
         writer.write_bool(self.reduced_debug_info);
         writer.write_bool(self.enable_respawn_screen);
         writer.write_bool(self.limited_crafting);
-        writer.write_var_int(self.spawn_data.dimension_type);
+        writer.write_var_int(self.spawn_data.dimension_type + 1);
         writer.write_string(&self.spawn_data.dimension_name);
         writer.write_i64_be(self.spawn_data.hashed_seed);
         writer.write_u8(self.spawn_data.game_mode);

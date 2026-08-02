@@ -10,16 +10,6 @@ use icbm_mc_767::packets::config::{
     CRegistryData, CUpdateEnabledFeatures, CUpdateTags, RegistryEntry,
 };
 
-fn f32_list(min: f64, max: f64) -> Nbt {
-    let mut value = NbtCompound::new();
-    value.insert("min_inclusive", Nbt::Float(min as f32));
-    value.insert("max_inclusive", Nbt::Float(max as f32));
-    let mut uniform = NbtCompound::new();
-    uniform.insert("type", Nbt::String("minecraft:uniform".to_owned()));
-    uniform.insert("value", Nbt::Compound(Box::new(value)));
-    Nbt::Compound(Box::new(uniform))
-}
-
 fn int_list(min: i32, max: i32) -> Nbt {
     let mut value = NbtCompound::new();
     value.insert("min_inclusive", Nbt::Int(min));
@@ -194,6 +184,15 @@ fn biome_nbt(
     data.insert("temperature", Nbt::Float(temperature));
     data.insert("downfall", Nbt::Float(downfall));
     data.insert("effects", Nbt::Compound(Box::new(effects)));
+    // generation_settings 的必需字段（平铺在顶层；空 carvers/features）
+    data.insert("carvers", Nbt::Compound(Box::new(NbtCompound::new())));
+    data.insert(
+        "features",
+        Nbt::List(Box::new(icbm_mc_767::nbt::NbtList::empty())),
+    );
+    // spawn_settings 的必需字段（平铺在顶层；空 spawners/spawn_costs）
+    data.insert("spawners", Nbt::Compound(Box::new(NbtCompound::new())));
+    data.insert("spawn_costs", Nbt::Compound(Box::new(NbtCompound::new())));
     Nbt::Compound(Box::new(data))
 }
 
@@ -238,13 +237,11 @@ pub fn update_tags() -> CUpdateTags {
     CUpdateTags::default()
 }
 
-/// 构造已知包列表（`minecraft:core`，1.20.5+ 配置阶段必需）。
+/// 构造已知包列表（1.20.5+ 配置阶段已知资源包协商）。
 #[must_use]
-pub fn known_packs() -> Vec<icbm_mc_767::packets::config::KnownPack> {
-    vec![icbm_mc_767::packets::config::KnownPack {
-        namespace: "minecraft".to_owned(),
-        id: "core".to_owned(),
-    }]
+pub const fn known_packs() -> Vec<icbm_mc_767::packets::config::KnownPack> {
+    // 服务器没有资源包：空列表 → 客户端回空 → 注册表全量 NBT 序列化。
+    Vec::new()
 }
 
 #[cfg(test)]

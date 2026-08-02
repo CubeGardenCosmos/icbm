@@ -20,6 +20,7 @@ icbm-region = { path = "../region" }
 md5 = "0.7"
 serde_json = { version = "1", default-features = false, features = ["std"] }
 tracing = { version = "0.1", default-features = false }
+tracing-subscriber = { version = "0.3", default-features = false, features = ["fmt"] }
 uuid = { version = "1", features = ["v4"] }
 
 [lints]

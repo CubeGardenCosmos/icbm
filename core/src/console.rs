@@ -11,7 +11,6 @@ use icbm_gameplay_minecraft::commands::{self, Command, GameMode};
 use icbm_mc_767::packets::play::clientbound::{
     CGameEvent, CPlayerAbilities, CPlayerInfoUpdate, PlayerInfoEntry,
 };
-use icbm_mc_767::packets::play_ids;
 use tracing::info;
 
 use crate::server::Server;

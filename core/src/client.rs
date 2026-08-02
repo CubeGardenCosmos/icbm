@@ -224,7 +224,13 @@ impl Client {
     /// 断开连接（发送原因并关闭）。
     pub fn kick(&self, reason: &str) {
         let json = serde_json::json!({ "text": reason }).to_string();
-        let _ = self.send_encoded(play_ids::CLIENTBOUND_DISCONNECT, |w| w.write_string(&json));
+        // 各阶段 disconnect 包 ID 不同（Mojang：login=0x00/config=0x02/play=0x1D）
+        let id = match self.connection_state() {
+            ConnectionState::Login => icbm_mc_767::packets::login_ids::CLIENTBOUND_DISCONNECT,
+            ConnectionState::Config => icbm_mc_767::packets::config_ids::CLIENTBOUND_DISCONNECT,
+            _ => icbm_mc_767::packets::play_ids::CLIENTBOUND_DISCONNECT,
+        };
+        let _ = self.send_encoded(id, |w| w.write_string(&json));
         self.alive.store(false, Ordering::Relaxed);
     }
 
@@ -302,25 +308,26 @@ pub fn handle_connection(server: &Server, mut stream: TcpStream) {
         }
 
         let Some(client_ref) = &client else {
-            // 尚未建立 Client（握手前）：首包必须是握手
+            // 尚未建立 Client（握手前）：首包必须是握手（无压缩）
             if buffer.is_empty() {
                 if !server.running.load(Ordering::Relaxed) {
                     break;
                 }
                 continue;
             }
-            match SIntent::decode(&mut Reader::new(&buffer)) {
-                Ok(intent) => {
-                    buffer.clear();
-                    match init_connection(server, &stream, &intent) {
-                        Ok(Some(created)) => client = Some(created),
-                        Ok(None) => break,
-                        Err(err) => {
-                            debug!(%err, "connection init failed");
-                            break;
-                        }
+            let Ok(Some((0x00, payload, consumed))) = decode_frame(&buffer, None) else {
+                break;
+            };
+            buffer.drain(..consumed);
+            match SIntent::decode(&mut Reader::new(&payload)) {
+                Ok(intent) => match init_connection(server, &stream, &intent) {
+                    Ok(Some(created)) => client = Some(created),
+                    Ok(None) => break,
+                    Err(err) => {
+                        debug!(%err, "connection init failed");
+                        break;
                     }
-                }
+                },
                 Err(_) => break,
             }
             continue;
@@ -418,7 +425,7 @@ fn handle_serverbound(
                 client.state.store(STATE_CONFIG, Ordering::Relaxed);
                 let name = client.name.lock().expect("name").clone();
                 debug!(name = %name, "login acknowledged, entering config");
-                send_config_phase(server, client)?;
+                send_config_intro(server, client)?;
             }
             _ => return Err(NetError::BadPacket("unexpected login packet")),
         },
@@ -431,14 +438,13 @@ fn handle_serverbound(
             }
             icbm_mc_767::packets::config_ids::SERVERBOUND_KNOWN_PACKS => {
                 let _ = icbm_mc_767::packets::config::SKnownPacks::decode(&mut reader)?;
-                send_known_packs_response(client)?;
+                // 客户端回显已知资源包后，服务器下发注册表/标签并完成配置。
+                send_config_data(client)?;
             }
             icbm_mc_767::packets::config_ids::SERVERBOUND_FINISH_CONFIGURATION => {
                 let _ = icbm_mc_767::packets::config::SFinishConfig::decode(&mut reader)?;
-                client.send_encoded(
-                    icbm_mc_767::packets::config_ids::CLIENTBOUND_FINISH_CONFIGURATION,
-                    |w| icbm_mc_767::packets::config::CFinishConfig.encode(w),
-                )?;
+                // 官方：服务器已通过 ReadyS2CPacket 发送完成配置（transitionsNetworkState），
+                // 客户端回 ReadyC2SPacket 后双方进入 Play；此处不再回包。
                 client.state.store(STATE_PLAY, Ordering::Relaxed);
                 let name = client.name.lock().expect("name").clone();
                 info!(name = %name, "entering play");
@@ -513,7 +519,40 @@ fn handle_login_start(
 }
 
 /// 配置阶段：注册表/特性/标签。
-fn send_config_phase(server: &Server, client: &Arc<Client>) -> Result<(), NetError> {
+/// 配置阶段第一步：启用特性 + 已知资源包列表。
+///
+/// 对照官方 `ServerConfigurationNetworkHandler#sendConfigurations`：
+/// `CustomPayload(brand)`（可选）→ `FeaturesS2CPacket` → `SelectKnownPacksS2CPacket`，
+/// 然后等待客户端回显 known packs，再下发注册表与标签。
+fn send_config_intro(server: &Server, client: &Arc<Client>) -> Result<(), NetError> {
+    let features = crate::net::registry::feature_flags();
+    client.send_encoded(
+        icbm_mc_767::packets::config_ids::CLIENTBOUND_UPDATE_ENABLED_FEATURES,
+        |w| features.encode(w),
+    )?;
+    // 服务器没有资源包，known packs 列表为空 → 客户端回空列表 → 注册表全量 NBT。
+    let packs = crate::net::registry::known_packs();
+    client.send_encoded(
+        icbm_mc_767::packets::config_ids::CLIENTBOUND_KNOWN_PACKS,
+        |w| {
+            w.write_var_int(i32::try_from(packs.len()).expect("packs"));
+            for pack in &packs {
+                w.write_string(&pack.namespace);
+                w.write_string(&pack.id);
+                w.write_string(&pack.version);
+            }
+        },
+    )?;
+    let _ = server;
+    Ok(())
+}
+
+/// 配置阶段第二步：注册表数据 + 更新标签 + 完成配置。
+///
+/// 对照官方 `SynchronizeRegistriesTask#syncRegistryAndTags` 与 `JoinWorldTask`：
+/// 收到客户端 known packs 回显后发 `DynamicRegistriesS2CPacket` ×N + `SynchronizeTagsS2CPacket`，
+/// 随后发 ReadyS2CPacket（finish config）。
+fn send_config_data(client: &Arc<Client>) -> Result<(), NetError> {
     let registries = [
         crate::net::registry::dimension_type_registry(),
         crate::net::registry::biome_registry(),
@@ -524,32 +563,14 @@ fn send_config_phase(server: &Server, client: &Arc<Client>) -> Result<(), NetErr
             |w| registry.encode(w),
         )?;
     }
-    let features = crate::net::registry::feature_flags();
-    client.send_encoded(
-        icbm_mc_767::packets::config_ids::CLIENTBOUND_UPDATE_ENABLED_FEATURES,
-        |w| features.encode(w),
-    )?;
     let tags = crate::net::registry::update_tags();
     client.send_encoded(
         icbm_mc_767::packets::config_ids::CLIENTBOUND_UPDATE_TAGS,
         |w| tags.encode(w),
     )?;
-    let _ = server;
-    Ok(())
-}
-
-/// 响应客户端已知包列表。
-fn send_known_packs_response(client: &Arc<Client>) -> Result<(), NetError> {
-    let packs = crate::net::registry::known_packs();
     client.send_encoded(
-        icbm_mc_767::packets::config_ids::CLIENTBOUND_KNOWN_PACKS,
-        |w| {
-            w.write_var_int(i32::try_from(packs.len()).expect("packs"));
-            for pack in &packs {
-                w.write_string(&pack.namespace);
-                w.write_string(&pack.id);
-            }
-        },
+        icbm_mc_767::packets::config_ids::CLIENTBOUND_FINISH_CONFIGURATION,
+        |w| icbm_mc_767::packets::config::CFinishConfig.encode(w),
     )?;
     Ok(())
 }

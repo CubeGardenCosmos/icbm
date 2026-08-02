@@ -12,7 +12,6 @@ use icbm_region::{RegionConfig, RegionId};
 
 fn parse_args() -> Result<Launch, String> {
     let mut args = std::env::args().skip(1);
-    let mut mode = Launch::Core(ServerLaunchArgs::default());
     let mut world: Option<PathBuf> = None;
     let mut shm: Option<String> = None;
     let mut port: Option<u16> = None;
@@ -53,22 +52,22 @@ fn parse_args() -> Result<Launch, String> {
         }
     }
 
-    if let Some((rx, rz)) = region {
-        mode = Launch::Region(RegionLaunchArgs {
+    let mode = if let Some((rx, rz)) = region {
+        Launch::Region(RegionLaunchArgs {
             id: RegionId { rx, rz },
             world_dir: world.ok_or_else(|| "region 模式需要 --world".to_owned())?,
             shm_name: shm.unwrap_or_else(|| "/datarouter".to_owned()),
-        });
+        })
     } else {
-        mode = Launch::Core(ServerLaunchArgs {
+        Launch::Core(ServerLaunchArgs {
             address: port.map_or_else(
                 || "0.0.0.0:25565".to_owned(),
                 |port| format!("0.0.0.0:{port}"),
             ),
             world_dir: world.unwrap_or_else(|| PathBuf::from("world")),
             shm_name: shm.unwrap_or_else(|| "/datarouter".to_owned()),
-        });
-    }
+        })
+    };
     Ok(mode)
 }
 
@@ -104,16 +103,16 @@ struct RegionLaunchArgs {
     shm_name: String,
 }
 
-fn main() {
-    #[allow(clippy::print_stderr)] // 参数错误写入 stderr 是控制台惯例
-    fn usage_error(message: &str) -> ! {
-        eprintln!("参数错误: {message}");
-        eprintln!("用法: icbm [--world <目录>] [--port <端口>] [--shm <名称>]");
-        eprintln!("      icbm --region <rx> <rz> --world <目录> [--shm <名称>]");
-        std::process::exit(2);
-    }
+#[allow(clippy::print_stderr)] // 参数错误写入 stderr 是控制台惯例
+fn usage_error(message: &str) -> ! {
+    eprintln!("参数错误: {message}");
+    eprintln!("用法: icbm [--world <目录>] [--port <端口>] [--shm <名称>]");
+    eprintln!("      icbm --region <rx> <rz> --world <目录> [--shm <名称>]");
+    std::process::exit(2);
+}
 
-    tracing_subscriber_noop();
+fn main() {
+    tracing_subscriber::fmt().with_target(false).init();
 
     match parse_args() {
         Ok(Launch::Region(args)) => {
@@ -155,6 +154,3 @@ fn main() {
         Err(message) => usage_error(&message),
     }
 }
-
-/// Phase 1 无 tracing subscriber；日志输出后续阶段接入。
-const fn tracing_subscriber_noop() {}

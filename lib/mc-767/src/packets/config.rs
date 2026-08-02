@@ -38,10 +38,10 @@ impl SClientInformation {
         Ok(Self {
             locale: reader.read_string()?,
             view_distance: reader.read_i8()?,
-            chat_mode: reader.read_var_int()?,
+            chat_mode: i32::from(reader.read_u8()?),
             chat_colors: reader.read_bool()?,
             skin_parts: reader.read_u8()?,
-            main_hand: reader.read_var_int()?,
+            main_hand: i32::from(reader.read_u8()?),
             enable_text_filtering: reader.read_bool()?,
             allow_server_listing: reader.read_bool()?,
         })
@@ -54,13 +54,15 @@ impl SClientInformation {
     }
 }
 
-/// 资源包标识（命名空间 + ID）。
+/// 资源包标识（对应官方 `VersionedIdentifier`：namespace/id/version 三个字符串）。
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct KnownPack {
     /// 命名空间（如 `minecraft`）。
     pub namespace: String,
     /// 包 ID（如 `core`）。
     pub id: String,
+    /// 包版本（如 `1.21.1`）。
+    pub version: String,
 }
 
 /// Serverbound：已知资源包列表（0x07）。
@@ -79,6 +81,7 @@ impl SKnownPacks {
             packs.push(KnownPack {
                 namespace: reader.read_string()?,
                 id: reader.read_string()?,
+                version: reader.read_string()?,
             });
         }
         Ok(Self { packs })
@@ -404,6 +407,7 @@ impl CKnownPacks {
         for pack in &self.packs {
             writer.write_string(&pack.namespace);
             writer.write_string(&pack.id);
+            writer.write_string(&pack.version);
         }
     }
 
@@ -496,12 +500,14 @@ mod tests {
         w.write_var_int(1);
         w.write_string("minecraft");
         w.write_string("core");
+        w.write_string("1.21.1");
         let bytes = w.into_bytes();
         let mut r = Reader::new(&bytes);
         let packs = SKnownPacks::decode(&mut r).unwrap();
         assert_eq!(packs.packs.len(), 1);
         assert_eq!(packs.packs[0].namespace, "minecraft");
         assert_eq!(packs.packs[0].id, "core");
+        assert_eq!(packs.packs[0].version, "1.21.1");
     }
 
     #[test]
