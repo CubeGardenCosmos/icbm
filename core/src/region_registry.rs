@@ -7,7 +7,7 @@ use std::collections::HashMap;
 use std::time::{Duration, Instant};
 
 use icbm_region::RegionId;
-use tracing::{info, warn};
+use tracing::{debug, warn};
 use tracing_subscriber::filter::LevelFilter;
 
 /// region 运行信息。
@@ -130,7 +130,7 @@ impl RegionRegistry {
             .arg(level_filter_str(log_level));
         let child = command.spawn()?;
         let pid = child.id();
-        info!(id = %id.service_name(), pid, "spawned region process");
+        debug!(id = %id.service_name(), pid, "spawned region process");
         // 实体 ID 段分配：从 1000 起每 region 一段，避免与玩家实体 ID 冲突。
         let entity_base = self.next_entity_base;
         self.next_entity_base = self

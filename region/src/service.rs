@@ -432,7 +432,7 @@ impl RegionService {
             kind::REGION_REGISTER,
             &encode_register(DIM_OVERWORLD, self.config.id.rx, self.config.id.rz, pid),
         )?;
-        info!(
+        debug!(
             id = %self.config.id.service_name(),
             pid, "region registering with core"
         );
@@ -451,7 +451,7 @@ impl RegionService {
                 if ok {
                     self.entity_base = entity_base.unwrap_or(0);
                     self.state = RegionState::Simulating;
-                    info!(id = %self.config.id.service_name(), "region registered");
+                    debug!(id = %self.config.id.service_name(), "region registered");
                     return Ok(());
                 }
                 return Err(RegionError::RegistrationRejected);
@@ -479,7 +479,7 @@ impl RegionService {
         }
         self.ticker.wait_next();
         if self.players.is_empty() {
-            info!(id = %self.config.id.service_name(), "no players, sleeping");
+            debug!(id = %self.config.id.service_name(), "no players, sleeping");
             self.state = RegionState::Sleeping;
         }
         Ok(())
@@ -495,7 +495,7 @@ impl RegionService {
         }
         std::thread::sleep(Duration::from_millis(100));
         if !self.players.is_empty() {
-            info!(id = %self.config.id.service_name(), "player entered, waking up");
+            debug!(id = %self.config.id.service_name(), "player entered, waking up");
             self.state = RegionState::Simulating;
         }
         Ok(())

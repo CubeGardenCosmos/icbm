@@ -17,7 +17,7 @@ use icbm_region::protocol::{
     decode_entity_data, decode_heartbeat, decode_register, encode_register_ack, encode_unload,
     kind,
 };
-use tracing::{info, trace, warn};
+use tracing::{debug, info, trace, warn};
 
 use crate::client::{Client, NetError};
 use crate::config::ServerConfig;
@@ -577,7 +577,7 @@ fn handle_core_message(server: &Server, message: &icbm_region::protocol::IpcMess
                     kind::REGISTER_ACK,
                     &encode_register_ack(dim, rx, rz, true, entity_base),
                 );
-                info!(id = %id.service_name(), pid, entity_base, "region registered");
+                debug!(id = %id.service_name(), pid, entity_base, "region registered");
             } else {
                 let _ = server.ipc.send(
                     &message.source,

@@ -6,7 +6,7 @@
 
 use std::path::PathBuf;
 
-use tracing::{error, info, warn};
+use tracing::{debug, error, info, warn};
 use tracing_subscriber::filter::LevelFilter;
 
 use icbm_core::console::{init_logging, parse_log_level};
@@ -146,7 +146,7 @@ fn main() {
 
     match args {
         Launch::Region(args) => {
-            info!(
+            debug!(
                 id = %args.id.service_name(),
                 "starting region worker mode"
             );

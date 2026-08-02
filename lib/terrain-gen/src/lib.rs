@@ -160,17 +160,33 @@ pub struct ChunkColumn {
 }
 
 impl ChunkColumn {
-    /// 世界 Y → section 索引与节内 Y。
+    /// 世界 Y → section 索引（越界返回 `None`）。
+    ///
+    /// 越界（低于底部或高于顶部）时不得用负数除法回绕成 `usize`（会得到
+    /// `usize::MAX` 并 panic），按 vanilla `ChunkAccess.getBlockState` 返回
+    /// 空气（见 [`Self::block_at`]）。
     #[must_use]
-    pub const fn section_index_of(&self, world_y: i32) -> usize {
-        ((world_y - self.bottom_section_y * 16) / 16) as usize
+    pub const fn section_index_of(&self, world_y: i32) -> Option<usize> {
+        let base_y = self.bottom_section_y * 16;
+        let top_y = base_y + (self.sections.len() * 16) as i32;
+        if world_y < base_y || world_y >= top_y {
+            return None;
+        }
+        Some(((world_y - base_y) / 16) as usize)
     }
 
     /// 读取世界坐标方块状态 ID。
+    ///
+    /// 世界 Y 超出本列范围时返回 `0`（空气），与 vanilla
+    /// `ChunkAccess.getBlockState` 对越界 Y 的行为一致：portal 探测、流体
+    /// 下落等合法调用会查询 `min_y - 1`，越界必须返回空气而不是 panic。
     #[must_use]
     pub fn block_at(&self, x: u32, world_y: i32, z: u32) -> i32 {
-        let section = self.section_index_of(world_y);
-        let local_y = (world_y - self.bottom_section_y * 16) % 16;
+        let Some(section) = self.section_index_of(world_y) else {
+            return 0;
+        };
+        let base_y = self.bottom_section_y * 16;
+        let local_y = (world_y - base_y) % 16;
         self.sections[section][((local_y << 4 | z as i32) << 4 | x as i32) as usize]
     }
 
@@ -317,5 +333,37 @@ mod tests {
         assert_eq!(chunk.x, -1);
         assert_eq!(chunk.block_at(15, 3, 15), ids::GRASS_BLOCK);
         assert_eq!(chunk.heightmap_heights()[255], 4);
+    }
+
+    #[test]
+    fn block_at_out_of_range_y_returns_air() {
+        // 回归：越界 Y 查询（如 portal 探测 y-1、流体下落查 min_y-1）曾因
+        // `((world_y - bottom*16)/16) as usize` 负数除法回绕成 usize::MAX 而
+        // panic（index out of bounds: len 24 / index 18446744073709551615）。
+        let chunk = generate_chunk(Dimension::Overworld, 0, 0);
+        // 底部之下（<-64）：-80..-95 恰好使除法结果 = -1；更远也应安全返回空气
+        for y in [-1000, -320, -95, -80, -65] {
+            assert_eq!(chunk.block_at(7, y, 7), ids::AIR, "y={y}");
+        }
+        // 范围内未铺层处（-64..-1）仍为空气
+        for y in [-64, -1] {
+            assert_eq!(chunk.block_at(7, y, 7), ids::AIR, "y={y}");
+        }
+        // 顶部之上：min_y(-64) + 384 = 320
+        for y in [320, 321, 1000] {
+            assert_eq!(chunk.block_at(7, y, 7), ids::AIR, "y={y}");
+        }
+        // 范围内不受影响
+        assert_eq!(chunk.block_at(7, 0, 7), ids::BEDROCK);
+        assert_eq!(chunk.block_at(7, 1, 7), ids::DIRT);
+        assert_eq!(chunk.block_at(7, 3, 7), ids::GRASS_BLOCK);
+    }
+
+    #[test]
+    fn nether_block_at_out_of_range_y() {
+        let chunk = generate_chunk(Dimension::Nether, 0, 0);
+        assert_eq!(chunk.block_at(0, -1, 0), ids::AIR);
+        assert_eq!(chunk.block_at(0, -80, 0), ids::AIR);
+        assert_eq!(chunk.block_at(0, 256, 0), ids::AIR);
     }
 }
