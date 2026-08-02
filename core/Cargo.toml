@@ -12,15 +12,19 @@ path = "src/main.rs"
 [dependencies]
 base64 = { version = "0.22", default-features = false, features = ["std"] }
 blinkcms-datarouter = { path = "../lib/datarouter" }
+flate2 = { version = "1", default-features = false, features = ["rust_backend"] }
 icbm-anvil = { path = "../lib/anvil" }
 icbm-gameplay-icbm = { path = "../gameplay/icbm" }
 icbm-gameplay-minecraft = { path = "../gameplay/minecraft" }
 icbm-mc-767 = { path = "../lib/mc-767" }
 icbm-region = { path = "../region" }
+libc = "0.2"
 md5 = "0.7"
+rustyline = { version = "18", default-features = false, features = ["with-file-history"] }
 serde_json = { version = "1", default-features = false, features = ["std"] }
+time = { version = "0.3", default-features = false, features = ["std", "formatting", "macros", "local-offset"] }
 tracing = { version = "0.1", default-features = false }
-tracing-subscriber = { version = "0.3", default-features = false, features = ["fmt"] }
+tracing-subscriber = { version = "0.3", default-features = false, features = ["fmt", "env-filter", "ansi", "time", "registry", "local-time", "std"] }
 uuid = { version = "1", features = ["v4"] }
 
 [lints]

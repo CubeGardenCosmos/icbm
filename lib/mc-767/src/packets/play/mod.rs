@@ -42,33 +42,38 @@ impl BlockPos {
     }
 }
 
-/// 1.21.1 注册表网络 ID 常量（对照 master `data/src/generated`）。
+/// 1.21.1 注册表网络 ID 常量（对照 master `data/src/generated/block.rs`，即
+/// vanilla `Block.BLOCK_STATE_REGISTRY` 的全局状态 ID）。
 ///
 /// 方块状态 ID 是固定全局 ID（客户端内置）；生物群系 ID 由服务器注册表
 /// 数据决定（本实现采用 vanilla 字母序，见 [`crate::packets::play::biome_ids`]）。
+///
+/// 注意：vanilla 按「方块注册序 + 状态属性值序」枚举状态；`BooleanProperty`
+/// 的值序为 `[true, false]`（`BooleanProperty.java`：`ImmutableSet.of(true, false)`），
+/// 因此 `grass_block` 两个状态中 **snowy=true 在前**（id 8）、snowy=false 在后（id 9）。
 pub mod block_state_ids {
     /// 空气。
     pub const AIR: i32 = 0;
     /// 石头。
     pub const STONE: i32 = 1;
-    /// 草方块（snowy=false）。
-    pub const GRASS_BLOCK: i32 = 8;
+    /// 草方块（snowy=false，默认态）。id 8 是 snowy=true。
+    pub const GRASS_BLOCK: i32 = 9;
     /// 泥土。
     pub const DIRT: i32 = 10;
     /// 基岩。
-    pub const BEDROCK: i32 = 80;
-    /// 水（level 0）。
-    pub const WATER: i32 = 81;
-    /// 熔岩（level 0）。
-    pub const LAVA: i32 = 97;
+    pub const BEDROCK: i32 = 79;
+    /// 水（level=0，默认态）。
+    pub const WATER: i32 = 80;
+    /// 熔岩（level=0，默认态）。
+    pub const LAVA: i32 = 96;
     /// 沙子。
-    pub const SAND: i32 = 113;
+    pub const SAND: i32 = 112;
     /// 黑曜石。
-    pub const OBSIDIAN: i32 = 2355;
+    pub const OBSIDIAN: i32 = 2354;
     /// 地狱岩。
-    pub const NETHERRACK: i32 = 5850;
+    pub const NETHERRACK: i32 = 5849;
     /// 末地石。
-    pub const END_STONE: i32 = 7416;
+    pub const END_STONE: i32 = 7415;
 }
 
 /// 1.21.1 生物群系网络 ID（icbm 服务器自定义注册表顺序）。
@@ -308,11 +313,31 @@ pub const fn ceil_log2(value: u32) -> u32 {
 #[cfg(test)]
 mod tests {
     use super::{
-        BlockPos, HEIGHTMAP_COLUMNS_PER_LONG, ceil_log2, encode_heightmap,
+        BlockPos, HEIGHTMAP_COLUMNS_PER_LONG, block_state_ids, ceil_log2, encode_heightmap,
         encode_paletted_container, unpack_indices,
     };
     use crate::codec::{Reader, Writer};
 
+    /// golden：全局方块状态 ID 对照 vanilla 1.21.1 `Block.BLOCK_STATE_REGISTRY`
+    /// （以 master `data/src/generated/block.rs` 为准）。
+    ///
+    /// 注意 `BooleanProperty` 值序为 `[true, false]`（`BooleanProperty.java`：
+    /// `ImmutableSet.of(true, false)`），故 `grass_block[snowy=true]`=8 在前、
+    /// `snowy=false`=9 在后；bedrock=79 之后是 water（80..）。
+    #[test]
+    fn block_state_ids_match_vanilla_1_21_1() {
+        assert_eq!(block_state_ids::AIR, 0);
+        assert_eq!(block_state_ids::STONE, 1);
+        assert_eq!(block_state_ids::GRASS_BLOCK, 9); // snowy=false
+        assert_eq!(block_state_ids::DIRT, 10);
+        assert_eq!(block_state_ids::BEDROCK, 79);
+        assert_eq!(block_state_ids::WATER, 80); // level=0
+        assert_eq!(block_state_ids::LAVA, 96); // level=0
+        assert_eq!(block_state_ids::SAND, 112);
+        assert_eq!(block_state_ids::OBSIDIAN, 2354);
+        assert_eq!(block_state_ids::NETHERRACK, 5849);
+        assert_eq!(block_state_ids::END_STONE, 7415);
+    }
     #[test]
     fn block_pos_round_trip() {
         for pos in [
@@ -348,10 +373,10 @@ mod tests {
         }
         // 列 7 起在长整型 1：列 7 → 长整型 1 位 0
         assert_eq!(longs[1] & 0x1FF, 68);
-        // 列 252..255 → 长整型 36（末字），位 0/9/18/27
+        // 列 252..255 → 长整型 36（末字），位 0/9/18/27（68 = 0x44）
         assert_eq!(
             longs[36],
-            (68i64) | (68i64 << 9) | (68i64 << 18) | (68i64 << 27)
+            (0x44i64) | (0x44i64 << 9) | (0x44i64 << 18) | (0x44i64 << 27)
         );
         // 单列非零：列 7 值 1（min_y=0 → 存储 1）只落在长整型 1 位 0
         let mut sparse = [0u16; 256];
@@ -359,7 +384,7 @@ mod tests {
         let longs = encode_heightmap(&sparse, 0);
         assert_eq!(longs[0], 0);
         assert_eq!(longs[1] & 0x1FF, 1);
-        assert!(longs[1] & !0x1FF == 0);
+        assert_eq!(longs[1] & !0x1FF, 0);
     }
 
     #[test]

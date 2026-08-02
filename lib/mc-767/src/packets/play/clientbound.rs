@@ -9,12 +9,14 @@ use crate::packets::play::{
     BlockPos, HEIGHTMAP_COLUMNS, encode_heightmap, encode_paletted_container,
 };
 use crate::packets::play_ids::{
-    CLIENTBOUND_BUNDLE_DELIMITER, CLIENTBOUND_CHANGE_DIFFICULTY, CLIENTBOUND_CHUNK_BATCH_FINISHED,
-    CLIENTBOUND_CHUNK_BATCH_START, CLIENTBOUND_COMMANDS, CLIENTBOUND_DISCONNECT,
+    CLIENTBOUND_ADD_ENTITY, CLIENTBOUND_BUNDLE_DELIMITER, CLIENTBOUND_CHANGE_DIFFICULTY,
+    CLIENTBOUND_CHUNK_BATCH_FINISHED, CLIENTBOUND_CHUNK_BATCH_START,
+    CLIENTBOUND_COMMAND_SUGGESTIONS, CLIENTBOUND_COMMANDS, CLIENTBOUND_DISCONNECT,
     CLIENTBOUND_FORGET_LEVEL_CHUNK, CLIENTBOUND_GAME_EVENT, CLIENTBOUND_KEEP_ALIVE,
-    CLIENTBOUND_LEVEL_CHUNK_WITH_LIGHT, CLIENTBOUND_LOGIN, CLIENTBOUND_PING,
-    CLIENTBOUND_PLAYER_ABILITIES, CLIENTBOUND_PLAYER_INFO_REMOVE, CLIENTBOUND_PLAYER_INFO_UPDATE,
-    CLIENTBOUND_PLAYER_POSITION, CLIENTBOUND_SET_CHUNK_CACHE_CENTER,
+    CLIENTBOUND_LEVEL_CHUNK_WITH_LIGHT, CLIENTBOUND_LOGIN, CLIENTBOUND_MOVE_ENTITY_POS,
+    CLIENTBOUND_MOVE_ENTITY_POS_ROT, CLIENTBOUND_PING, CLIENTBOUND_PLAYER_ABILITIES,
+    CLIENTBOUND_PLAYER_INFO_REMOVE, CLIENTBOUND_PLAYER_INFO_UPDATE, CLIENTBOUND_PLAYER_POSITION,
+    CLIENTBOUND_REMOVE_ENTITIES, CLIENTBOUND_SET_CHUNK_CACHE_CENTER,
     CLIENTBOUND_SET_CHUNK_CACHE_RADIUS, CLIENTBOUND_SET_DEFAULT_SPAWN_POSITION,
     CLIENTBOUND_SYSTEM_CHAT, CLIENTBOUND_UPDATE_TAGS,
 };
@@ -50,6 +52,157 @@ impl ChunkSection {
             block_states: blocks.to_vec(),
             biomes: vec![biome_id; 64],
         }
+    }
+}
+
+/// Clientbound：实体生成（0x01 `EntitySpawnS2CPacket.java`）。
+///
+/// 字段顺序对照 `EntitySpawnS2CPacket.write`：entityId(VarInt) → UUID →
+/// entityType（注册表 `VarInt`）→ x/y/z(`F64`) → pitch/yaw/headYaw(`Byte`，`floor(deg*256/360)`) →
+/// entityData(VarInt，1.21.1 仍编码但常为 0) → velocity(Short × 3，`clamp(-3.9,3.9)*8000`)。
+#[derive(Debug, Clone)]
+pub struct CAddEntity {
+    /// 实体 ID。
+    pub entity_id: i32,
+    /// 实体 UUID。
+    pub uuid: Uuid,
+    /// 实体类型注册表 ID（如 `minecraft:creeper` = 23）。
+    pub entity_type: i32,
+    /// X。
+    pub x: f64,
+    /// Y。
+    pub y: f64,
+    /// Z。
+    pub z: f64,
+    /// 俯仰角（度）。
+    pub pitch: f32,
+    /// 偏航角（度）。
+    pub yaw: f32,
+}
+
+impl CAddEntity {
+    /// 编码载荷。
+    pub fn encode(&self, writer: &mut Writer) {
+        writer.write_var_int(self.entity_id);
+        writer.write_uuid(&self.uuid);
+        writer.write_var_int(self.entity_type);
+        writer.write_f64_be(self.x);
+        writer.write_f64_be(self.y);
+        writer.write_f64_be(self.z);
+        writer.write_i8(angle_byte(self.pitch));
+        writer.write_i8(angle_byte(self.yaw));
+        writer.write_i8(angle_byte(self.yaw)); // headYaw
+        writer.write_var_int(0); // entityData
+        writer.write_i16_be(0); // velocityX
+        writer.write_i16_be(0); // velocityY
+        writer.write_i16_be(0); // velocityZ
+    }
+
+    /// 包 ID。
+    #[must_use]
+    pub const fn packet_id() -> i32 {
+        CLIENTBOUND_ADD_ENTITY
+    }
+}
+
+/// 度 → 网络角度字节（`MathHelper.floor(deg * 256 / 360)`）。
+#[must_use]
+pub const fn angle_byte(degrees: f32) -> i8 {
+    (degrees * 256.0 / 360.0) as i8
+}
+
+/// Clientbound：实体相对移动（0x2E `EntityS2CPacket.MoveRelative`）。
+///
+/// delta 单位 1/4096 方块（`EntityTrackerEntry` 的 `(x - prevX) * 4096`）。
+#[derive(Debug, Clone)]
+pub struct CMoveEntityPos {
+    /// 实体 ID。
+    pub entity_id: i32,
+    /// X 增量（1/4096 方块）。
+    pub delta_x: i16,
+    /// Y 增量（1/4096 方块）。
+    pub delta_y: i16,
+    /// Z 增量（1/4096 方块）。
+    pub delta_z: i16,
+    /// 是否在地面。
+    pub on_ground: bool,
+}
+
+impl CMoveEntityPos {
+    /// 编码载荷。
+    pub fn encode(&self, writer: &mut Writer) {
+        writer.write_var_int(self.entity_id);
+        writer.write_i16_be(self.delta_x);
+        writer.write_i16_be(self.delta_y);
+        writer.write_i16_be(self.delta_z);
+        writer.write_bool(self.on_ground);
+    }
+
+    /// 包 ID。
+    #[must_use]
+    pub const fn packet_id() -> i32 {
+        CLIENTBOUND_MOVE_ENTITY_POS
+    }
+}
+
+/// Clientbound：实体相对移动+旋转（0x2F `EntityS2CPacket.RotateAndMoveRelative`）。
+#[derive(Debug, Clone)]
+pub struct CMoveEntityPosRot {
+    /// 实体 ID。
+    pub entity_id: i32,
+    /// X 增量（1/4096 方块）。
+    pub delta_x: i16,
+    /// Y 增量（1/4096 方块）。
+    pub delta_y: i16,
+    /// Z 增量（1/4096 方块）。
+    pub delta_z: i16,
+    /// 偏航角字节。
+    pub yaw: i8,
+    /// 俯仰角字节。
+    pub pitch: i8,
+    /// 是否在地面。
+    pub on_ground: bool,
+}
+
+impl CMoveEntityPosRot {
+    /// 编码载荷。
+    pub fn encode(&self, writer: &mut Writer) {
+        writer.write_var_int(self.entity_id);
+        writer.write_i16_be(self.delta_x);
+        writer.write_i16_be(self.delta_y);
+        writer.write_i16_be(self.delta_z);
+        writer.write_i8(self.yaw);
+        writer.write_i8(self.pitch);
+        writer.write_bool(self.on_ground);
+    }
+
+    /// 包 ID。
+    #[must_use]
+    pub const fn packet_id() -> i32 {
+        CLIENTBOUND_MOVE_ENTITY_POS_ROT
+    }
+}
+
+/// Clientbound：移除实体（0x42 `EntitiesDestroyS2CPacket`）。
+#[derive(Debug, Clone)]
+pub struct CRemoveEntities {
+    /// 实体 ID 列表。
+    pub entity_ids: Vec<i32>,
+}
+
+impl CRemoveEntities {
+    /// 编码载荷。
+    pub fn encode(&self, writer: &mut Writer) {
+        writer.write_var_int(i32::try_from(self.entity_ids.len()).expect("ids exceed i32"));
+        for id in &self.entity_ids {
+            writer.write_var_int(*id);
+        }
+    }
+
+    /// 包 ID。
+    #[must_use]
+    pub const fn packet_id() -> i32 {
+        CLIENTBOUND_REMOVE_ENTITIES
     }
 }
 
@@ -360,23 +513,118 @@ impl CChunkBatchFinished {
     }
 }
 
-/// Clientbound：命令树（0x11，Phase 1 仅根节点）。
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct CCommands;
+/// 命令树节点（1.21.1 `CommandTreeS2CPacket` 的节点数据）。
+///
+/// 仅支持本服务器用到的节点形态：根、字面量、字符串参数；不编码
+/// redirect(0x08)/executable(0x04)/customSuggestions(0x10) 标志。
+#[derive(Debug, Clone)]
+pub enum CommandTreeNode {
+    /// 根节点（flags=0）。
+    Root {
+        /// 子节点下标。
+        children: Vec<usize>,
+    },
+    /// 字面量节点（flags=1，`LiteralCommandNode`）。
+    Literal {
+        /// 命令名（如 `gamemode`）。
+        name: String,
+        /// 子节点下标。
+        children: Vec<usize>,
+    },
+    /// 参数节点（flags=2，`RequiredArgumentNode`）。
+    ///
+    /// 参数类型固定为 `brigadier:string`（注册序 5），word 变体；该类型无内置
+    /// 建议源，客户端对参数补全会发 `RequestCommandCompletionsC2SPacket` 请求服务器。
+    Argument {
+        /// 参数名（客户端显示占位符 `<name>`）。
+        name: String,
+        /// 子节点下标。
+        children: Vec<usize>,
+    },
+}
+
+/// Clientbound：命令树（0x11 `CommandTreeS2CPacket`）。
+///
+/// 编码对照 `CommandTreeS2CPacket.write`：`writeCollection`（`VarInt` 节点数）→
+/// 每节点 `flags(Byte)` → `writeIntArray(children)`（`VarInt` 数量 + `VarInt` 下标）→
+/// literal/argument 数据 → 最后 `writeVarInt(rootIndex)`（根下标在**末尾**）。
+#[derive(Debug, Clone)]
+pub struct CCommands {
+    /// 节点表（下标 0 为根节点）。
+    pub nodes: Vec<CommandTreeNode>,
+}
 
 impl CCommands {
-    /// 编码载荷（根节点：flags=0、无子节点）。
+    /// 编码载荷。
     pub fn encode(&self, writer: &mut Writer) {
-        writer.write_var_int(1); // 节点数
-        writer.write_var_int(0); // 根节点 flags
-        writer.write_var_int(0); // 根节点子节点数
-        writer.write_var_int(0); // 根索引
+        writer.write_var_int(i32::try_from(self.nodes.len()).expect("nodes exceed i32"));
+        for node in &self.nodes {
+            let (flags, children) = match node {
+                CommandTreeNode::Root { children } => (0u8, children.as_slice()),
+                CommandTreeNode::Literal { children, .. } => (1u8, children.as_slice()),
+                CommandTreeNode::Argument { children, .. } => (2u8, children.as_slice()),
+            };
+            writer.write_u8(flags);
+            writer.write_var_int(i32::try_from(children.len()).expect("children exceed i32"));
+            for child in children {
+                writer.write_var_int(i32::try_from(*child).expect("child index exceeds i32"));
+            }
+            match node {
+                CommandTreeNode::Root { .. } => {}
+                CommandTreeNode::Literal { name, .. } => writer.write_string(name),
+                CommandTreeNode::Argument { name, .. } => {
+                    writer.write_string(name);
+                    // `brigadier:string`（`ArgumentTypes.java` 注册序 5），properties =
+                    // StringType 枚举 VarInt：0=word（对照 `StringArgumentType.Serializer`）。
+                    writer.write_var_int(5);
+                    writer.write_var_int(0);
+                }
+            }
+        }
+        writer.write_var_int(0); // rootIndex（0 = 第一个节点）
     }
 
     /// 包 ID。
     #[must_use]
     pub const fn packet_id() -> i32 {
         CLIENTBOUND_COMMANDS
+    }
+}
+
+/// Clientbound：命令补全建议（0x10 `CommandSuggestionsS2CPacket`）。
+///
+/// 编码对照 `CommandSuggestionsS2CPacket.java`：id → start → length → 建议列表；
+/// 每项 { String 文本, Optional<Text> tooltip }，tooltip 为 NBT 组件，不发送时写 false。
+#[derive(Debug, Clone)]
+pub struct CCommandSuggestions {
+    /// 请求 ID（回显客户端 `RequestCommandCompletionsC2SPacket` 的 ID）。
+    pub id: i32,
+    /// 替换区间起点（相对客户端原始输入字符串，含前导 `/`）。
+    pub start: i32,
+    /// 替换区间长度。
+    pub length: i32,
+    /// 建议文本列表。
+    pub suggestions: Vec<String>,
+}
+
+impl CCommandSuggestions {
+    /// 编码载荷。
+    pub fn encode(&self, writer: &mut Writer) {
+        writer.write_var_int(self.id);
+        writer.write_var_int(self.start);
+        writer.write_var_int(self.length);
+        writer
+            .write_var_int(i32::try_from(self.suggestions.len()).expect("suggestions exceed i32"));
+        for text in &self.suggestions {
+            writer.write_string(text);
+            writer.write_bool(false); // 无 tooltip（TextCodecs.OPTIONAL_UNLIMITED_REGISTRY_PACKET_CODEC）
+        }
+    }
+
+    /// 包 ID。
+    #[must_use]
+    pub const fn packet_id() -> i32 {
+        CLIENTBOUND_COMMAND_SUGGESTIONS
     }
 }
 
@@ -869,6 +1117,73 @@ mod tests {
         assert_eq!(sky_empty[0], 0x200_0001); // 位 0 与位 25
         let block_empty = r.read_bitset().unwrap();
         assert_eq!(block_empty[0], 0x3FF_FFFF); // 位 0..=25
+    }
+
+    #[test]
+    fn command_tree_encodes_literals_and_arguments() {
+        // 对照 `CommandTreeS2CPacket.write`：VarInt 节点数 → 每节点 flags(Byte) +
+        // 子节点 VarInt 数组 → literal/argument 数据 → 末尾 rootIndex。
+        let packet = CCommands {
+            nodes: vec![
+                CommandTreeNode::Root {
+                    children: vec![1, 2],
+                },
+                CommandTreeNode::Literal {
+                    name: "gamemode".to_owned(),
+                    children: vec![2],
+                },
+                CommandTreeNode::Argument {
+                    name: "mode".to_owned(),
+                    children: vec![],
+                },
+            ],
+        };
+        let mut w = Writer::new();
+        packet.encode(&mut w);
+        let bytes = w.into_bytes();
+        let mut r = Reader::new(&bytes);
+        assert_eq!(r.read_var_int().unwrap(), 3); // 节点数
+        // 根节点：flags=0，children=[1,2]
+        assert_eq!(r.read_u8().unwrap(), 0);
+        assert_eq!(r.read_var_int().unwrap(), 2);
+        assert_eq!(r.read_var_int().unwrap(), 1);
+        assert_eq!(r.read_var_int().unwrap(), 2);
+        // 字面量：flags=1，children=[2]，name="gamemode"
+        assert_eq!(r.read_u8().unwrap(), 1);
+        assert_eq!(r.read_var_int().unwrap(), 1);
+        assert_eq!(r.read_var_int().unwrap(), 2);
+        assert_eq!(r.read_string().unwrap(), "gamemode");
+        // 参数：flags=2，children=[]，name="mode"，brigadier:string(5) + word(0)
+        assert_eq!(r.read_u8().unwrap(), 2);
+        assert_eq!(r.read_var_int().unwrap(), 0);
+        assert_eq!(r.read_string().unwrap(), "mode");
+        assert_eq!(r.read_var_int().unwrap(), 5); // brigadier:string
+        assert_eq!(r.read_var_int().unwrap(), 0); // SINGLE_WORD
+        assert_eq!(r.read_var_int().unwrap(), 0); // rootIndex 在末尾
+        assert!(r.is_empty());
+    }
+
+    #[test]
+    fn command_suggestions_encodes_entries() {
+        let packet = CCommandSuggestions {
+            id: 9,
+            start: 10,
+            length: 2,
+            suggestions: vec!["creative".to_owned(), "survival".to_owned()],
+        };
+        let mut w = Writer::new();
+        packet.encode(&mut w);
+        let bytes = w.into_bytes();
+        let mut r = Reader::new(&bytes);
+        assert_eq!(r.read_var_int().unwrap(), 9);
+        assert_eq!(r.read_var_int().unwrap(), 10);
+        assert_eq!(r.read_var_int().unwrap(), 2);
+        assert_eq!(r.read_var_int().unwrap(), 2); // 建议数
+        assert_eq!(r.read_string().unwrap(), "creative");
+        assert!(!r.read_bool().unwrap()); // 无 tooltip
+        assert_eq!(r.read_string().unwrap(), "survival");
+        assert!(!r.read_bool().unwrap());
+        assert!(r.is_empty());
     }
 
     #[test]

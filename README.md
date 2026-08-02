@@ -48,10 +48,20 @@ region 是服务器的子进程，作为 datarouter 中的独立服务（`icbm.r
 
 - 玩家跨越 region 边界时速度不得超过 2 方块/秒；乘船跨越会被减速。
 - 装备鞘翅高速接近边境时"感受到动能"并死亡；空中高速靠近且剩余 50 方块时，Action Bar 提示："你当前正在边境，请爬升高度。"
-- 玩家所在 region 为中心，其 **9 × 9** 范围内未生成地图的 region 会拉起子进程进行多线程生成。
+- 玩家所在 region 为中心，其 **3 × 3** 范围内未生成地图的 region 会拉起子进程进行
+  地形生成（README 原计划 9 × 9，但 datarouter 端口上限 `DATAROUTER_MAX_PORTS`=64，
+  9×9=81 超出；更远处由移动触发的区块请求按需拉起）。
 - 默认模拟距离 8，最大可视距离 64；允许读取所在 region 外的地形。
+- 玩家移动时，core 按 vanilla 规则在玩家走出已发区块缓存中心 `view/2` 时重新请求
+  视野区块并更新 `SetChunkCacheCenter`，跨 region 时先拉起/复用新 region 再请求，
+  避免落入未加载地形。
 - 玩家离开且 region 内无玩家时：传送处于跟随状态的伴侣动物，region 标记为**沉睡**（停止 tick 更新）。
-- region 沉睡超过 30 秒后**卸载**（停止 region 进程）；沉睡的 region 允许破坏方块，但除锁定玩家的 BOSS、掉落物之外的实体停止更新。
+- region 沉睡超过 30 秒后**卸载**（停止 region 进程）；卸载时 core 向在线玩家发
+  `REMOVE_ENTITIES` 清理该区域的实体。沉睡的 region 允许破坏方块，但除锁定玩家的
+  BOSS、掉落物之外的实体停止更新。
+- **漫游 Creeper 测试信号**：region 模拟期间每 tick 以 1/120 概率在区域内随机生成
+  一只 Creeper（上限 12 只），它们不攻击、随机游走（每 tick 1/3 概率移动 1 格），
+  作为验证 region 是否仍在运行/已卸载的视觉信号——region 卸载后其 Creeper 随之消失。
 - Y > 400 活动时不加载任何 region；被卸载的 region 是只读的，无法进行任何交互。
 
 ## 目录结构
@@ -95,15 +105,15 @@ world/
 
 ## 第一阶段范围（Phase 1）
 
-- [ ] 地形生成器：主世界、地狱、末地统一为 flat 超平坦。
-- [ ] `lib/anvil`：1.21.1 Anvil 存档格式——.mca region 文件（8KiB 头部/扇区分配/压缩编解码，含 LZ4 与外部 .mcc 流）、chunk NBT 编解码（sections/palette/heightmap/block_entities/entities）、level.dat 与 playerdata。
-- [ ] core–region 分型基本功能：region 拉起/注册/心跳/沉睡/卸载、9 × 9 预生成；region 通过 `lib/anvil` 读写并锁住其 `.mca` 存档文件。
-- [ ] `gameplay/minecraft`：方块、生物、声音注册；`gamerule` 与 `gamemode` 指令。
-- [ ] `/bmtool` 工具：当前仅 `/bmtool tps`，输出 CPU 负载、CPU 核心数、活跃 Region 数、沉睡 Region 数、当前 region TPS、平均 region TPS。
-- [ ] 控制台：参考 master 分支（stdin 线程 + 命令分发）。
-- [ ] 默认 icon 与 MOTD：参考 master 分支（状态查询响应，内置 favicon）。
-- [ ] `lib/mc-767`：协议 767 编解码（握手/状态/登录/配置/Play 最小子集）+ NBT。
-- [ ] datarouter 接入：core/region 通过共享内存通讯，二进制协议落地。
+- [x] 地形生成器：主世界、地狱、末地统一为 flat 超平坦（vanilla 全局方块状态 ID 对齐，含 golden 测试）。
+- [x] `lib/anvil`：1.21.1 Anvil 存档格式——.mca region 文件（8KiB 头部/扇区分配/压缩编解码，含 LZ4 与外部 .mcc 流）、chunk NBT 编解码（sections/palette/heightmap/block_entities/entities）、level.dat 与 playerdata。
+- [x] core–region 分型基本功能：region 拉起/注册/心跳/沉睡/卸载、3 × 3 预生成（9×9 超出 datarouter 端口上限，见 README 边境章节）；region 通过 `lib/anvil` 读写并锁住其 `.mca` 存档文件。
+- [x] `gameplay/minecraft`：方块、生物、声音注册；`gamerule` 与 `gamemode` 指令（含创造模式能力包、游戏规则持久化到 level.dat）。
+- [x] `/bmtool` 工具：`/bmtool tps`，输出 CPU 负载、CPU 核心数、活跃 Region 数、沉睡 Region 数、当前 region TPS、平均 region TPS。
+- [x] 控制台：参考 master 分支（stdin 线程 + 命令分发）。
+- [x] 默认 icon 与 MOTD：参考 master 分支（状态查询响应，内置 favicon）。
+- [x] `lib/mc-767`：协议 767 编解码（握手/状态/登录/配置/Play 最小子集，含实体 AddEntity/MoveEntityPos/RemoveEntities）+ NBT。
+- [x] datarouter 接入：core/region 通过共享内存通讯，二进制协议落地（含实体包转发 `ENTITY_DATA`）。
 
 ## 参考基线
 
@@ -124,7 +134,30 @@ cargo build --release
 ./target/release/icbm
 ```
 
+命令行参数：
+
+- `--world <目录>`：世界目录（默认 `world`）；
+- `--port <端口>`：监听端口（默认 25565）；
+- `--shm <名称>`：datarouter 共享内存对象名（默认 `/icbm`）；
+- `--log-level <off|error|warn|info|debug|trace>`：日志级别，默认 `info`；
+  TRACE/DEBUG/INFO/WARN/ERROR 严格分层，region 子进程继承同一级别。
+
 > 依赖 datarouter-switch 进程先于 core 启动；部署细节见 `docs/ipc.md`。
+
+### 单文件可移植 release（任意 Linux）
+
+`scripts/build-release.sh` 构建**静态链接**的 `x86_64-unknown-linux-musl` 单文件二进制，
+可在任意 Linux 发行版直接运行（无 glibc 版本依赖、无外部命令依赖）：
+
+```bash
+./scripts/build-release.sh   # 产物：target/x86_64-unknown-linux-musl/release/icbm
+```
+
+运行所需资源全部内嵌：favicon（`assets/icbmlogo.png`，`include_bytes!`）、
+`datarouter-switch` 二进制（`lib/datarouter` build.rs 编译后 `include_bytes!`，启动时
+经 Linux `memfd` 内存执行、零落盘）；region 子进程由同一二进制 `--region` 拉起。
+构建依赖 `rustup target add x86_64-unknown-linux-musl` 与 `musl-gcc`
+（Fedora `musl-gcc` / Debian `musl-tools`）。
 
 ## 开发约定
 

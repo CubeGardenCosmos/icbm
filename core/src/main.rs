@@ -7,11 +7,16 @@
 use std::path::PathBuf;
 
 use tracing::{error, info, warn};
+use tracing_subscriber::filter::LevelFilter;
 
+use icbm_core::console::{init_logging, parse_log_level};
 use icbm_region::{RegionConfig, RegionId};
 
 /// 缺省 datarouter 共享内存对象名（可用 `--shm` 覆盖；POSIX shm 名以 `/` 开头）。
 const DEFAULT_SHM_NAME: &str = "/icbm";
+
+/// 缺省日志级别。
+const DEFAULT_LOG_LEVEL: LevelFilter = LevelFilter::INFO;
 
 fn parse_args() -> Result<Launch, String> {
     let mut args = std::env::args().skip(1);
@@ -19,6 +24,7 @@ fn parse_args() -> Result<Launch, String> {
     let mut shm: Option<String> = None;
     let mut port: Option<u16> = None;
     let mut region: Option<(i32, i32)> = None;
+    let mut log_level = DEFAULT_LOG_LEVEL;
 
     while let Some(arg) = args.next() {
         match arg.as_str() {
@@ -51,6 +57,12 @@ fn parse_args() -> Result<Launch, String> {
                         .map_err(|e| format!("端口非法: {e}"))?,
                 );
             }
+            "--log-level" => {
+                let value = args
+                    .next()
+                    .ok_or_else(|| "--log-level 需要级别".to_owned())?;
+                log_level = parse_log_level(&value)?;
+            }
             other => return Err(format!("未知参数: {other}")),
         }
     }
@@ -60,6 +72,7 @@ fn parse_args() -> Result<Launch, String> {
             id: RegionId { rx, rz },
             world_dir: world.ok_or_else(|| "region 模式需要 --world".to_owned())?,
             shm_name: shm.unwrap_or_else(|| DEFAULT_SHM_NAME.to_owned()),
+            log_level,
         })
     } else {
         Launch::Core(ServerLaunchArgs {
@@ -69,6 +82,7 @@ fn parse_args() -> Result<Launch, String> {
             ),
             world_dir: world.unwrap_or_else(|| PathBuf::from("world")),
             shm_name: shm.unwrap_or_else(|| DEFAULT_SHM_NAME.to_owned()),
+            log_level,
         })
     };
     Ok(mode)
@@ -87,6 +101,7 @@ struct ServerLaunchArgs {
     address: String,
     world_dir: PathBuf,
     shm_name: String,
+    log_level: LevelFilter,
 }
 
 impl Default for ServerLaunchArgs {
@@ -95,6 +110,7 @@ impl Default for ServerLaunchArgs {
             address: "0.0.0.0:25565".to_owned(),
             world_dir: PathBuf::from("world"),
             shm_name: DEFAULT_SHM_NAME.to_owned(),
+            log_level: DEFAULT_LOG_LEVEL,
         }
     }
 }
@@ -104,21 +120,32 @@ struct RegionLaunchArgs {
     id: RegionId,
     world_dir: PathBuf,
     shm_name: String,
+    log_level: LevelFilter,
 }
 
 #[allow(clippy::print_stderr)] // 参数错误写入 stderr 是控制台惯例
 fn usage_error(message: &str) -> ! {
     eprintln!("参数错误: {message}");
-    eprintln!("用法: icbm [--world <目录>] [--port <端口>] [--shm <名称>]");
-    eprintln!("      icbm --region <rx> <rz> --world <目录> [--shm <名称>]");
+    eprintln!("用法: icbm [--world <目录>] [--port <端口>] [--shm <名称>] [--log-level <级别>]");
+    eprintln!("      icbm --region <rx> <rz> --world <目录> [--shm <名称>] [--log-level <级别>]");
+    eprintln!("级别: off | error | warn | info | debug | trace（默认 info）");
     std::process::exit(2);
 }
 
 fn main() {
-    tracing_subscriber::fmt().with_target(false).init();
+    let args = match parse_args() {
+        Ok(args) => args,
+        Err(message) => usage_error(&message),
+    };
+    let (log_level, use_stderr) = match &args {
+        Launch::Core(args) => (args.log_level, false),
+        Launch::Region(args) => (args.log_level, true),
+    };
+    // region 子进程：日志走 stderr、不启动交互控制台（stdout 留给 core 控制台）。
+    init_logging(log_level, use_stderr);
 
-    match parse_args() {
-        Ok(Launch::Region(args)) => {
+    match args {
+        Launch::Region(args) => {
             info!(
                 id = %args.id.service_name(),
                 "starting region worker mode"
@@ -138,12 +165,13 @@ fn main() {
                 std::process::exit(1);
             }
         }
-        Ok(Launch::Core(args)) => {
+        Launch::Core(args) => {
             info!("starting icbm core on {}", args.address);
             let config = icbm_core::config::ServerConfig {
                 address: args.address,
                 world_dir: args.world_dir,
                 shm_name: args.shm_name,
+                log_level: args.log_level,
                 ..icbm_core::config::ServerConfig::default()
             };
             let server = match icbm_core::server::Server::new(config) {
@@ -159,6 +187,5 @@ fn main() {
             }
             warn!("server stopped");
         }
-        Err(message) => usage_error(&message),
     }
 }

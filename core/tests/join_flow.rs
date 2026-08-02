@@ -8,14 +8,16 @@
 
 use std::io::{Read, Write};
 use std::net::TcpStream;
+use std::os::unix::process::CommandExt;
 use std::process::{Child, Command, Stdio};
 use std::time::{Duration, Instant};
 
 use icbm_mc_767::codec::{Reader, Writer};
-use icbm_mc_767::packets::{decode_frame, encode_frame};
 use icbm_mc_767::packets::login_ids;
 use icbm_mc_767::packets::play::clientbound::CGameEvent;
 use icbm_mc_767::packets::play_ids;
+use icbm_mc_767::packets::status_ids;
+use icbm_mc_767::packets::{decode_frame, encode_frame};
 use icbm_mc_767::protocol::PROTOCOL_VERSION;
 use uuid::Uuid;
 
@@ -29,7 +31,9 @@ struct FakeClient {
 impl FakeClient {
     fn connect(addr: &str) -> Self {
         let stream = TcpStream::connect(addr).expect("connect to server");
-        stream.set_read_timeout(Some(Duration::from_secs(10))).unwrap();
+        stream
+            .set_read_timeout(Some(Duration::from_secs(10)))
+            .unwrap();
         stream.set_nodelay(true).unwrap();
         Self {
             stream,
@@ -85,9 +89,9 @@ struct TestServer {
 }
 
 impl TestServer {
-    fn start() -> Self {
-        let world_dir =
-            std::env::temp_dir().join(format!("icbm-join-test-{}", std::process::id()));
+    /// `name` 用于区分并行测试实例（世界目录与 datarouter shm 名需唯一）。
+    fn start(name: &str) -> Self {
+        let world_dir = std::env::temp_dir().join(format!("icbm-join-test-{}-{}", std::process::id(), name));
         let _ = std::fs::remove_dir_all(&world_dir);
         std::fs::create_dir_all(&world_dir).unwrap();
 
@@ -97,7 +101,7 @@ impl TestServer {
             listener.local_addr().unwrap().port()
         };
         let addr = format!("127.0.0.1:{port}");
-        let shm_name = format!("/datarouter-join-test-{}", std::process::id());
+        let shm_name = format!("/datarouter-join-test-{}-{name}", std::process::id());
 
         let exe = env!("CARGO_BIN_EXE_icbm");
         let child = Command::new(exe)
@@ -109,6 +113,7 @@ impl TestServer {
                 "--shm",
                 &shm_name,
             ])
+            .process_group(0) // 独立进程组：Drop 时整组清理 region 子进程
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
             .spawn()
@@ -134,7 +139,11 @@ impl TestServer {
 
 impl Drop for TestServer {
     fn drop(&mut self) {
-        let _ = self.child.kill();
+        // 终止整个进程组（core + 其拉起的全部 region 子进程）
+        let _ = std::process::Command::new("kill")
+            .arg("-KILL")
+            .arg(format!("-{}", self.child.id()))
+            .status();
         let _ = self.child.wait();
         let _ = std::fs::remove_dir_all(&self.world_dir);
         let _ = std::fs::remove_file(format!(
@@ -144,11 +153,51 @@ impl Drop for TestServer {
     }
 }
 
+/// 状态流程：握手（`next_state=1`）→ 状态请求 → MOTD JSON 响应 → ping → pong 回显。
+///
+/// 覆盖 join 流程未走到的 Status 状态机分支（MOTD 与 favicon 内嵌资源）。
+#[test]
+fn status_request_ping_flow() {
+    let server = TestServer::start("status");
+    let mut client = FakeClient::connect(&server.addr);
+
+    // 握手 → 状态
+    let mut intent = Writer::new();
+    intent.write_var_int(PROTOCOL_VERSION);
+    intent.write_string("127.0.0.1");
+    intent.write_u16_be(25565);
+    intent.write_var_int(1);
+    client.send(0x00, &intent.into_bytes());
+
+    // 状态请求（空载荷）→ 响应 JSON（载荷为长度前缀字符串）
+    client.send(status_ids::SERVERBOUND_REQUEST, &[]);
+    let (id, payload) = client.recv();
+    assert_eq!(id, status_ids::CLIENTBOUND_RESPONSE);
+    let mut r = Reader::new(&payload);
+    let json_str = r.read_string().unwrap();
+    assert!(r.is_empty());
+    let json: serde_json::Value = serde_json::from_str(&json_str).unwrap();
+    assert_eq!(json["version"]["protocol"], 767);
+    assert_eq!(json["version"]["name"], "1.21.1");
+    let favicon = json["favicon"].as_str().expect("favicon present");
+    assert!(favicon.starts_with("data:image/png;base64,"));
+
+    // ping → pong 原样回显（随后服务器关闭连接）
+    let ping_payload = 0xDEAD_BEEF_CAFE_F00Du64 as i64;
+    let mut w = Writer::new();
+    w.write_i64_be(ping_payload);
+    client.send(status_ids::SERVERBOUND_PING, &w.into_bytes());
+    let (id, payload) = client.recv();
+    assert_eq!(id, status_ids::CLIENTBOUND_PONG);
+    let mut r = Reader::new(&payload);
+    assert_eq!(r.read_i64_be().unwrap(), ping_payload);
+}
+
 // 全流程步骤较长；按读包顺序推进，拆分会损失顺序语义，故允许超长函数。
 #[allow(clippy::too_many_lines)]
 #[test]
 fn full_join_flow_status_login_config_play() {
-    let server = TestServer::start();
+    let server = TestServer::start("join");
     let mut client = FakeClient::connect(&server.addr);
 
     // ── 握手（next state = 2 登录） ─────────────────────────────────────
@@ -303,7 +352,10 @@ fn full_join_flow_status_login_config_play() {
     // 初始区块即将到来
     let ev = client.recv_until(play_ids::CLIENTBOUND_GAME_EVENT, "initial chunks coming");
     let mut r = Reader::new(&ev);
-    assert_eq!(r.read_u8().unwrap(), CGameEvent::EVENT_INITIAL_CHUNKS_COMING);
+    assert_eq!(
+        r.read_u8().unwrap(),
+        CGameEvent::EVENT_INITIAL_CHUNKS_COMING
+    );
     let _ = r.read_f32_be().unwrap();
 
     // 区块批次开始 → 各区块（0x27）→ 批次完成

@@ -7,12 +7,14 @@ use std::time::{Duration, Instant};
 
 use blinkcms_datarouter::switch_frontend::{SwitchConfig, SwitchError, SwitchHandle};
 use icbm_anvil::level::{LevelData, write_level_dat};
-use icbm_mc_767::packets::play::clientbound::{CChunkBatchFinished, CChunkBatchStart};
+use icbm_mc_767::packets::play::clientbound::{
+    CChunkBatchFinished, CChunkBatchStart, CRemoveEntities,
+};
 use icbm_mc_767::packets::play_ids;
 use icbm_region::RegionId;
 use icbm_region::protocol::{
-    DIM_OVERWORLD, Ipc, IpcError, decode_chunk_data, decode_heartbeat, decode_register,
-    encode_register_ack, encode_unload, kind,
+    DIM_OVERWORLD, Ipc, IpcError, decode_chunk_data, decode_entity_data, decode_heartbeat,
+    decode_register, encode_register_ack, encode_unload, kind,
 };
 use tracing::{info, warn};
 
@@ -118,6 +120,15 @@ impl Server {
         let ipc = Ipc::connect(&config.shm_name, "icbm.core", auth_token)?;
         info!("connected to datarouter {}", config.shm_name);
         let world = Mutex::new(WorldState::new(config.world_dir.clone()));
+        // 从 level.dat 恢复游戏规则（`GameRules` 复合，对照 `LevelSave` 启动路径）
+        if let Ok(level) = icbm_anvil::level::read_level_dat(&level_path) {
+            let mut state = world.lock().expect("world lock");
+            for (name, value) in &level.gamerules {
+                if let Err(err) = state.gamerules.set(name, value) {
+                    warn!(%err, rule = %name, "ignoring stale gamerule from level.dat");
+                }
+            }
+        }
         Ok(Self {
             inner: Arc::new(ServerInner {
                 config,
@@ -128,6 +139,28 @@ impl Server {
                 chunk_diag: std::sync::atomic::AtomicU64::new(0),
             }),
         })
+    }
+
+    /// 把当前游戏规则持久化到 level.dat（`GameRules` 复合）。
+    pub fn persist_gamerules(&self) {
+        let path = self.config.world_dir.join("level.dat");
+        let mut level = icbm_anvil::level::read_level_dat(&path).unwrap_or(LevelData {
+            level_name: "world".to_owned(),
+            gamerules: Vec::new(),
+            player: None,
+        });
+        let gamerules: Vec<(String, String)> = {
+            let world = self.world.lock().expect("world lock");
+            world
+                .gamerules
+                .iter()
+                .map(|(name, value)| (name.to_owned(), value.to_owned()))
+                .collect()
+        };
+        level.gamerules = gamerules;
+        if let Err(err) = icbm_anvil::level::write_level_dat(&path, &level) {
+            warn!(%err, "failed to persist gamerules");
+        }
     }
 
     /// 运行主循环直至停止。
@@ -173,7 +206,12 @@ impl Server {
         let world_dir = self.world.lock().expect("world lock").world_dir.clone();
         let spawn_result = {
             let mut world = self.world.lock().expect("world lock");
-            world.regions.spawn(&id, &world_dir, &self.config.shm_name)
+            world.regions.spawn(
+                &id,
+                &world_dir,
+                &self.config.shm_name,
+                self.config.log_level,
+            )
         };
         spawn_result.map_err(NetError::Io)?;
         let deadline = Instant::now() + Duration::from_secs(10);
@@ -241,8 +279,8 @@ fn start_switch(
         shm_name: config.shm_name.clone(),
         mode: 0o600,
         ttl_ms: 5000,
-        // core + 若干 region（Phase 1 预计 1-2 个），留出扩容余量。
-        max_ports: 8,
+        // core + 3×3 预生成（9 region）+ 扩容余量；datarouter 上限 64。
+        max_ports: 32,
         // region 服务名动态（`icbm.region.<id>`），allowlist 无法穷举。
         allow_any: true,
         token: auth_token,
@@ -364,6 +402,12 @@ fn maintain_regions(server: &Server) {
             .regions
             .get(&id)
             .map(|entry| entry.pid);
+        let entity_base = server
+            .world
+            .lock()
+            .expect("world lock")
+            .regions
+            .entity_base(&id);
         let _ = server.ipc.send(
             &id.service_name(),
             kind::REGION_UNLOAD,
@@ -373,7 +417,27 @@ fn maintain_regions(server: &Server) {
             let _ = kill_process(pid);
         }
         server.world.lock().expect("world lock").regions.remove(&id);
+        // 通知在线玩家移除该区域的实体（客户端不感知 region 卸载，需显式 REMOVE_ENTITIES）
+        if let Some(base) = entity_base {
+            remove_region_entities(server, base);
+        }
         info!(id = %id.service_name(), "region unloaded after sleep");
+    }
+}
+
+/// 向所有在线玩家发送 `REMOVE_ENTITIES`，清除一个 region 的实体（卸载信号）。
+fn remove_region_entities(server: &Server, entity_base: i32) {
+    let ids: Vec<i32> =
+        (entity_base..entity_base + crate::region_registry::ENTITY_ID_STRIDE).collect();
+    let players: Vec<Arc<crate::client::Client>> = {
+        let world = server.world.lock().expect("world lock");
+        world.players.values().cloned().collect()
+    };
+    for client in players {
+        let remove = CRemoveEntities {
+            entity_ids: ids.clone(),
+        };
+        let _ = client.send_encoded(CRemoveEntities::packet_id(), |w| remove.encode(w));
     }
 }
 
@@ -399,17 +463,24 @@ fn handle_core_message(server: &Server, message: &icbm_region::protocol::IpcMess
                     .expect("world lock")
                     .regions
                     .mark_registered(&id);
+                let entity_base = server
+                    .world
+                    .lock()
+                    .expect("world lock")
+                    .regions
+                    .entity_base(&id)
+                    .unwrap_or(0);
                 let _ = server.ipc.send(
                     &message.source,
                     kind::REGISTER_ACK,
-                    &encode_register_ack(dim, rx, rz, true),
+                    &encode_register_ack(dim, rx, rz, true, entity_base),
                 );
-                info!(id = %id.service_name(), pid, "region registered");
+                info!(id = %id.service_name(), pid, entity_base, "region registered");
             } else {
                 let _ = server.ipc.send(
                     &message.source,
                     kind::REGISTER_ACK,
-                    &encode_register_ack(dim, rx, rz, false),
+                    &encode_register_ack(dim, rx, rz, false, 0),
                 );
                 warn!(id = %id.service_name(), "rejected unknown region");
             }
@@ -435,6 +506,7 @@ fn handle_core_message(server: &Server, message: &icbm_region::protocol::IpcMess
                 );
         }
         kind::CHUNK_DATA => forward_chunk_data(server, &message.body),
+        kind::ENTITY_DATA => forward_entity_data(server, &message.body),
         kind::REGION_STATS_RESP => {
             // Phase 1：心跳已含统计；统计响应暂不消费
         }
@@ -446,7 +518,7 @@ fn handle_core_message(server: &Server, message: &icbm_region::protocol::IpcMess
 
 /// 转发区块数据给等待中的玩家（含批次包装）。
 fn forward_chunk_data(server: &Server, body: &[u8]) {
-    let Ok((_dim, _cx, _cz, data)) = decode_chunk_data(body) else {
+    let Ok((_dim, cx, cz, data)) = decode_chunk_data(body) else {
         return;
     };
     // 取等待者
@@ -455,6 +527,16 @@ fn forward_chunk_data(server: &Server, body: &[u8]) {
         world.chunk_pending.as_ref().map(|pending| pending.player)
     };
     let Some(player) = player else { return };
+    // 预生成/预加载区块不在当前请求区域内：不转发、不计数（丢弃）
+    {
+        let world = server.world.lock().expect("world lock");
+        if let Some(pending) = world.chunk_pending.as_ref()
+            && pending.player == player
+            && !pending.contains(cx, cz)
+        {
+            return;
+        }
+    }
     let client = {
         let world = server.world.lock().expect("world lock");
         world.players.get(&player).cloned()
@@ -506,6 +588,25 @@ fn forward_chunk_data(server: &Server, body: &[u8]) {
     }
 }
 
+/// 转发 region 的实体包给位于该区域的玩家（`ENTITY_DATA`）。
+fn forward_entity_data(server: &Server, body: &[u8]) {
+    let Ok((_dim, rx, rz, packet_id, payload)) = decode_entity_data(body) else {
+        return;
+    };
+    let players: Vec<Arc<crate::client::Client>> = {
+        let world = server.world.lock().expect("world lock");
+        world
+            .player_regions
+            .iter()
+            .filter(|(_, region)| region.rx == rx && region.rz == rz)
+            .filter_map(|(uuid, _)| world.players.get(uuid).cloned())
+            .collect()
+    };
+    for client in players {
+        let _ = client.send_packet(packet_id, payload);
+    }
+}
+
 /// 从服务名解析 region ID（`icbm.region.o_<rx>_<rz>`）。
 fn parse_region_service_name(name: &str) -> Option<RegionId> {
     let rest = name.strip_prefix("icbm.region.o_")?;
@@ -516,13 +617,16 @@ fn parse_region_service_name(name: &str) -> Option<RegionId> {
     })
 }
 
-/// 终止 region 子进程。
+/// 终止 region 子进程（直接发 SIGTERM 信号，不依赖外部 `kill` 命令——
+/// 保持 release 单二进制自包含，可在最小 Linux 环境运行）。
 fn kill_process(pid: u32) -> std::io::Result<()> {
-    std::process::Command::new("kill")
-        .arg("-TERM")
-        .arg(pid.to_string())
-        .status()
-        .map(|_| ())
+    // SAFETY: 仅向已知子进程 PID 发送 SIGTERM；pid 合法则必有返回。
+    let result = unsafe { libc::kill(i32::try_from(pid).unwrap_or(-1), libc::SIGTERM) };
+    if result == 0 {
+        Ok(())
+    } else {
+        Err(std::io::Error::last_os_error())
+    }
 }
 
 #[cfg(test)]

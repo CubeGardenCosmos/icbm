@@ -26,6 +26,7 @@ use icbm_mc_767::packets::play::clientbound::{
 use icbm_mc_767::packets::play_ids;
 use icbm_mc_767::packets::status::{CPongResponse, CStatusResponse, SPingRequest, SStatusRequest};
 use icbm_mc_767::packets::status_ids;
+use icbm_region::RegionId;
 use tracing::{debug, info, warn};
 use uuid::Uuid;
 
@@ -137,6 +138,12 @@ pub struct Client {
     pub gamemode: Mutex<GameMode>,
     /// 位置。
     pub position: Mutex<Position>,
+    /// 移动速度（方块/秒，由移动包估算；ICBM 快照用）。
+    pub speed: Mutex<f64>,
+    /// 上次位置更新基准（速度估算）。
+    last_move: Mutex<(Position, Instant)>,
+    /// 已发给客户端的区块缓存中心（移动触发区块补充用）。
+    pub chunk_center: Mutex<(i32, i32)>,
     /// 可视距离。
     pub view_distance: AtomicI32,
     /// 是否存活（连接可继续）。
@@ -181,6 +188,18 @@ impl Client {
                 yaw: 0.0,
                 pitch: 0.0,
             }),
+            speed: Mutex::new(0.0),
+            last_move: Mutex::new((
+                Position {
+                    x: 0.0,
+                    y: 4.0,
+                    z: 0.0,
+                    yaw: 0.0,
+                    pitch: 0.0,
+                },
+                Instant::now(),
+            )),
+            chunk_center: Mutex::new((0, 0)),
             view_distance: AtomicI32::new(8),
             alive: AtomicBool::new(true),
             keep_alive: Mutex::new(None),
@@ -301,6 +320,36 @@ impl Client {
             .lock()
             .expect("keep alive lock")
             .is_some_and(|(_, sent)| sent.elapsed() > timeout)
+    }
+
+    /// 记录一次位置更新并估算移动速度（方块/秒，3D 距离/间隔，EMA 平滑）。
+    ///
+    /// 间隔超出 [20ms, 2s] 视为传送/停滞：只更新基准不改变速度。
+    pub fn note_move(&self) {
+        let now = Instant::now();
+        let position = *self.position.lock().expect("position");
+        let mut last = self.last_move.lock().expect("last move");
+        let dt = now.duration_since(last.1).as_secs_f64();
+        if (0.02..=2.0).contains(&dt) {
+            let distance = ((position.x - last.0.x).powi(2)
+                + (position.y - last.0.y).powi(2)
+                + (position.z - last.0.z).powi(2))
+            .sqrt();
+            let instant = (distance / dt).clamp(0.0, 100.0);
+            let mut speed = self.speed.lock().expect("speed");
+            *speed = if *speed <= 0.0 {
+                instant
+            } else {
+                *speed * 0.5 + instant * 0.5
+            };
+        }
+        *last = (position, now);
+    }
+
+    /// 重置速度基准（传送/进服后调用，避免把传送位移计入速度）。
+    pub fn reset_move_baseline(&self) {
+        let position = *self.position.lock().expect("position");
+        *self.last_move.lock().expect("last move") = (position, Instant::now());
     }
 }
 
@@ -644,6 +693,10 @@ fn send_config_data(client: &Arc<Client>) -> Result<(), NetError> {
 
 /// 进入 Play：加入游戏 → 区块加载 → 位置同步。
 pub fn enter_play(server: &Server, client: &Arc<Client>) -> Result<(), NetError> {
+    // 出生游戏模式（配置缺省；`Client::new` 默认生存）
+    if let Some(mode) = GameMode::from_id(server.config.default_gamemode) {
+        *client.gamemode.lock().expect("gamemode") = mode;
+    }
     send_join_sequence(server, client)?;
 
     // 服务器声明可接收 `icbm_client:state_subscription`（C2S 通道）。
@@ -668,7 +721,16 @@ pub fn enter_play(server: &Server, client: &Arc<Client>) -> Result<(), NetError>
             .players
             .insert(*client.uuid.lock().expect("uuid"), Arc::clone(client));
     }
-
+    // 玩家所在 region（实体/区块转发用；先于区块加载设置，避免进服早期
+    // region 发来的实体包被丢弃）
+    {
+        let position = client.position.lock().expect("position");
+        let region = RegionId::from_overworld_chunk(position.chunk_x(), position.chunk_z());
+        let mut world = server.world.lock().expect("world lock");
+        let _ = world
+            .player_regions
+            .insert(*client.uuid.lock().expect("uuid"), region);
+    }
     // 区块加载（先发“区块即将到达”让客户端显示加载界面）
     client.send_encoded(CGameEvent::packet_id(), |w| {
         CGameEvent {
@@ -694,6 +756,8 @@ pub fn enter_play(server: &Server, client: &Arc<Client>) -> Result<(), NetError>
         }
         .encode(w);
     })?;
+    // 传送后重置速度基准，避免把进服位移计入速度
+    client.reset_move_baseline();
 
     let name = client.name.lock().expect("name").clone();
     info!(name = %name, "player entered the world");
@@ -785,7 +849,7 @@ fn send_join_sequence(server: &Server, client: &Arc<Client>) -> Result<(), NetEr
         .encode(w);
     })?;
     client.send_encoded(icbm_mc_767::packets::play_ids::CLIENTBOUND_COMMANDS, |w| {
-        icbm_mc_767::packets::play::clientbound::CCommands.encode(w);
+        crate::net::play::build_command_tree().encode(w);
     })?;
     Ok(())
 }
@@ -825,6 +889,9 @@ fn on_disconnect(server: &Server, client: &Arc<Client>) {
     {
         let name = client.name.lock().expect("name").clone();
         info!(name = %name, "player left");
+        world
+            .player_regions
+            .remove(&*client.uuid.lock().expect("uuid"));
         if let Some(pending) = &world.chunk_pending
             && pending.player == *client.uuid.lock().expect("uuid")
         {

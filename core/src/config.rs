@@ -2,9 +2,13 @@
 
 use std::path::PathBuf;
 
+use tracing_subscriber::filter::LevelFilter;
+
 /// 服务器配置（Phase 1 全部来自命令行/默认值，文件配置后续阶段加入）。
 #[derive(Debug, Clone)]
 pub struct ServerConfig {
+    /// 日志级别（`--log-level`，默认 INFO；同时传递给 region 子进程）。
+    pub log_level: LevelFilter,
     /// 监听地址。
     pub address: String,
     /// 世界目录。
@@ -35,6 +39,7 @@ pub struct ServerConfig {
 impl Default for ServerConfig {
     fn default() -> Self {
         Self {
+            log_level: LevelFilter::INFO,
             address: "0.0.0.0:25565".to_owned(),
             world_dir: PathBuf::from("world"),
             shm_name: "/icbm".to_owned(),

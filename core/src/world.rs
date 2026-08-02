@@ -6,6 +6,7 @@ use std::sync::Arc;
 
 use icbm_gameplay_minecraft::gamerules::GameRuleStore;
 use icbm_mc_767::packets::play::BlockPos;
+use icbm_region::RegionId;
 use uuid::Uuid;
 
 use crate::client::Client;
@@ -22,6 +23,19 @@ pub struct ChunkPending {
     pub received: usize,
     /// 是否已发批次开始。
     pub in_batch: bool,
+    /// 请求区域（区块坐标，含边界）；区域外 chunk（预生成等）不转发也不计数。
+    pub min_x: i32,
+    pub max_x: i32,
+    pub min_z: i32,
+    pub max_z: i32,
+}
+
+impl ChunkPending {
+    /// 该区块是否属于本请求区域。
+    #[must_use]
+    pub const fn contains(&self, cx: i32, cz: i32) -> bool {
+        cx >= self.min_x && cx <= self.max_x && cz >= self.min_z && cz <= self.max_z
+    }
 }
 
 /// 共享世界状态（各线程经锁访问）。
@@ -34,6 +48,8 @@ pub struct WorldState {
     pub regions: RegionRegistry,
     /// 全局串行的区块请求。
     pub chunk_pending: Option<ChunkPending>,
+    /// 玩家当前所在 region（UUID → region；实体/区块转发用）。
+    pub player_regions: HashMap<Uuid, RegionId>,
     /// 世界目录。
     pub world_dir: PathBuf,
     /// 世界出生点。
@@ -49,6 +65,7 @@ impl WorldState {
             gamerules: GameRuleStore::new(),
             regions: RegionRegistry::new(),
             chunk_pending: None,
+            player_regions: HashMap::new(),
             world_dir,
             spawn: BlockPos::new(0, 4, 0),
         }

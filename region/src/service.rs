@@ -5,13 +5,16 @@ use std::fmt;
 use std::path::PathBuf;
 use std::time::{Duration, Instant};
 
+use icbm_mc_767::codec::Writer;
+use icbm_mc_767::packets::play::clientbound::{CAddEntity, CMoveEntityPos};
+use icbm_mc_767::packets::play_ids;
 use tracing::{debug, error, info, warn};
 use uuid::Uuid;
 
 use crate::protocol::{
     CORE_SERVICE, DIM_OVERWORLD, Ipc, IpcError, IpcMessage, decode_chunk_request,
     decode_player_enter, decode_player_leave, decode_register_ack, encode_chunk_data,
-    encode_heartbeat, encode_register, encode_stats, kind,
+    encode_entity_data, encode_heartbeat, encode_register, encode_stats, kind,
 };
 use crate::store::ChunkStore;
 use crate::{Face, RegionId};
@@ -148,6 +151,32 @@ impl Ticker {
     }
 }
 
+/// Creeper 实体类型注册表 ID（vanilla 1.21.1 `EntityType` 注册序，对照 master
+/// `data/src/generated/entity_type.rs`：`CREEPER` = 23）。
+const ENTITY_TYPE_CREEPER: i32 = 23;
+/// 每区域最多存活的漫游 Creeper 数（实体 ID 取 `[entity_base, entity_base+12)`）。
+const MAX_CREEPERS: usize = 12;
+/// 每 tick 生成 Creeper 的概率（约 6 秒一只）。
+const SPAWN_CHANCE: f64 = 1.0 / 120.0;
+/// 每 tick 游走的概率。
+const WANDER_CHANCE: f64 = 1.0 / 3.0;
+/// Creeper 出生高度（flat 地表 y=3 之上）。
+const CREEPER_SPAWN_Y: f64 = 4.0;
+
+/// 区域内一只漫游 Creeper（不攻击，仅作 region 存活/卸载信号）。
+struct Creeper {
+    /// 实体 ID（`entity_base + 生成序`）。
+    entity_id: i32,
+    /// 实体 UUID。
+    uuid: Uuid,
+    /// X（方块）。
+    x: f64,
+    /// Z（方块）。
+    z: f64,
+    /// 偏航角（度）。
+    yaw: f32,
+}
+
 /// region 服务。
 pub struct RegionService {
     config: RegionConfig,
@@ -160,6 +189,12 @@ pub struct RegionService {
     unknown_messages: u64,
     /// 待发送区块（每 tick 分批冲刷）。
     pending_chunks: std::collections::VecDeque<(Face, i32, i32)>,
+    /// core 分配的实体 ID 基址（`REGISTER_ACK`）。
+    entity_base: i32,
+    /// 区域内漫游 Creeper（region 存活信号）。
+    creepers: Vec<Creeper>,
+    /// xorshift64 状态（种子取自区域坐标，固定种子可复现）。
+    rng: u64,
 }
 
 impl RegionService {
@@ -174,6 +209,9 @@ impl RegionService {
             config.auth_token.clone(),
         )?;
         let store = ChunkStore::open(&config.world_dir, config.id)?;
+        // 确定性 RNG 种子：区域坐标哈希（固定种子可复现，AGENTS 要求）。
+        let rng = (u64::from(config.id.rx as u32)).wrapping_mul(0x9E37_79B9_7F4A_7C15)
+            ^ (u64::from(config.id.rz as u32)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
         Ok(Self {
             config,
             ipc,
@@ -184,6 +222,9 @@ impl RegionService {
             running: true,
             unknown_messages: 0,
             pending_chunks: std::collections::VecDeque::new(),
+            entity_base: 0,
+            creepers: Vec::new(),
+            rng: rng | 1,
         })
     }
 
@@ -229,9 +270,10 @@ impl RegionService {
                 debug!(kind = message.kind, "ignoring message during registration");
                 continue;
             }
-            let (dim, rx, rz, ok) = decode_register_ack(&message.body)?;
+            let (dim, rx, rz, ok, entity_base) = decode_register_ack(&message.body)?;
             if dim == DIM_OVERWORLD && rx == self.config.id.rx && rz == self.config.id.rz {
                 if ok {
+                    self.entity_base = entity_base.unwrap_or(0);
                     self.state = RegionState::Simulating;
                     info!(id = %self.config.id.service_name(), "region registered");
                     return Ok(());
@@ -247,7 +289,8 @@ impl RegionService {
         self.ticker.begin();
         self.drain_messages()?;
         self.flush_chunks()?;
-        // Phase 1 世界 tick 为空（无实体/方块更新），仅维持 TPS 与心跳
+        // Phase 1 世界 tick：仅随机漫游 Creeper（region 存活信号）
+        self.tick_creepers()?;
         let tps = self.ticker.end();
         if self.ticker.should_heartbeat() {
             self.send_heartbeat(tps);
@@ -315,6 +358,8 @@ impl RegionService {
                 let (uuid, _, _) = decode_player_enter(&message.body)?;
                 self.players.insert(uuid);
                 debug!(%uuid, "player entered region");
+                // 把已存在的 Creeper 补发给新进入的玩家（客户端需 ADD_ENTITY 才渲染）
+                self.resend_creepers()?;
             }
             kind::PLAYER_LEAVE => {
                 let uuid = decode_player_leave(&message.body)?;
@@ -367,6 +412,140 @@ impl RegionService {
                 self.pending_chunks.push_back((face, cx + dx, cz + dz));
             }
         }
+    }
+
+    /// xorshift64 随机数。
+    const fn next_random(&mut self) -> u64 {
+        self.rng ^= self.rng << 13;
+        self.rng ^= self.rng >> 7;
+        self.rng ^= self.rng << 17;
+        self.rng
+    }
+
+    /// [0,1) 均匀随机。
+    fn rand_f64(&mut self) -> f64 {
+        (self.next_random() >> 11) as f64 / (1u64 << 53) as f64
+    }
+
+    /// 随机漫游 Creeper：随机生成新个体并让已有个体游走。
+    fn tick_creepers(&mut self) -> Result<(), RegionError> {
+        if self.creepers.len() < MAX_CREEPERS && self.rand_f64() < SPAWN_CHANCE {
+            self.spawn_creeper()?;
+        }
+        let min_x = f64::from(self.config.id.rx) * 512.0;
+        let min_z = f64::from(self.config.id.rz) * 512.0;
+        // 先预掷随机数再逐个体决策，避免同时借用 self.rng 与 self.creepers。
+        let rolls: Vec<(bool, u64)> = (0..self.creepers.len())
+            .map(|_| (self.rand_f64() < WANDER_CHANCE, self.next_random() % 4))
+            .collect();
+        let mut moves: Vec<(i32, i16, i16)> = Vec::new();
+        for (creeper, (wander, dir)) in self.creepers.iter_mut().zip(rolls) {
+            if !wander {
+                continue;
+            }
+            let (dx, dz) = match dir {
+                0 => (1, 0),
+                1 => (-1, 0),
+                2 => (0, 1),
+                _ => (0, -1),
+            };
+            let next_x = creeper.x + f64::from(dx);
+            let next_z = creeper.z + f64::from(dz);
+            // 不越出本区域 512×512 方块边界（区域外归相邻 region 模拟）
+            if !(min_x..min_x + 512.0).contains(&next_x)
+                || !(min_z..min_z + 512.0).contains(&next_z)
+            {
+                continue;
+            }
+            creeper.x = next_x;
+            creeper.z = next_z;
+            moves.push((creeper.entity_id, (dx * 4096) as i16, (dz * 4096) as i16));
+        }
+        for (entity_id, delta_x, delta_z) in moves {
+            let move_pos = CMoveEntityPos {
+                entity_id,
+                delta_x,
+                delta_y: 0,
+                delta_z,
+                on_ground: true,
+            };
+            self.send_entity_packet(play_ids::CLIENTBOUND_MOVE_ENTITY_POS, |w| {
+                move_pos.encode(w);
+            })?;
+        }
+        Ok(())
+    }
+
+    /// 在区域内随机位置生成一只 Creeper 并广播 `ADD_ENTITY`。
+    fn spawn_creeper(&mut self) -> Result<(), RegionError> {
+        let index = self.creepers.len();
+        let entity_id = self.entity_base + i32::try_from(index).unwrap_or(i32::MAX);
+        let cx = self.config.id.rx * 32 + (self.next_random() % 32) as i32;
+        let cz = self.config.id.rz * 32 + (self.next_random() % 32) as i32;
+        let creeper = Creeper {
+            entity_id,
+            uuid: Uuid::new_v4(),
+            x: f64::from(cx * 16) + self.rand_f64() * 16.0,
+            z: f64::from(cz * 16) + self.rand_f64() * 16.0,
+            yaw: (self.rand_f64() * 360.0) as f32,
+        };
+        self.send_entity_packet(play_ids::CLIENTBOUND_ADD_ENTITY, |w| {
+            CAddEntity {
+                entity_id: creeper.entity_id,
+                uuid: creeper.uuid,
+                entity_type: ENTITY_TYPE_CREEPER,
+                x: creeper.x,
+                y: CREEPER_SPAWN_Y,
+                z: creeper.z,
+                pitch: 0.0,
+                yaw: creeper.yaw,
+            }
+            .encode(w);
+        })?;
+        debug!(entity_id, "creeper spawned");
+        self.creepers.push(creeper);
+        Ok(())
+    }
+
+    /// 玩家进入后补发所有已有 Creeper 的 `ADD_ENTITY`。
+    fn resend_creepers(&self) -> Result<(), RegionError> {
+        for creeper in &self.creepers {
+            let add = CAddEntity {
+                entity_id: creeper.entity_id,
+                uuid: creeper.uuid,
+                entity_type: ENTITY_TYPE_CREEPER,
+                x: creeper.x,
+                y: CREEPER_SPAWN_Y,
+                z: creeper.z,
+                pitch: 0.0,
+                yaw: creeper.yaw,
+            };
+            self.send_entity_packet(play_ids::CLIENTBOUND_ADD_ENTITY, |w| add.encode(w))?;
+        }
+        Ok(())
+    }
+
+    /// 经 `ENTITY_DATA` 把 clientbound 包交给 core 转发给本区域玩家。
+    fn send_entity_packet(
+        &self,
+        packet_id: i32,
+        encode: impl FnOnce(&mut Writer),
+    ) -> Result<(), RegionError> {
+        let mut writer = Writer::new();
+        encode(&mut writer);
+        let payload = writer.into_bytes();
+        self.ipc.send_retry(
+            CORE_SERVICE,
+            kind::ENTITY_DATA,
+            &encode_entity_data(
+                DIM_OVERWORLD,
+                self.config.id.rx,
+                self.config.id.rz,
+                packet_id,
+                &payload,
+            ),
+        )?;
+        Ok(())
     }
 
     /// 每 tick 最多发送固定数量的区块，避免一次性灌满 datarouter channel

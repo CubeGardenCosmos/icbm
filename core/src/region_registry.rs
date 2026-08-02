@@ -8,6 +8,7 @@ use std::time::{Duration, Instant};
 
 use icbm_region::RegionId;
 use tracing::{info, warn};
+use tracing_subscriber::filter::LevelFilter;
 
 /// region 运行信息。
 #[derive(Debug, Clone)]
@@ -30,10 +31,12 @@ pub struct RegionEntry {
     pub tick_count: u32,
     /// 已加载区块数。
     pub loaded_chunks: u32,
+    /// 实体 ID 基址（core 分配；区域内实体 ID ∈ [base, base+999]，卸载时据此清理）。
+    pub entity_base: i32,
 }
 
 impl RegionEntry {
-    fn new(pid: u32) -> Self {
+    fn new(pid: u32, entity_base: i32) -> Self {
         Self {
             pid,
             alive: false,
@@ -44,6 +47,7 @@ impl RegionEntry {
             avg_tick_ms: 0.0,
             tick_count: 0,
             loaded_chunks: 0,
+            entity_base,
         }
     }
 }
@@ -52,13 +56,21 @@ impl RegionEntry {
 #[derive(Debug, Default)]
 pub struct RegionRegistry {
     entries: HashMap<(i32, i32), RegionEntry>,
+    next_entity_base: i32,
 }
+
+/// 每个 region 的实体 ID 段宽度（core 按段分配，卸载时整段清除）。
+pub const ENTITY_ID_STRIDE: i32 = 1000;
 
 impl RegionRegistry {
     /// 新建空注册表。
     #[must_use]
     pub fn new() -> Self {
-        Self::default()
+        Self {
+            entries: HashMap::new(),
+            // 实体 ID 从 1000 起分配，避开玩家实体 ID（1）。
+            next_entity_base: ENTITY_ID_STRIDE,
+        }
     }
 
     /// 当前是否有活动或已注册的 region。
@@ -73,12 +85,22 @@ impl RegionRegistry {
         self.entries.get(&(id.rx, id.rz))
     }
 
+    /// region 的实体 ID 基址。
+    #[must_use]
+    pub fn entity_base(&self, id: &RegionId) -> Option<i32> {
+        self.get(id).map(|entry| entry.entity_base)
+    }
+
     /// 拉起 region 子进程（已存在则不重复拉起）。
+    ///
+    /// `log_level` 与 core 一致地传给子进程（region 经同一二进制 `--region` 入口，
+    /// 在 `main` 中按 `--log-level` 初始化 tracing）。
     pub fn spawn(
         &mut self,
         id: &RegionId,
         world_dir: &std::path::Path,
         shm_name: &str,
+        log_level: LevelFilter,
     ) -> Result<(), std::io::Error> {
         if let Some(entry) = self.entries.get(&(id.rx, id.rz))
             && entry.alive
@@ -97,11 +119,20 @@ impl RegionRegistry {
             .arg("--world")
             .arg(world_dir)
             .arg("--shm")
-            .arg(shm_name);
+            .arg(shm_name)
+            .arg("--log-level")
+            .arg(level_filter_str(log_level));
         let child = command.spawn()?;
         let pid = child.id();
         info!(id = %id.service_name(), pid, "spawned region process");
-        self.entries.insert((id.rx, id.rz), RegionEntry::new(pid));
+        // 实体 ID 段分配：从 1000 起每 region 一段，避免与玩家实体 ID 冲突。
+        let entity_base = self.next_entity_base;
+        self.next_entity_base = self
+            .next_entity_base
+            .checked_add(ENTITY_ID_STRIDE)
+            .unwrap_or(ENTITY_ID_STRIDE);
+        self.entries
+            .insert((id.rx, id.rz), RegionEntry::new(pid, entity_base));
         Ok(())
     }
 
@@ -211,4 +242,16 @@ impl RegionRegistry {
 /// 记录失联告警。
 pub fn warn_timed_out(id: &RegionId) {
     warn!(id = %id.service_name(), "region heartbeat timeout, marked dead");
+}
+
+/// `LevelFilter` → `--log-level` 参数值（供 region 子进程复用同一过滤级别）。
+const fn level_filter_str(level: LevelFilter) -> &'static str {
+    match level {
+        LevelFilter::OFF => "off",
+        LevelFilter::ERROR => "error",
+        LevelFilter::WARN => "warn",
+        LevelFilter::INFO => "info",
+        LevelFilter::DEBUG => "debug",
+        LevelFilter::TRACE => "trace",
+    }
 }

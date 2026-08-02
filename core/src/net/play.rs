@@ -7,9 +7,11 @@ use std::time::{Duration, Instant};
 use icbm_gameplay_icbm::bmtool::{BmToolTpsData, format_bmtool_tps};
 use icbm_gameplay_minecraft::commands::{self, Command};
 use icbm_mc_767::codec::Reader;
+use icbm_mc_767::packets::play::clientbound::{CCommandSuggestions, CCommands, CommandTreeNode};
 use icbm_mc_767::packets::play::serverbound::{
-    SChatCommand, SChatMessage, SConfirmTeleport, SKeepAlive, SMovePlayerPos, SMovePlayerPosRot,
-    SMovePlayerRot, SMovePlayerStatusOnly, SPlayerAction, SSwing,
+    SChatAck, SChatCommand, SChatCommandSigned, SChatMessage, SCommandSuggestionRequest,
+    SConfirmTeleport, SKeepAlive, SMovePlayerPos, SMovePlayerPosRot, SMovePlayerRot,
+    SMovePlayerStatusOnly, SPlayerAction, SSwing,
 };
 use icbm_mc_767::packets::play_ids;
 use icbm_region::RegionId;
@@ -43,6 +45,10 @@ pub fn load_initial_chunks(server: &Server, client: &Arc<Client>) -> Result<(), 
             total,
             received: 0,
             in_batch: false,
+            min_x: chunk_x - radius,
+            max_x: chunk_x + radius,
+            min_z: chunk_z - radius,
+            max_z: chunk_z + radius,
         });
     }
     server.ipc.send(
@@ -64,13 +70,119 @@ pub fn load_initial_chunks(server: &Server, client: &Arc<Client>) -> Result<(), 
             .chunk_pending
             .is_none();
         if done {
-            return Ok(());
+            break;
         }
         if Instant::now() > deadline {
             server.world.lock().expect("world lock").chunk_pending = None;
             return Err(NetError::RegionTimeout);
         }
         std::thread::sleep(Duration::from_millis(50));
+    }
+
+    // 以玩家所在 region 为中心预拉相邻 3×3 子 region（启动子进程并生成地形）
+    preload_neighbor_regions(server, client);
+    Ok(())
+}
+
+/// 请求玩家当前位置周边的区块并转发给客户端（移动触发）。
+///
+/// 对照 vanilla `PlayerChunkWatchingManager`：客户端可视中心移出已发中心
+/// `view/2` 时重新请求整个视野，并更新 `SetChunkCacheCenter`。
+pub fn request_chunks_around(
+    server: &Server,
+    client: &Arc<Client>,
+    chunk_x: i32,
+    chunk_z: i32,
+) -> Result<(), NetError> {
+    let region_id = RegionId::from_overworld_chunk(chunk_x, chunk_z);
+    server.ensure_region(region_id)?;
+
+    let radius = client
+        .view_distance
+        .load(std::sync::atomic::Ordering::Relaxed)
+        .clamp(2, 32);
+    let side = 2 * radius + 1;
+    let total = usize::try_from(side).expect("radius").pow(2);
+    {
+        let mut world = server.world.lock().expect("world lock");
+        let _ = world.chunk_pending.insert(ChunkPending {
+            player: *client.uuid.lock().expect("uuid"),
+            total,
+            received: 0,
+            in_batch: false,
+            min_x: chunk_x - radius,
+            max_x: chunk_x + radius,
+            min_z: chunk_z - radius,
+            max_z: chunk_z + radius,
+        });
+    }
+    server.ipc.send(
+        &region_id.service_name(),
+        icbm_region::protocol::kind::CHUNK_REQUEST,
+        &encode_chunk_request(DIM_OVERWORLD, chunk_x, chunk_z, radius),
+    )?;
+    *client.chunk_center.lock().expect("chunk center") = (chunk_x, chunk_z);
+    client.send_encoded(
+        icbm_mc_767::packets::play_ids::CLIENTBOUND_SET_CHUNK_CACHE_CENTER,
+        |w| {
+            icbm_mc_767::packets::play::clientbound::CSetChunkCacheCenter { chunk_x, chunk_z }
+                .encode(w);
+        },
+    )?;
+    Ok(())
+}
+
+/// 预拉相邻 region：拉起周边 3×3 子 region 并请求少量区块（半径 0）让地形
+/// 提前生成，避免玩家跨区时无地可站直接落入虚空。
+///
+/// 说明：README 的 9×9 预生成超出 datarouter 端口上限（`DATAROUTER_MAX_PORTS`=64，
+/// 9×9=81 > 64），Phase 1 改为相邻 3×3（9 个 region，含自身）；更远处由
+/// 移动触发的 `request_chunks_around` 按需拉起。预生成区块不设 `ChunkPending`，
+/// core 侧按请求区域过滤后丢弃；数据仅为让子进程生成并落盘（region 的
+/// `network_chunk_payload` 内存缓存 + 卸载时 `flush` 写回 .mca）。
+pub fn preload_neighbor_regions(server: &Server, client: &Arc<Client>) {
+    let position = client.position.lock().expect("position");
+    let center = RegionId::from_overworld_chunk(position.chunk_x(), position.chunk_z());
+    drop(position);
+    let world_dir = {
+        let world = server.world.lock().expect("world lock");
+        world.world_dir.clone()
+    };
+    for drx in -1..=1 {
+        for drz in -1..=1 {
+            let id = RegionId {
+                rx: center.rx + drx,
+                rz: center.rz + drz,
+            };
+            let known = server
+                .world
+                .lock()
+                .expect("world lock")
+                .regions
+                .contains(&id);
+            if known {
+                continue;
+            }
+            let spawn_result = {
+                let mut world = server.world.lock().expect("world lock");
+                world.regions.spawn(
+                    &id,
+                    &world_dir,
+                    &server.config.shm_name,
+                    server.config.log_level,
+                )
+            };
+            if let Err(err) = spawn_result {
+                warn!(id = %id.service_name(), %err, "preload spawn failed");
+                continue;
+            }
+            // 半径 0：只生成 region 中心区块作为“地形已生成”信号，不转发给玩家
+            let _ = server.ipc.send(
+                &id.service_name(),
+                icbm_region::protocol::kind::CHUNK_REQUEST,
+                &encode_chunk_request(DIM_OVERWORLD, id.rx * 32 + 16, id.rz * 32 + 16, 0),
+            );
+        }
     }
 }
 
@@ -89,9 +201,21 @@ pub fn handle_play_packet(
             let packet = SChatCommand::decode(reader)?;
             handle_player_command(server, client, &packet.command);
         }
+        play_ids::SERVERBOUND_CHAT_COMMAND_SIGNED => {
+            // 安全聊天永不支持：解码签名结构后忽略签名，按未签名命令执行。
+            let packet = SChatCommandSigned::decode(reader)?;
+            handle_player_command(server, client, &packet.command);
+        }
         play_ids::SERVERBOUND_CHAT => {
             let packet = SChatMessage::decode(reader)?;
             broadcast_chat(server, client, &packet.message);
+        }
+        play_ids::SERVERBOUND_CHAT_ACK => {
+            let _ = SChatAck::decode(reader)?;
+        }
+        play_ids::SERVERBOUND_COMMAND_SUGGESTION => {
+            let packet = SCommandSuggestionRequest::decode(reader)?;
+            handle_command_suggestion(server, client, &packet)?;
         }
         play_ids::SERVERBOUND_CHUNK_BATCH_RECEIVED => {
             let _ = icbm_mc_767::packets::play::serverbound::SChunkBatchReceived::decode(reader)?;
@@ -157,7 +281,7 @@ pub fn handle_play_packet(
     Ok(())
 }
 
-/// 更新玩家位置；跨 region 时通知新旧 region。
+/// 更新玩家位置；跨 region 时通知新旧 region，移动超出已发中心时补充区块。
 fn update_position(
     server: &Server,
     client: &Arc<Client>,
@@ -167,15 +291,45 @@ fn update_position(
         let position = client.position.lock().expect("position");
         RegionId::from_overworld_chunk(position.chunk_x(), position.chunk_z())
     };
+    let mut position = client.position.lock().expect("position");
+    apply(&mut position);
+    drop(position);
+    client.note_move();
+
     let new_region = {
-        let mut position = client.position.lock().expect("position");
-        apply(&mut position);
+        let position = client.position.lock().expect("position");
         RegionId::from_overworld_chunk(position.chunk_x(), position.chunk_z())
     };
-    if old_region != new_region {
+    let (chunk_x, chunk_z) = {
+        let position = client.position.lock().expect("position");
+        (position.chunk_x(), position.chunk_z())
+    };
+    let region_changed = old_region != new_region;
+    if region_changed {
         server.notify_player_leave(client, &old_region)?;
         server.ensure_region(new_region)?;
         server.notify_player_enter(client, &new_region)?;
+        {
+            let mut world = server.world.lock().expect("world lock");
+            let _ = world
+                .player_regions
+                .insert(*client.uuid.lock().expect("uuid"), new_region);
+        }
+        // 跨区后以新 region 为中心预拉相邻 3×3，提前启动子进程并生成地形
+        preload_neighbor_regions(server, client);
+    }
+
+    // 客户端可视中心落后超过 view/2 区块，或跨区：重新请求视野区块
+    let view = client
+        .view_distance
+        .load(std::sync::atomic::Ordering::Relaxed)
+        .clamp(2, 32);
+    let needs_chunks = region_changed || {
+        let center = *client.chunk_center.lock().expect("chunk center");
+        (chunk_x - center.0).abs() > view / 2 || (chunk_z - center.1).abs() > view / 2
+    };
+    if needs_chunks {
+        request_chunks_around(server, client, chunk_x, chunk_z)?;
     }
     Ok(())
 }
@@ -206,9 +360,17 @@ fn handle_player_command(server: &Server, client: &Arc<Client>, command: &str) {
             let _ = client.send_system_chat(&feedback, false);
         }
         Some(Command::GameRule { rule, value }) => {
-            let mut world = server.world.lock().expect("world lock");
-            let feedback = commands::apply_gamerule(&mut world.gamerules, &rule, value.as_deref());
-            let _ = client.send_system_chat(&feedback.unwrap_or_else(|err| err), false);
+            let (feedback, ok) = {
+                let mut world = server.world.lock().expect("world lock");
+                let feedback =
+                    commands::apply_gamerule(&mut world.gamerules, &rule, value.as_deref());
+                let ok = feedback.is_ok();
+                (feedback.unwrap_or_else(|err| err), ok)
+            };
+            let _ = client.send_system_chat(&feedback, false);
+            if ok {
+                server.persist_gamerules();
+            }
         }
         Some(Command::Help) => {
             let _ = client.send_system_chat("可用命令: /gamemode, /gamerule, /bmtool tps", false);
@@ -221,6 +383,168 @@ fn handle_player_command(server: &Server, client: &Arc<Client>, command: &str) {
         let position = client.position.lock().expect("position");
         let data = bmtool_tps_data(server, Some((position.chunk_x(), position.chunk_z())));
         let _ = client.send_system_chat(&format_bmtool_tps(&data), false);
+    }
+}
+
+/// 全部顶层命令名（minecraft 命名空间 + icbm 命名空间 `bmtool`；升序，与
+/// `command_suggestions` 的排序约定一致）。
+const TOP_LEVEL_COMMANDS: &[&str] = &["bmtool", "gamemode", "gamerule", "help"];
+
+/// 构建客户端命令树（0x11 `CommandTreeS2CPacket`）。
+///
+/// 根节点 → gamemode/gamerule/bmtool/help；参数统一用 `brigadier:string`：
+/// 该类型无内置建议源，客户端对参数按 Tab 会发 0x0B 请求、由服务器回补全。
+#[must_use]
+pub fn build_command_tree() -> CCommands {
+    use CommandTreeNode as Node;
+    CCommands {
+        nodes: vec![
+            Node::Root {
+                children: vec![1, 2, 3, 4],
+            },
+            Node::Literal {
+                name: "gamemode".to_owned(),
+                children: vec![5],
+            },
+            Node::Literal {
+                name: "gamerule".to_owned(),
+                children: vec![6],
+            },
+            Node::Literal {
+                name: "bmtool".to_owned(),
+                children: vec![7],
+            },
+            Node::Literal {
+                name: "help".to_owned(),
+                children: vec![],
+            },
+            Node::Argument {
+                name: "mode".to_owned(),
+                children: vec![8],
+            },
+            Node::Argument {
+                name: "rule".to_owned(),
+                children: vec![9],
+            },
+            Node::Literal {
+                name: "tps".to_owned(),
+                children: vec![],
+            },
+            Node::Argument {
+                name: "target".to_owned(),
+                children: vec![],
+            },
+            Node::Argument {
+                name: "value".to_owned(),
+                children: vec![],
+            },
+        ],
+    }
+}
+
+/// 处理客户端命令补全请求（0x0B `RequestCommandCompletionsC2SPacket` → 0x10）。
+fn handle_command_suggestion(
+    server: &Server,
+    client: &Arc<Client>,
+    packet: &SCommandSuggestionRequest,
+) -> Result<(), NetError> {
+    let (start, length, suggestions) = command_suggestions(server, &packet.command);
+    client.send_encoded(
+        icbm_mc_767::packets::play_ids::CLIENTBOUND_COMMAND_SUGGESTIONS,
+        |w| {
+            CCommandSuggestions {
+                id: packet.id,
+                start,
+                length,
+                suggestions,
+            }
+            .encode(w);
+        },
+    )
+}
+
+/// 计算命令补全建议与替换区间。
+///
+/// 客户端请求文本含前导 `/`（对照 master `handle_command_suggestion` 的
+/// `get(1..)`）。`start`/`length` 覆盖正在输入的最后一个词；字面量已完整时
+/// （如 `/gamemode`）区间为空、补全其第一个参数。
+fn command_suggestions(server: &Server, input: &str) -> (i32, i32, Vec<String>) {
+    let Some(body) = input.strip_prefix('/') else {
+        return (0, 0, Vec::new());
+    };
+    let slash = input.len() - body.len();
+    if body.is_empty() {
+        return (i32::try_from(slash).unwrap_or(0), 0, top_level_commands());
+    }
+    let tokens: Vec<&str> = body.split_whitespace().collect();
+    let ends_with_space = body.ends_with(char::is_whitespace);
+    // 正在输入的词：尾部空格 → 空词；单词且是完整命令 → 其第一个参数；否则末词。
+    let (context, typing, start): (Vec<&str>, &str, usize) =
+        if ends_with_space || (tokens.len() == 1 && is_known_command(tokens[0])) {
+            (tokens.clone(), "", input.len())
+        } else if let Some((last, rest)) = tokens.split_last() {
+            let start = input.rfind(' ').map_or(slash, |i| i + 1);
+            (rest.to_vec(), last, start)
+        } else {
+            (Vec::new(), "", slash)
+        };
+    let mut candidates = match context.as_slice() {
+        [] => top_level_commands(),
+        ["gamemode"] => vec!["survival", "creative", "adventure", "spectator"]
+            .into_iter()
+            .map(str::to_owned)
+            .collect(),
+        ["gamemode", _] => online_player_names(server),
+        ["gamerule"] => icbm_gameplay_minecraft::gamerules::GAME_RULES
+            .iter()
+            .map(|rule| rule.name.to_owned())
+            .collect(),
+        ["gamerule", rule] => gamerule_value_suggestions(rule),
+        ["bmtool"] => vec!["tps".to_owned()],
+        _ => Vec::new(),
+    };
+    candidates.retain(|candidate| candidate.starts_with(typing));
+    candidates.sort();
+    candidates.dedup();
+    let length = input.len().saturating_sub(start);
+    (
+        i32::try_from(start).unwrap_or(0),
+        i32::try_from(length).unwrap_or(0),
+        candidates,
+    )
+}
+
+/// 顶层命令名（minecraft 命名空间 + icbm 命名空间）。
+fn top_level_commands() -> Vec<String> {
+    TOP_LEVEL_COMMANDS
+        .iter()
+        .map(|name| (*name).to_owned())
+        .collect()
+}
+
+/// token 是否为已知顶层命令（字面量已完整）。
+fn is_known_command(token: &str) -> bool {
+    TOP_LEVEL_COMMANDS.contains(&token)
+}
+
+/// 在线玩家名（`/gamemode <mode> <target>` 的第三段）。
+fn online_player_names(server: &Server) -> Vec<String> {
+    let world = server.world.lock().expect("world lock");
+    world
+        .players
+        .values()
+        .map(|player| player.name.lock().expect("name").clone())
+        .collect()
+}
+
+/// `/gamerule <rule>` 的值建议：布尔规则给 true/false。
+fn gamerule_value_suggestions(rule: &str) -> Vec<String> {
+    use icbm_gameplay_minecraft::gamerules::RuleType;
+    match icbm_gameplay_minecraft::gamerules::find(rule) {
+        Some(game_rule) if game_rule.rule_type == RuleType::Bool => {
+            vec!["true".to_owned(), "false".to_owned()]
+        }
+        _ => Vec::new(),
     }
 }
 
@@ -327,6 +651,7 @@ pub fn send_icbm_snapshot(server: &Server, client: &Arc<Client>) {
                 )
             });
     let sequence = client.icbm_sequence.fetch_add(1, Ordering::Relaxed) + 1;
+    let speed = *client.speed.lock().expect("speed");
     let _ = client.send_encoded(
         icbm_mc_767::packets::play_ids::CLIENTBOUND_CUSTOM_PAYLOAD,
         |w| {
@@ -334,7 +659,7 @@ pub fn send_icbm_snapshot(server: &Server, client: &Arc<Client>) {
             w.write_var_int(1); // protocolVersion
             w.write_var_long(i64::try_from(sequence).unwrap_or(i64::MAX));
             w.write_string("minecraft:overworld");
-            w.write_bool(false); // Phase 1 无裁切（区域外临时生成）
+            w.write_bool(true); // simulationClipped：区域边界真实存在（客户端据此渲染边界）
             match region {
                 Some((min_x, min_z, max_x, max_z)) => {
                     w.write_bool(true);
@@ -359,7 +684,9 @@ pub fn send_icbm_snapshot(server: &Server, client: &Arc<Client>) {
                 }
                 None => w.write_bool(false),
             }
-            w.write_bool(false); // 速度未知
+            // 玩家移动速度（方块/秒，由移动包估算）
+            w.write_bool(true);
+            w.write_f64_be(speed);
             w.write_bool(true); // 有 TPS
             w.write_f32_be(tps);
             w.write_var_int(20); // refreshIntervalTicks

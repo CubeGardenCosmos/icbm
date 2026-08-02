@@ -53,7 +53,7 @@ offset 1: 载荷（按 kind 定义，全部小端）
 | kind  | 名称               | 方向      | 载荷                                                                 |
 |-------|--------------------|-----------|----------------------------------------------------------------------|
 | 0x01  | REGION_REGISTER    | R → C     | `[u8 dim][i32 rx][i32 rz][u32 pid]`                                  |
-| 0x81  | REGISTER_ACK       | C → R     | `[u8 dim][i32 rx][i32 rz][u8 ok]`                                    |
+| 0x81  | REGISTER_ACK       | C → R     | `[u8 dim][i32 rx][i32 rz][u8 ok][i32 entity_id_base]`（实体 ID 基址） |
 | 0x02  | REGION_HEARTBEAT   | R → C     | `[f32 tps][u8 sleeping][u32 loaded_chunks][u64 tick]`                |
 | 0x03  | REGION_UNLOAD      | C → R     | `[u8 dim][i32 rx][i32 rz]`（收到后 region 正常退出）                  |
 | 0x04  | PLAYER_ENTER       | C → R     | `[u128 uuid][f64 x][f64 y][f64 z][f32 yaw][f32 pitch]`               |
@@ -62,6 +62,7 @@ offset 1: 载荷（按 kind 定义，全部小端）
 | 0x07  | CHUNK_DATA         | R → C     | `[u8 dim][i32 cx][i32 cz][u32 len][bytes：区块网络数据]`              |
 | 0x08  | REGION_STATS       | C → R     | 空载荷；region 立即回 0x09                                           |
 | 0x09  | REGION_STATS_RESP  | R → C     | `[f32 tps][f32 avg_tps_ms][u32 tick_count][u8 sleeping][u32 loaded_chunks]` |
+| 0x0A  | ENTITY_DATA        | R → C     | `[u8 dim][i32 rx][i32 rz][i32 packet_id][bytes：clientbound 包载荷]`；core 转发给该区域玩家 |
 
 ## 生命周期
 
@@ -70,11 +71,15 @@ offset 1: 载荷（按 kind 定义，全部小端）
    区域拉起第一个 region 子进程（同一二进制 `--region` 模式，继承环境变量
    `ICBM_DATAROUTER_TOKEN`）。
 2. region 启动 → 连接 datarouter → 注册 `icbm.region.<id>` → 发送 `REGION_REGISTER`。
-3. core 回复 `REGISTER_ACK` 后，region 进入正常模拟；每 1 秒发送一次
+3. core 回复 `REGISTER_ACK`（含分配的实体 ID 基址，区域内实体 ID ∈
+   `[base, base+999]`）后，region 进入正常模拟；每 1 秒发送一次
    `REGION_HEARTBEAT`（含 TPS 与沉睡状态）。
 4. 玩家进出：core 发送 `PLAYER_ENTER` / `PLAYER_LEAVE`；region 在无玩家时进入沉睡（停止 tick），持续 30 秒后由 core 发送 `REGION_UNLOAD` 卸载。
 5. 区块数据：core 收到客户端进入时向所在 region 发 `CHUNK_REQUEST`，region 从 `lib/anvil` 读取或 flat 生成后返回 `CHUNK_DATA`（网络序列化），core 转发给客户端；改动经 `lib/anvil` 写回 `.mca`。
-6. switch 异常退出/扩容重启时，既有 Frontend 在下一次 touch/send 时自动重注册；region 侧由 `send_retry` 对 BUSY/FULL/AGAIN 短退避重试。
+6. 实体：region 模拟漫游 Creeper（Phase 1 测试信号），经 `ENTITY_DATA` 把
+   `ADD_ENTITY`/`MOVE_ENTITY_POS` 等 clientbound 包发给 core，core 转发给位于
+   该区域的玩家；region 卸载时 core 按实体 ID 段发 `REMOVE_ENTITIES` 清理客户端实体。
+7. switch 异常退出/扩容重启时，既有 Frontend 在下一次 touch/send 时自动重注册；region 侧由 `send_retry` 对 BUSY/FULL/AGAIN 短退避重试。
 
 ## 错误处理
 

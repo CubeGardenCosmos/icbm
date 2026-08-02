@@ -41,6 +41,8 @@ pub mod kind {
     pub const REGION_STATS: u8 = 0x08;
     /// R→C：统计响应。
     pub const REGION_STATS_RESP: u8 = 0x09;
+    /// R→C：实体包（AddEntity/MoveEntityPos 等，core 转发给区域玩家）。
+    pub const ENTITY_DATA: u8 = 0x0A;
 }
 
 /// IPC 错误。
@@ -174,19 +176,28 @@ pub fn decode_register(body: &[u8]) -> Result<(u8, i32, i32, u32), IpcError> {
     ))
 }
 
-/// `REGISTER_ACK` 载荷：`[u8 dim][i32 rx][i32 rz][u8 ok]`。
+/// `REGISTER_ACK` 载荷：`[u8 dim][i32 rx][i32 rz][u8 ok][i32 entity_id_base]`。
+///
+/// `entity_id_base` 为该 region 的实体 ID 基址（core 分配，区域内实体 ID 取
+/// `[base, base+999]`；卸载时 core 据此发 `REMOVE_ENTITIES` 清理客户端实体）。
 #[must_use]
-pub fn encode_register_ack(dim: u8, rx: i32, rz: i32, ok: bool) -> Vec<u8> {
+pub fn encode_register_ack(dim: u8, rx: i32, rz: i32, ok: bool, entity_id_base: i32) -> Vec<u8> {
     let mut out = encode_register(dim, rx, rz, 0);
     out.push(u8::from(ok));
+    out.extend_from_slice(&entity_id_base.to_le_bytes());
     out
 }
 
 /// 解析 `REGISTER_ACK` 载荷。
-pub fn decode_register_ack(body: &[u8]) -> Result<(u8, i32, i32, bool), IpcError> {
+///
+/// 旧版（无 `entity_id_base`，仅 14 字节）仍可解析，`entity_id_base` 视为 `None`。
+pub fn decode_register_ack(body: &[u8]) -> Result<(u8, i32, i32, bool, Option<i32>), IpcError> {
     let (dim, rx, rz, _) = decode_register(body)?;
     let ok = body.get(13).is_some_and(|&b| b != 0);
-    Ok((dim, rx, rz, ok))
+    let entity_id_base = body
+        .get(14..18)
+        .map(|bytes| i32::from_le_bytes(bytes.try_into().expect("slice")));
+    Ok((dim, rx, rz, ok, entity_id_base))
 }
 
 /// `REGION_HEARTBEAT` 载荷：`[f32 tps][u8 sleeping][u32 loaded][u64 tick]`。
@@ -359,6 +370,34 @@ pub fn decode_stats(body: &[u8]) -> Result<(f32, f32, u32, bool, u32), IpcError>
     ))
 }
 
+/// `ENTITY_DATA` 载荷：`[u8 dim][i32 rx][i32 rz][i32 packet_id][clientbound 载荷]`。
+///
+/// core 收到后把 `(packet_id, 载荷)` 转发给位于 `(rx, rz)` 区域的在线玩家。
+#[must_use]
+pub fn encode_entity_data(dim: u8, rx: i32, rz: i32, packet_id: i32, payload: &[u8]) -> Vec<u8> {
+    let mut out = Vec::with_capacity(17 + payload.len());
+    out.push(dim);
+    out.extend_from_slice(&rx.to_le_bytes());
+    out.extend_from_slice(&rz.to_le_bytes());
+    out.extend_from_slice(&packet_id.to_le_bytes());
+    out.extend_from_slice(payload);
+    out
+}
+
+/// 解析 `ENTITY_DATA` 载荷。
+pub fn decode_entity_data(body: &[u8]) -> Result<(u8, i32, i32, i32, &[u8]), IpcError> {
+    if body.len() < 17 {
+        return Err(IpcError::Length("entity data", body.len()));
+    }
+    Ok((
+        body[0],
+        i32::from_le_bytes(body[1..5].try_into().expect("slice")),
+        i32::from_le_bytes(body[5..9].try_into().expect("slice")),
+        i32::from_le_bytes(body[9..13].try_into().expect("slice")),
+        &body[13..],
+    ))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -373,9 +412,17 @@ mod tests {
 
     #[test]
     fn register_ack_round_trip() {
-        let body = encode_register_ack(DIM_NETHER, 1, 1, true);
-        let (dim, rx, rz, ok) = decode_register_ack(&body).unwrap();
-        assert_eq!((dim, rx, rz, ok), (DIM_NETHER, 1, 1, true));
+        let body = encode_register_ack(DIM_NETHER, 1, 1, true, 2000);
+        let (dim, rx, rz, ok, base) = decode_register_ack(&body).unwrap();
+        assert_eq!(
+            (dim, rx, rz, ok, base),
+            (DIM_NETHER, 1, 1, true, Some(2000))
+        );
+        // 旧版 ACK（无 entity_id_base）仍可解析
+        let legacy = encode_register_ack(DIM_OVERWORLD, 0, 0, true, 0);
+        let (_, _, _, ok, base) = decode_register_ack(&legacy[..14]).unwrap();
+        assert!(ok);
+        assert_eq!(base, None);
     }
 
     #[test]
@@ -402,6 +449,15 @@ mod tests {
             (tps, avg, ticks, sleeping, loaded),
             (19.8, 50.5, 12345, true, 42)
         );
+    }
+
+    #[test]
+    fn entity_data_round_trip() {
+        let payload = [0x2Eu8, 0x01, 0x00, 0x02];
+        let body = encode_entity_data(DIM_OVERWORLD, 3, -2, 0x2E, &payload);
+        let (dim, rx, rz, packet_id, data) = decode_entity_data(&body).unwrap();
+        assert_eq!((dim, rx, rz, packet_id), (DIM_OVERWORLD, 3, -2, 0x2E));
+        assert_eq!(data, &payload[..]);
     }
 
     #[test]
