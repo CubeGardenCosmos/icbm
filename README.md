@@ -89,6 +89,7 @@ world/
 
 - `lib/datarouter` 为 Git 子模块（`git@github.com:Creeper23456/datarouter.git`），提供共享内存传输与 Rust Frontend。
 - 服务命名：core 注册为 `icbm.core`；region 注册为 `icbm.region.<id>`。
+- **channel 容量**：默认 512KiB（`DATAROUTER_CHANNEL_SIZE`）。Phase 1 区块一次下发约 4MB，部署时需以 `DATAROUTER_CHANNEL_SIZE=4194304` 重编 switch（`-DDATAROUTER_CHANNEL_SIZE=4194304`）与 Rust 侧（构建时环境变量），两侧不一致会因布局校验失败而无法连接。
 - 应用层约定**无上下文开销的二进制协议**（见 `docs/ipc.md`）：消息体为紧凑二进制帧，不使用业务 JSON/TLV 上下文。
 - 消息类型：注册、心跳（TPS/沉睡状态）、玩家进出、区块请求与数据、卸载指令等。
 
