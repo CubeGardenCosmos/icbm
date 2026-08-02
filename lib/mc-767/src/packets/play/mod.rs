@@ -260,6 +260,33 @@ fn write_packed_indices(writer: &mut Writer, data: &[i64]) {
     }
 }
 
+/// 解包 LSB-first 打包数据（`count` 个值，每值 `bits` 位）。
+#[must_use]
+pub fn unpack_indices(data: &[i64], bits: u32, count: usize) -> Vec<u32> {
+    let mask = if bits >= 64 {
+        u64::MAX
+    } else {
+        (1u64 << bits) - 1
+    };
+    let mut values = Vec::with_capacity(count);
+    for index in 0..count {
+        let bit_pos = index * bits as usize;
+        let long_index = bit_pos / 64;
+        let offset = bit_pos % 64;
+        let mut value = if long_index < data.len() {
+            (data[long_index] as u64) >> offset
+        } else {
+            0
+        };
+        let spill = offset + bits as usize;
+        if spill > 64 && long_index + 1 < data.len() {
+            value |= (data[long_index + 1] as u64) << (64 - offset);
+        }
+        values.push((value & mask) as u32);
+    }
+    values
+}
+
 /// 计算以 2 为底向上取整的对数（0 → 0）。
 #[must_use]
 pub const fn ceil_log2(value: u32) -> u32 {

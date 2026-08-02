@@ -3,6 +3,15 @@ name = "icbm-region"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
+description = "icbm region worker library (same binary as core, --region mode)"
+
+[dependencies]
+blinkcms-datarouter = { path = "../lib/datarouter" }
+icbm-anvil = { path = "../lib/anvil" }
+icbm-mc-767 = { path = "../lib/mc-767" }
+icbm-terrain-gen = { path = "../lib/terrain-gen" }
+tracing = { version = "0.1", default-features = false }
+uuid = { version = "1", features = ["v4"] }
 
 [lints]
 workspace = true
