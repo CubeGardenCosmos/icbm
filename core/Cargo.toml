@@ -3,12 +3,24 @@ name = "icbm-core"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
+description = "icbm server core (same binary as region, default mode)"
 
 [[bin]]
 name = "icbm"
 path = "src/main.rs"
 
 [dependencies]
+base64 = { version = "0.22", default-features = false, features = ["std"] }
+blinkcms-datarouter = { path = "../lib/datarouter" }
+icbm-anvil = { path = "../lib/anvil" }
+icbm-gameplay-icbm = { path = "../gameplay/icbm" }
+icbm-gameplay-minecraft = { path = "../gameplay/minecraft" }
+icbm-mc-767 = { path = "../lib/mc-767" }
+icbm-region = { path = "../region" }
+md5 = "0.7"
+serde_json = { version = "1", default-features = false, features = ["std"] }
+tracing = { version = "0.1", default-features = false }
+uuid = { version = "1", features = ["v4"] }
 
 [lints]
 workspace = true

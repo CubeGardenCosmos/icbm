@@ -98,6 +98,19 @@ dependencies = [
 [[package]]
 name = "icbm-core"
 version = "0.1.0-dev+1.21.1"
+dependencies = [
+ "base64",
+ "blinkcms-datarouter",
+ "icbm-anvil",
+ "icbm-gameplay-icbm",
+ "icbm-gameplay-minecraft",
+ "icbm-mc-767",
+ "icbm-region",
+ "md5",
+ "serde_json",
+ "tracing",
+ "uuid",
+]
 
 [[package]]
 name = "icbm-gameplay-icbm"
@@ -185,6 +198,12 @@ name = "lz4_flex"
 version = "0.11.6"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "373f5eceeeab7925e0c1098212f2fbc4d416adec9d35051a6ab251e824c1854a"
+
+[[package]]
+name = "md5"
+version = "0.7.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "490cc448043f947bae3cbee9c203358d62dbee0db12107a74be5c30ccfd09771"
 
 [[package]]
 name = "memchr"
