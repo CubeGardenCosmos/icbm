@@ -221,8 +221,11 @@ impl Palette {
     /// 写出网络载荷。
     pub fn encode(&self, writer: &mut Writer) {
         if self.bits == 0 {
+            // 单值模式：bits=0 + palette 值 + data 长度 0（官方 ZeroBitStorage
+            // 的 getRaw 返回固定 31-long 数组，writeLongArray 仍写 varint 0）
             writer.write_u8(0);
             writer.write_var_int(self.entries[0]);
+            writer.write_var_int(0);
             return;
         }
         writer.write_u8(self.bits as u8);
@@ -344,6 +347,8 @@ mod tests {
         assert_eq!(bytes[0], 0); // bits=0
         let mut r = Reader::new(&bytes[1..]);
         assert_eq!(r.read_var_int().unwrap(), 1);
+        // 官方单值（ZeroBitStorage）仍写 data 长度 0
+        assert_eq!(r.read_var_int().unwrap(), 0);
         assert!(r.is_empty());
     }
 
