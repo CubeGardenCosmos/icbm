@@ -246,6 +246,12 @@ impl ChunkStore {
             icbm_terrain_gen::ChunkColumn::local_coord(z),
         ))
     }
+
+    /// 已加载主世界区块坐标列表。
+    #[must_use]
+    pub fn loaded_overworld_chunks(&self) -> Vec<(i32, i32)> {
+        self.overworld.keys().copied().collect()
+    }
 }
 
 /// `ChunkColumn` → Anvil `SectionNbt` 列表。

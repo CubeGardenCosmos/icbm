@@ -4,6 +4,7 @@
 //! 地狱 4×4 区块区域，通过 datarouter 与 core 通讯。生命周期状态机：
 //! 注册 → 模拟 → 沉睡 → 卸载（见 [`service`]）。
 
+pub mod fluids;
 pub mod protocol;
 pub mod service;
 pub mod store;

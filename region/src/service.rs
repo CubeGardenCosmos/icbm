@@ -221,6 +221,56 @@ impl RegionService {
         })?;
         Ok(())
     }
+
+    /// 流体 tick：对已加载区块内水/岩浆执行扩散（简化模型），更新与广播。
+    ///
+    /// 每 tick 检查已加载区块列（高度范围），收集扩散更新后统一写入并广播
+    /// `CBlockUpdate`（避免 tick 中多次借锁）。
+    fn tick_fluids(&mut self) -> Result<(), RegionError> {
+        let chunks = self.store.loaded_overworld_chunks();
+        if chunks.is_empty() {
+            return Ok(());
+        }
+        let mut updates: Vec<(i32, i32, i32, i32)> = Vec::new();
+        for (cx, cz) in chunks {
+            let min_x = cx * 16;
+            let min_z = cz * 16;
+            // flat 世界高度范围（-64..319，与生成一致）；只查非空气层（地表附近）
+            let mut pending: Vec<(i32, i32, i32, i32)> = Vec::new();
+            let store = &mut self.store;
+            crate::fluids::tick_fluid(
+                min_x,
+                -64,
+                min_z,
+                min_x + 15,
+                319,
+                min_z + 15,
+                |x, y, z| store.block_at(Face::Overworld, x, y, z).unwrap_or(0),
+                |update| {
+                    pending.push((update.x, update.y, update.z, update.state_id));
+                },
+            );
+            for (x, y, z, state) in pending {
+                if self
+                    .store
+                    .set_block(Face::Overworld, x, y, z, state)
+                    .is_ok()
+                {
+                    updates.push((x, y, z, state));
+                }
+            }
+        }
+        for (x, y, z, state) in updates {
+            let packet = icbm_mc_767::packets::play::clientbound::CBlockUpdate {
+                position: icbm_mc_767::packets::play::BlockPos::new(x, y, z),
+                state_id: state,
+            };
+            self.send_entity_packet(play_ids::CLIENTBOUND_BLOCK_UPDATE, |w| {
+                packet.encode(w);
+            })?;
+        }
+        Ok(())
+    }
     /// 新建服务（连接 datarouter、打开存档）。
     pub fn new(config: RegionConfig) -> Result<Self, RegionError> {
         let ipc = Ipc::connect(
@@ -309,6 +359,7 @@ impl RegionService {
         self.ticker.begin();
         self.drain_messages()?;
         self.flush_chunks()?;
+        self.tick_fluids()?;
         // Phase 1 世界 tick：仅随机漫游 Creeper（region 存活信号）
         self.tick_creepers()?;
         let tps = self.ticker.end();
