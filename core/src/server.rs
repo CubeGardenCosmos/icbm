@@ -261,8 +261,26 @@ fn start_switch(
             );
             Ok(None)
         }
+        Err(SwitchError::StartTimedOut(_)) if shm_object_exists(&config.shm_name) => {
+            // 同名共享内存对象已存在但探测失败：通常是旧版 datarouter 的外部
+            // switch 残留（layout/通道大小不兼容），内嵌 switch 无法接管。
+            Err(ServerError::Switch(SwitchError::InvalidConfig(format!(
+                "shared memory {} is held by an incompatible switch; \
+                 stop it and remove the object first: \
+                 pkill -f datarouter-switch && rm -f /dev/shm/{}",
+                config.shm_name,
+                config.shm_name.trim_start_matches('/')
+            ))))
+        }
         Err(err) => Err(ServerError::Switch(err)),
     }
+}
+
+/// POSIX 共享内存对象是否已存在（Linux 下位于 /dev/shm）。
+fn shm_object_exists(name: &str) -> bool {
+    std::path::Path::new("/dev/shm")
+        .join(name.trim_start_matches('/'))
+        .exists()
 }
 
 /// datarouter receiver 线程：region 消息 + 生命周期维护。
