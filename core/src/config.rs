@@ -38,7 +38,7 @@ impl Default for ServerConfig {
             world_dir: PathBuf::from("world"),
             shm_name: "/datarouter".to_owned(),
             motd: "ICBM by CubeGarden Studio, READY".to_owned(),
-            max_players: 20,
+            max_players: 182,
             view_distance: 8,
             simulation_distance: 8,
             compression_threshold: 256,
