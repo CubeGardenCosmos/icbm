@@ -119,6 +119,14 @@ pub mod block_state_ids {
     /// 亮度方块（level=15, waterlogged=false 默认态；level 0..15 × waterlogged
     /// 2 → 10367..10398，level L 非含水 = 10367 + L*2）。
     pub const LIGHT_BLOCK: i32 = 10398;
+    /// 普通活塞（base；facing 6 × extended 2 → 2011..2022）。
+    pub const PISTON_BASE: i32 = 2011;
+    /// 粘性活塞（base；1992..2003）。
+    pub const STICKY_PISTON_BASE: i32 = 1992;
+    /// 活塞头（base；2023..2046，每 facing 4 子态）。
+    pub const PISTON_HEAD_BASE: i32 = 2023;
+    /// 管珊瑚扇（waterlogged=false 默认态）。
+    pub const TUBE_CORAL_FAN: i32 = 12843;
 }
 
 /// 1.21.1 生物群系网络 ID（icbm 服务器自定义注册表顺序）。

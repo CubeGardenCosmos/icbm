@@ -69,6 +69,12 @@ pub mod names {
     pub const BARRIER: &str = "minecraft:barrier";
     /// 亮度方块（vanilla 注册键 `minecraft:light`）。
     pub const LIGHT: &str = "minecraft:light";
+    /// 活塞（默认态：未伸出）。
+    pub const PISTON: &str = "minecraft:piston";
+    /// 粘性活塞（默认态：未伸出）。
+    pub const STICKY_PISTON: &str = "minecraft:sticky_piston";
+    /// 珊瑚扇（tube 默认态；刷取用）。
+    pub const TUBE_CORAL_FAN: &str = "minecraft:tube_coral_fan";
 }
 
 use crate::packets::play::block_state_ids as ids;
@@ -108,6 +114,9 @@ pub const fn state_id_to_name(id: i32) -> Option<&'static str> {
         ids::COMMAND_BLOCK => Some(names::COMMAND_BLOCK),
         ids::BARRIER => Some(names::BARRIER),
         ids::LIGHT_BLOCK => Some(names::LIGHT),
+        ids::PISTON_BASE => Some(names::PISTON),
+        ids::STICKY_PISTON_BASE => Some(names::STICKY_PISTON),
+        ids::TUBE_CORAL_FAN => Some(names::TUBE_CORAL_FAN),
         _ => None,
     }
 }
@@ -147,6 +156,9 @@ pub fn name_to_state_id(name: &str) -> Option<i32> {
         names::COMMAND_BLOCK => Some(ids::COMMAND_BLOCK),
         names::BARRIER => Some(ids::BARRIER),
         names::LIGHT => Some(ids::LIGHT_BLOCK),
+        names::PISTON => Some(ids::PISTON_BASE + 6), // 默认态（south 未伸出）
+        names::STICKY_PISTON => Some(ids::STICKY_PISTON_BASE + 6),
+        names::TUBE_CORAL_FAN => Some(ids::TUBE_CORAL_FAN),
         _ => None,
     }
 }

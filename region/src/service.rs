@@ -228,6 +228,8 @@ pub struct RegionService {
     world_time: i64,
     /// 上次命令方块执行状态（坐标 → 上次是否已触发；防止每 tick 重复执行）。
     command_block_fired: std::collections::HashMap<(i32, i32, i32), bool>,
+    /// 活塞供电快照（坐标 → 上次是否供电；边沿检测用）。
+    piston_powered: std::collections::HashMap<(i32, i32, i32), bool>,
     /// 上次广播时间（节流：每秒一次）。
     last_time_broadcast: Instant,
     /// 天气状态（雨/雷/梯度）。
@@ -431,6 +433,7 @@ impl RegionService {
             weather: crate::weather::WeatherState::new(),
             last_time_broadcast: Instant::now(),
             command_block_fired: std::collections::HashMap::new(),
+            piston_powered: std::collections::HashMap::new(),
         })
     }
 
@@ -498,6 +501,7 @@ impl RegionService {
         self.tick_fluids()?;
         self.tick_redstone()?;
         self.tick_command_blocks()?;
+        self.tick_pistons()?;
         self.tick_crops()?;
         self.tick_time()?;
         self.tick_weather()?;
@@ -1030,6 +1034,31 @@ impl RegionService {
         Ok(())
     }
 
+    /// 活塞 tick：BUD（QC 供电）与伸出/缩回，推动方块并广播 `CBlockUpdate`。
+    fn tick_pistons(&mut self) -> Result<(), RegionError> {
+        let positions = self.store.piston_positions();
+        if positions.is_empty() {
+            return Ok(());
+        }
+        let actions = crate::pistons::tick_pistons(
+            &positions,
+            &mut self.piston_powered,
+            &mut PistonStoreAccess(&mut self.store),
+        );
+        for action in actions {
+            for ((x, y, z), state) in action.updates {
+                let packet = icbm_mc_767::packets::play::clientbound::CBlockUpdate {
+                    position: icbm_mc_767::packets::play::BlockPos::new(x, y, z),
+                    state_id: state,
+                };
+                self.send_entity_packet(play_ids::CLIENTBOUND_BLOCK_UPDATE, |w| {
+                    packet.encode(w);
+                })?;
+            }
+        }
+        Ok(())
+    }
+
     /// 农作物随机 tick 生长：每个已加载区块按 `randomTickSpeed`（默认 3）次
     /// 抽查地表顶方块，命中作物且未成熟时以 1/3 概率推进 age（广播 `CBlockUpdate`）。
     fn tick_crops(&mut self) -> Result<(), RegionError> {
@@ -1530,5 +1559,18 @@ mod raycast_tests {
         let (hit, _, _, _) = raycast_block(&mut store, [0.0, -58.38, 0.0], [1.0, 0.0, 0.0], 50.0);
         assert!(!hit);
         std::fs::remove_dir_all(&dir).unwrap();
+    }
+}
+
+/// 活塞方块访问适配器（ChunkStore → BlockAccess）。
+struct PistonStoreAccess<'a>(&'a mut ChunkStore);
+
+impl crate::pistons::BlockAccess for PistonStoreAccess<'_> {
+    fn block_at(&mut self, x: i32, y: i32, z: i32) -> i32 {
+        self.0.block_at(Face::Overworld, x, y, z).unwrap_or(0)
+    }
+
+    fn set_block(&mut self, x: i32, y: i32, z: i32, state: i32) {
+        let _ = self.0.set_block(Face::Overworld, x, y, z, state);
     }
 }

@@ -832,6 +832,46 @@ fn barrier_blocks_walkers_but_not_boats() {
     client.set_read_timeout(Duration::from_secs(10));
 }
 
+/// 活塞：红石供电（上升沿）伸出推动前方方块；BUD 准连接供电。
+#[test]
+fn piston_pushes_blocks_on_power() {
+    let server = TestServer::start("piston");
+    let mut client = FakeClient::connect(&server.addr);
+    join_to_play(&mut client);
+    client.recv_until(play_ids::CLIENTBOUND_CHUNK_BATCH_FINISHED, "initial batch");
+
+    // 朝南（+z）的活塞 + 前方石头（/setblock 放置默认态，facing=south）
+    send_chat_command(&mut client, "setblock 20 -60 10 piston");
+    recv_chat_until(&mut client, "已放置");
+    send_chat_command(&mut client, "setblock 20 -60 11 stone");
+    recv_chat_until(&mut client, "已放置");
+    // 侧方红石块供电 → 上升沿伸出
+    send_chat_command(&mut client, "setblock 19 -60 10 redstone_block");
+    recv_chat_until(&mut client, "已放置");
+
+    // 等待：z=11 变活塞头（2025 子态 0）、z=12 变石头（前移）、z=13 无
+    let deadline = Instant::now() + Duration::from_secs(15);
+    let mut head_seen = false;
+    let mut stone_seen = false;
+    while Instant::now() < deadline && !(head_seen && stone_seen) {
+        let (id, payload) = client.recv();
+        if id == play_ids::CLIENTBOUND_BLOCK_UPDATE {
+            let mut r = Reader::new(&payload);
+            let pos = icbm_mc_767::packets::play::BlockPos::from_long(r.read_i64_be().unwrap());
+            let state = r.read_var_int().unwrap();
+            if pos == icbm_mc_767::packets::play::BlockPos::new(20, -60, 11) {
+                // 活塞头（south 朝向 = 2023 + 3*4 = 2035）
+                head_seen = state == 2035;
+            }
+            if pos == icbm_mc_767::packets::play::BlockPos::new(20, -60, 12) {
+                stone_seen = state == 1;
+            }
+        }
+    }
+    assert!(head_seen, "piston head should appear at z=11");
+    assert!(stone_seen, "stone should be pushed to z=12");
+}
+
 /// 服务端命令：`/gamemode creative`、`/gamerule`（含 level.dat 持久化）与
 /// `/bmtool tps` 应从系统聊天返回反馈。
 #[test]

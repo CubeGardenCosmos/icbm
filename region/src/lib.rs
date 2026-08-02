@@ -8,6 +8,7 @@ pub mod entities;
 pub mod crops;
 pub mod fluids;
 pub mod mobs;
+pub mod pistons;
 pub mod portal;
 pub mod protocol;
 pub mod redstone;
