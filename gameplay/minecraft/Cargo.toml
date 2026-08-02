@@ -3,6 +3,10 @@ name = "icbm-gameplay-minecraft"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
+description = "Minecraft namespace gameplay content: blocks, mobs, sounds, gamerules, commands"
+
+[dependencies]
+icbm-mc-767 = { path = "../../lib/mc-767" }
 
 [lints]
 workspace = true

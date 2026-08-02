@@ -102,10 +102,16 @@ version = "0.1.0-dev+1.21.1"
 [[package]]
 name = "icbm-gameplay-icbm"
 version = "0.1.0-dev+1.21.1"
+dependencies = [
+ "icbm-mc-767",
+]
 
 [[package]]
 name = "icbm-gameplay-minecraft"
 version = "0.1.0-dev+1.21.1"
+dependencies = [
+ "icbm-mc-767",
+]
 
 [[package]]
 name = "icbm-i18n"

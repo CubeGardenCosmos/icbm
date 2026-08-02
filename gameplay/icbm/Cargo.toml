@@ -3,6 +3,10 @@ name = "icbm-gameplay-icbm"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
+description = "icbm namespace gameplay content: /bmtool and server-specific commands"
+
+[dependencies]
+icbm-mc-767 = { path = "../../lib/mc-767" }
 
 [lints]
 workspace = true
