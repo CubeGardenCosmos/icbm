@@ -178,6 +178,8 @@ pub struct Client {
     verify_token: Mutex<Option<Vec<u8>>>,
     /// 上次传送门检测时间（节流用）。
     pub last_portal_check: Mutex<Instant>,
+    /// 上次向 region 发送 `PLAYER_MOVE` 的时间（节流：约 4 次/秒）。
+    pub last_player_move_sent: Mutex<Instant>,
     /// 待消费的传送门检测结果（`BLOCK_QUERY_RESP` 写入；-1 = 无）。
     pub pending_portal_block: std::sync::atomic::AtomicI32,
 }
@@ -234,6 +236,7 @@ impl Client {
             write_cipher: Mutex::new(None),
             verify_token: Mutex::new(None),
             last_portal_check: Mutex::new(Instant::now()),
+            last_player_move_sent: Mutex::new(Instant::now()),
             pending_portal_block: std::sync::atomic::AtomicI32::new(-1),
         })
     }

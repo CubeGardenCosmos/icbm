@@ -33,6 +33,8 @@ pub mod kind {
     pub const PLAYER_ENTER: u8 = 0x04;
     /// C→R：玩家离开。
     pub const PLAYER_LEAVE: u8 = 0x05;
+    /// C→R：玩家移动（`[uuid 16B][f64 x][f64 y][f64 z]`；供敌对生物追踪）。
+    pub const PLAYER_MOVE: u8 = 0x0F;
     /// C→R：区块请求。
     pub const CHUNK_REQUEST: u8 = 0x06;
     /// R→C：区块数据。
@@ -53,6 +55,8 @@ pub mod kind {
     pub const BLOCK_QUERY_RESP: u8 = 0x8D;
     /// C→R：游戏规则变更（`[u8 名长][名][u8 值长][值]`）。
     pub const GAMERULE_UPDATE: u8 = 0x0E;
+    /// C→R：世界时间设置（`[i64 tick]`；`/time` 命令用）。
+    pub const TIME_UPDATE: u8 = 0x10;
 }
 
 /// IPC 错误。
@@ -289,6 +293,32 @@ pub fn decode_player_leave(body: &[u8]) -> Result<Uuid, IpcError> {
     let mut uuid_bytes = [0u8; 16];
     uuid_bytes.copy_from_slice(&body[0..16]);
     Ok(Uuid::from_bytes(uuid_bytes))
+}
+
+/// `PLAYER_MOVE` 载荷：`[uuid 16B][f64 x][f64 y][f64 z]`。
+#[must_use]
+pub fn encode_player_move(uuid: &Uuid, x: f64, y: f64, z: f64) -> Vec<u8> {
+    let mut out = Vec::with_capacity(40);
+    out.extend_from_slice(uuid.as_bytes());
+    out.extend_from_slice(&x.to_le_bytes());
+    out.extend_from_slice(&y.to_le_bytes());
+    out.extend_from_slice(&z.to_le_bytes());
+    out
+}
+
+/// 解析 `PLAYER_MOVE` 载荷。
+pub fn decode_player_move(body: &[u8]) -> Result<(Uuid, f64, f64, f64), IpcError> {
+    if body.len() < 40 {
+        return Err(IpcError::Length("player move", body.len()));
+    }
+    let mut uuid_bytes = [0u8; 16];
+    uuid_bytes.copy_from_slice(&body[0..16]);
+    Ok((
+        Uuid::from_bytes(uuid_bytes),
+        f64::from_le_bytes(body[16..24].try_into().expect("slice")),
+        f64::from_le_bytes(body[24..32].try_into().expect("slice")),
+        f64::from_le_bytes(body[32..40].try_into().expect("slice")),
+    ))
 }
 
 /// `CHUNK_REQUEST` 载荷：`[u8 dim][i32 cx][i32 cz][i32 radius]`。
@@ -537,6 +567,26 @@ pub fn decode_gamerule_update(body: &[u8]) -> Result<(String, String), IpcError>
     let value =
         String::from_utf8_lossy(&body[2 + name_len..2 + name_len + value_len]).into_owned();
     Ok((name, value))
+}
+
+/// `TIME_UPDATE` 载荷：`[i64 tick][u8 add]`（add=1 表示在 region 当前时间上累加）。
+#[must_use]
+pub fn encode_time_update(tick: i64, add: bool) -> Vec<u8> {
+    let mut out = Vec::with_capacity(9);
+    out.extend_from_slice(&tick.to_le_bytes());
+    out.push(u8::from(add));
+    out
+}
+
+/// 解析 `TIME_UPDATE` 载荷。
+pub fn decode_time_update(body: &[u8]) -> Result<(i64, bool), IpcError> {
+    if body.len() < 9 {
+        return Err(IpcError::Length("time update", body.len()));
+    }
+    Ok((
+        i64::from_le_bytes(body[0..8].try_into().expect("slice")),
+        body[8] != 0,
+    ))
 }
 
 #[cfg(test)]

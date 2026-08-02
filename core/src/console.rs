@@ -438,6 +438,11 @@ impl Server {
                     let feedback = apply_enchant(self, &target, &enchantment, level);
                     info!("{feedback}");
                 }
+                Command::Time { set, add } => {
+                    if let Some(feedback) = apply_time(self, set, add) {
+                        info!("{feedback}");
+                    }
+                }
             }
             return;
         }
@@ -841,6 +846,34 @@ pub fn apply_enchant(server: &Server, target: &str, enchantment: &str, level: i3
     });
     let _ = server;
     format!("已给 {target} 主手附魔 {enchantment} {level}")
+}
+
+/// 执行 `/time set/add`：把世界时间同步到所有 region（`TIME_UPDATE`）。
+///
+/// 返回反馈字符串；`None` 表示参数非法。
+pub fn apply_time(server: &Server, set: Option<i64>, add: Option<i64>) -> Option<String> {
+    let regions: Vec<icbm_region::RegionId> = {
+        let world = server.world.lock().expect("world lock");
+        world.regions.ids()
+    };
+    let tick = match (set, add) {
+        (Some(tick), None) => tick,
+        (None, Some(add)) => add, // region 侧累加
+        _ => return None,
+    };
+    for region in regions {
+        let body = icbm_region::protocol::encode_time_update(tick, add.is_some());
+        let _ = server.ipc.send(
+            &region.service_name(),
+            icbm_region::protocol::kind::TIME_UPDATE,
+            &body,
+        );
+    }
+    Some(if add.is_some() {
+        format!("已推进时间 {tick} tick")
+    } else {
+        format!("已将时间设置为 {tick}")
+    })
 }
 
 /// 广播系统消息（`say`）。

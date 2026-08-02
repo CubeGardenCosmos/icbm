@@ -122,6 +122,8 @@ pub enum Command {
         enchantment: String,
         level: i32,
     },
+    /// `/time set <day|night|noon|midnight|<tick>>` 或 `/time add <tick>`。
+    Time { set: Option<i64>, add: Option<i64> },
 }
 
 /// 解析命令行的第一段（`/gamemode ...` / `/gamerule ...` / `/help`）。
@@ -169,7 +171,30 @@ pub fn parse_command(line: &str) -> Option<Command> {
                 level,
             })
         }
+        "time" => Some(parse_time(parts)),
         _ => None,
+    }
+}
+
+/// 解析 `/time set <值>` 与 `/time add <tick>`。
+fn parse_time(mut parts: std::str::SplitWhitespace<'_>) -> Command {
+    match parts.next() {
+        Some("set") => {
+            let value = parts.next().unwrap_or("day");
+            let set = match value {
+                "day" => Some(1_000),
+                "noon" => Some(6_000),
+                "night" => Some(13_000),
+                "midnight" => Some(18_000),
+                other => other.parse::<i64>().ok(),
+            };
+            Command::Time { set, add: None }
+        }
+        Some("add") => Command::Time {
+            set: None,
+            add: parts.next().and_then(|v| v.parse::<i64>().ok()),
+        },
+        _ => Command::Time { set: None, add: None },
     }
 }
 

@@ -14,8 +14,9 @@ use uuid::Uuid;
 use crate::protocol::{
     CORE_SERVICE, DIM_OVERWORLD, Ipc, IpcError, IpcMessage, decode_block_query,
     decode_block_update, decode_chunk_request, decode_gamerule_update, decode_player_enter,
-    decode_player_leave, decode_register_ack, encode_block_query_resp, encode_chunk_data,
-    encode_entity_data, encode_heartbeat, encode_register, encode_stats, kind,
+    decode_player_leave, decode_player_move, decode_register_ack, decode_time_update,
+    encode_block_query_resp, encode_chunk_data, encode_entity_data, encode_heartbeat,
+    encode_register, encode_stats, kind,
 };
 use crate::store::ChunkStore;
 use crate::{Face, RegionId};
@@ -155,12 +156,22 @@ impl Ticker {
 /// Creeper 实体类型注册表 ID（vanilla 1.21.1 `EntityType` 注册序，对照 master
 /// `data/src/generated/entity_type.rs`：`CREEPER` = 23）。
 const ENTITY_TYPE_CREEPER: i32 = 23;
-/// 每区域最多存活的漫游 Creeper 数（实体 ID 取 `[entity_base, entity_base+12)`）。
+/// 每区域最多存活的 Creeper 数（vanilla 每区域怪物上限约 70，本实现取小）。
 const MAX_CREEPERS: usize = 12;
-/// 每 tick 生成 Creeper 的概率（约 6 秒一只）。
+/// 每 tick 生成 Creeper 的概率（夜晚约 6 秒一只，vanilla 自然生成节奏）。
 const SPAWN_CHANCE: f64 = 1.0 / 120.0;
-/// Creeper 出生高度（flat 地表 y=3 之上）。
+/// Creeper 出生高度（superflat 地表顶 -61 之上）。
 const CREEPER_SPAWN_Y: f64 = crate::OVERWORLD_SURFACE_FEET_Y as f64;
+/// 敌对生物追踪/引爆半径（方块）：vanilla `CreeperEntity` 的
+/// `CHARGED_CREEPER`/`FUSE_TIME` 与 `MobEntity` 目标半径。
+const CREEPER_TARGET_RANGE: f64 = 16.0;
+/// 点燃引信的玩家距离（vanilla 3 格内开始闪烁）。
+const CREEPER_FUSE_RANGE: f64 = 3.0;
+/// 引信时长（tick；vanilla `CreeperEntity.FUSE_TIME` = 30）。
+const CREEPER_FUSE_TICKS: i32 = 30;
+/// 夜晚时间窗（世界时间 % 24000；vanilla 13000..23000 为夜间，敌对生物生成）。
+const NIGHT_START: i64 = 13_000;
+const NIGHT_END: i64 = 23_000;
 
 /// 区域内一只漫游 Creeper（不攻击，仅作 region 存活/卸载信号）。
 struct Creeper {
@@ -170,12 +181,16 @@ struct Creeper {
     uuid: Uuid,
     /// X（方块）。
     x: f64,
+    /// Y（方块）。
+    y: f64,
     /// Z（方块）。
     z: f64,
     /// 偏航角（度）。
     yaw: f32,
     /// 上次移动方向（1/4 方向索引；避免连续折返，寻路更自然）。
     last_dir: u8,
+    /// 引信倒计时（tick；-1 = 未点燃）。点燃后闪烁并倒计时爆炸（vanilla 30 tick）。
+    fuse: i32,
 }
 
 /// region 服务。
@@ -186,6 +201,10 @@ pub struct RegionService {
     state: RegionState,
     ticker: Ticker,
     players: HashSet<Uuid>,
+    /// 玩家最新位置（UUID → xyz；敌对生物追踪用，`PLAYER_MOVE` 更新）。
+    player_positions: std::collections::HashMap<Uuid, (f64, f64, f64)>,
+    /// 玩家所在区块缓存（`PLAYER_MOVE` 节流用：区块变化才转发）。
+    player_chunks: std::collections::HashMap<Uuid, (i32, i32)>,
     running: bool,
     unknown_messages: u64,
     /// 待发送区块（每 tick 分批冲刷）。
@@ -392,6 +411,8 @@ impl RegionService {
             state: RegionState::Registering,
             ticker: Ticker::new(),
             players: HashSet::new(),
+            player_positions: std::collections::HashMap::new(),
+            player_chunks: std::collections::HashMap::new(),
             running: true,
             unknown_messages: 0,
             pending_chunks: std::collections::VecDeque::new(),
@@ -541,8 +562,9 @@ impl RegionService {
     fn handle_message(&mut self, message: &IpcMessage) -> Result<(), RegionError> {
         match message.kind {
             kind::PLAYER_ENTER => {
-                let (uuid, _, _) = decode_player_enter(&message.body)?;
+                let (uuid, pos, _) = decode_player_enter(&message.body)?;
                 self.players.insert(uuid);
+                self.player_positions.insert(uuid, (pos[0], pos[1], pos[2]));
                 debug!(%uuid, "player entered region");
                 // 把已存在的 Creeper 补发给新进入的玩家（客户端需 ADD_ENTITY 才渲染）
                 self.resend_creepers()?;
@@ -552,7 +574,13 @@ impl RegionService {
             kind::PLAYER_LEAVE => {
                 let uuid = decode_player_leave(&message.body)?;
                 self.players.remove(&uuid);
+                self.player_positions.remove(&uuid);
+                self.player_chunks.remove(&uuid);
                 debug!(%uuid, "player left region");
+            }
+            kind::PLAYER_MOVE => {
+                let (uuid, x, y, z) = decode_player_move(&message.body)?;
+                self.player_positions.insert(uuid, (x, y, z));
             }
             kind::CHUNK_REQUEST => {
                 let (dim, cx, cz, radius) = decode_chunk_request(&message.body)?;
@@ -569,6 +597,15 @@ impl RegionService {
             kind::GAMERULE_UPDATE => {
                 if let Ok((name, value)) = decode_gamerule_update(&message.body) {
                     self.gamerules.insert(name, value);
+                }
+            }
+            kind::TIME_UPDATE => {
+                if let Ok((tick, add)) = decode_time_update(&message.body) {
+                    self.world_time = if add {
+                        self.world_time.wrapping_add(tick)
+                    } else {
+                        tick
+                    };
                 }
             }
             kind::BLOCK_QUERY => {
@@ -722,6 +759,12 @@ impl RegionService {
 
     /// TNT 爆炸：破坏范围内方块、广播 `CExplosion` 与 `CBlockUpdate`、生成掉落物。
     fn detonate_tnt(&mut self, x: f64, y: f64, z: f64) -> Result<(), RegionError> {
+        self.detonate_explosion(x, y, z, 4.0)
+    }
+
+    /// 通用爆炸：破坏范围内方块、广播 `CExplosion` 与 `CBlockUpdate`、生成掉落物。
+    /// `radius`：TNT 4、Creeper 3（vanilla `TntEntity`/`CreeperEntity` 爆炸半径）。
+    fn detonate_explosion(&mut self, x: f64, y: f64, z: f64, radius: f64) -> Result<(), RegionError> {
         use icbm_mc_767::packets::play::clientbound::{
             CBlockUpdate, CExplosion, ExplosionDestructionType,
         };
@@ -731,15 +774,14 @@ impl RegionService {
             let mut lookup = |bx: i32, by: i32, bz: i32| {
                 store.block_at(Face::Overworld, bx, by, bz).unwrap_or(0)
             };
-            crate::entities::compute_explosion(x, y, z, 4.0, &mut lookup)
-            .affected_blocks
+            crate::entities::compute_explosion(x, y, z, radius, &mut lookup).affected_blocks
         };
         // 广播 CExplosion（受影响方块 → 客户端渲染爆炸效果）
         let explosion = CExplosion {
             x,
             y,
             z,
-            radius: 4.0,
+            radius: radius as f32,
             affected_blocks: affected
                 .iter()
                 .map(|&(bx, by, bz)| icbm_mc_767::packets::play::BlockPos::new(bx, by, bz))
@@ -1069,46 +1111,96 @@ impl RegionService {
         Ok(())
     }
 
-    /// 随机漫游 Creeper：随机生成新个体并让已有个体游走。
+    /// 敌对生物（Creeper）tick：vanilla 生成机制 + 追逐/引爆 AI。
+    ///
+    /// 生成：仅在夜晚（`world_time % 24000 ∈ [13000, 23000)`）且 `doMobSpawning`
+    /// 开启时按概率生成，上限 `MAX_CREEPERS`。AI：寻找最近玩家（16 格内），
+    /// 向其靠近；3 格内点燃引信（广播实体状态闪烁），30 tick 后爆炸。
     fn tick_creepers(&mut self) -> Result<(), RegionError> {
-        if self.creepers.len() < MAX_CREEPERS && self.rand_f64() < SPAWN_CHANCE {
+        let night = {
+            let phase = self.world_time.rem_euclid(24_000);
+            phase >= NIGHT_START && phase < NIGHT_END
+        };
+        if self.gamerule_bool("doMobSpawning")
+            && night
+            && self.creepers.len() < MAX_CREEPERS
+            && self.rand_f64() < SPAWN_CHANCE
+        {
             self.spawn_creeper()?;
         }
         let min_x = f64::from(self.config.id.rx) * 512.0;
         let min_z = f64::from(self.config.id.rz) * 512.0;
-        // 先预掷随机数再逐个体决策，避免同时借用 self.rng 与 self.creepers。
-        let rolls: Vec<(f64, u64)> = (0..self.creepers.len())
-            .map(|_| (self.rand_f64(), self.next_random() % 4))
-            .collect();
+
+        // 最近玩家位置（只取区域内玩家；core 经 PLAYER_MOVE 同步）
+        let nearest: Option<(f64, f64, f64)> = {
+            let mut best: Option<(f64, (f64, f64, f64))> = None;
+            for (uuid, pos) in &self.player_positions {
+                if !self.players.contains(uuid) {
+                    continue;
+                }
+                let dist = (pos.0 - min_x - 256.0).powi(2) + (pos.2 - min_z - 256.0).powi(2);
+                if best.as_ref().is_none_or(|(d, _)| dist < *d) {
+                    best = Some((dist, *pos));
+                }
+            }
+            best.map(|(_, pos)| pos)
+        };
+
         let mut moves: Vec<(i32, i16, i16)> = Vec::new();
-        for (creeper, (roll, dir_roll)) in self.creepers.iter_mut().zip(rolls) {
-            // 降低游走概率并排除折返：更像友好生物的随机漫步
-            if roll < 0.7 {
+        let mut fuse_starts: Vec<i32> = Vec::new();
+        let mut explosions: Vec<(i32, f64, f64, f64)> = Vec::new();
+        let mut alive: Vec<Creeper> = Vec::with_capacity(self.creepers.len());
+        for mut creeper in std::mem::take(&mut self.creepers) {
+            if creeper.fuse >= 0 {
+                // 引信倒计时
+                creeper.fuse -= 1;
+                if creeper.fuse <= 0 {
+                    explosions.push((creeper.entity_id, creeper.x, creeper.y, creeper.z));
+                    continue;
+                }
+                alive.push(creeper);
                 continue;
             }
-            let candidates: Vec<u8> = (0..4u8)
-                .filter(|&dir| (dir + 2) % 4 != creeper.last_dir || creeper.last_dir == 4)
-                .collect();
-            let dir = candidates[(dir_roll as usize) % candidates.len()];
-            let (dx, dz) = match dir {
-                0 => (1, 0),
-                1 => (-1, 0),
-                2 => (0, 1),
-                _ => (0, -1),
-            };
-            let next_x = creeper.x + f64::from(dx);
-            let next_z = creeper.z + f64::from(dz);
-            // 不越出本区域 512×512 方块边界（区域外归相邻 region 模拟）
-            if !(min_x..min_x + 512.0).contains(&next_x)
-                || !(min_z..min_z + 512.0).contains(&next_z)
-            {
-                continue;
+            // 追逐最近玩家
+            if let Some((px, py, pz)) = nearest {
+                let dx = px - creeper.x;
+                let dz = pz - creeper.z;
+                let horizontal = (dx * dx + dz * dz).sqrt();
+                if horizontal <= CREEPER_FUSE_RANGE {
+                    creeper.fuse = CREEPER_FUSE_TICKS;
+                    fuse_starts.push(creeper.entity_id);
+                    alive.push(creeper);
+                    continue;
+                }
+                if horizontal <= CREEPER_TARGET_RANGE
+                    && (py - creeper.y).abs() < 8.0
+                    && self.rand_f64() < 0.2
+                {
+                    // 朝玩家移动 1 格（vanilla 步行速度约 0.25 格/tick）
+                    let step = if dx.abs() > dz.abs() {
+                        (dx.signum(), 0.0)
+                    } else {
+                        (0.0, dz.signum())
+                    };
+                    let next_x = creeper.x + step.0;
+                    let next_z = creeper.z + step.1;
+                    if (min_x..min_x + 512.0).contains(&next_x)
+                        && (min_z..min_z + 512.0).contains(&next_z)
+                    {
+                        creeper.x = next_x;
+                        creeper.z = next_z;
+                        moves.push((
+                            creeper.entity_id,
+                            (step.0 * 4096.0) as i16,
+                            (step.1 * 4096.0) as i16,
+                        ));
+                    }
+                }
             }
-            creeper.x = next_x;
-            creeper.z = next_z;
-            creeper.last_dir = dir;
-            moves.push((creeper.entity_id, (dx * 4096) as i16, (dz * 4096) as i16));
+            alive.push(creeper);
         }
+        self.creepers = alive;
+
         for (entity_id, delta_x, delta_z) in moves {
             let move_pos = CMoveEntityPos {
                 entity_id,
@@ -1120,6 +1212,26 @@ impl RegionService {
             self.send_entity_packet(play_ids::CLIENTBOUND_MOVE_ENTITY_POS, |w| {
                 move_pos.encode(w);
             })?;
+        }
+        for entity_id in fuse_starts {
+            // 实体状态 1 = 苦力怕点燃引信（客户端渲染闪烁）
+            let status = icbm_mc_767::packets::play::clientbound::CEntityStatus {
+                entity_id,
+                status: 1,
+            };
+            self.send_entity_packet(play_ids::CLIENTBOUND_ENTITY_EVENT, |w| {
+                status.encode(w);
+            })?;
+        }
+        for (entity_id, x, y, z) in explosions {
+            // 爆炸后移除 Creeper 实体并破坏方块
+            let remove = icbm_mc_767::packets::play::clientbound::CRemoveEntities {
+                entity_ids: vec![entity_id],
+            };
+            self.send_entity_packet(play_ids::CLIENTBOUND_REMOVE_ENTITIES, |w| {
+                remove.encode(w);
+            })?;
+            self.detonate_explosion(x, y, z, 3.0)?;
         }
         Ok(())
     }
@@ -1134,9 +1246,11 @@ impl RegionService {
             entity_id,
             uuid: Uuid::new_v4(),
             x: f64::from(cx * 16) + self.rand_f64() * 16.0,
+            y: CREEPER_SPAWN_Y,
             z: f64::from(cz * 16) + self.rand_f64() * 16.0,
             yaw: (self.rand_f64() * 360.0) as f32,
             last_dir: 4, // 初始无方向
+            fuse: -1,   // 未点燃
         };
         self.send_entity_packet(play_ids::CLIENTBOUND_ADD_ENTITY, |w| {
             CAddEntity {
@@ -1144,7 +1258,7 @@ impl RegionService {
                 uuid: creeper.uuid,
                 entity_type: ENTITY_TYPE_CREEPER,
                 x: creeper.x,
-                y: CREEPER_SPAWN_Y,
+                y: creeper.y,
                 z: creeper.z,
                 pitch: 0.0,
                 yaw: creeper.yaw,
@@ -1164,7 +1278,7 @@ impl RegionService {
                 uuid: creeper.uuid,
                 entity_type: ENTITY_TYPE_CREEPER,
                 x: creeper.x,
-                y: CREEPER_SPAWN_Y,
+                y: creeper.y,
                 z: creeper.z,
                 pitch: 0.0,
                 yaw: creeper.yaw,

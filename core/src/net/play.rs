@@ -468,6 +468,28 @@ fn update_position(
             }
         }
     }
+    // 敌对生物追踪：向所在 region 同步玩家位置（节流：约 4 次/秒）。
+    // 虚拟区（Y>400）不关联 region，跳过。
+    if let Some(region) = new_region
+        && client
+            .last_player_move_sent
+            .lock()
+            .expect("last move sent")
+            .elapsed()
+            >= Duration::from_millis(250)
+    {
+        let (px, py, pz) = {
+            let position = client.position.lock().expect("position");
+            (position.x, position.y, position.z)
+        };
+        let body = icbm_region::protocol::encode_player_move(&uuid, px, py, pz);
+        server.ipc.send(
+            &region.service_name(),
+            icbm_region::protocol::kind::PLAYER_MOVE,
+            &body,
+        )?;
+        *client.last_player_move_sent.lock().expect("last move sent") = Instant::now();
+    }
     // 传送门检测（节流：约每 0.5 秒一次，避免每 tick 查询 region）
     check_portal_entry(server, client)?;
     Ok(())
@@ -866,6 +888,11 @@ fn handle_player_command(server: &Server, client: &Arc<Client>, command: &str) {
         }) => {
             let feedback = crate::console::apply_enchant(server, &target, &enchantment, level);
             let _ = client.send_system_chat(&feedback, false);
+        }
+        Some(Command::Time { set, add }) => {
+            if let Some(feedback) = crate::console::apply_time(server, set, add) {
+                let _ = client.send_system_chat(&feedback, false);
+            }
         }
         None => {}
     }

@@ -550,8 +550,8 @@ fn initial_batch_capped_by_server_view_distance() {
     assert_eq!(r.read_var_int().unwrap(), 289);
 }
 
-/// region 模拟层随机生成漫游 Creeper（region 存活信号）：客户端应收到
-/// `ADD_ENTITY`（实体类型 23 = creeper）。
+/// region 模拟层按原版机制生成敌对 Creeper（region 存活信号 + 敌对生物）：
+/// 客户端应收到 `ADD_ENTITY`（实体类型 23 = creeper）。
 #[test]
 fn creeper_spawns_in_region() {
     let server = TestServer::start("creeper");
@@ -559,7 +559,11 @@ fn creeper_spawns_in_region() {
     join_to_play(&mut client);
     client.recv_until(play_ids::CLIENTBOUND_CHUNK_BATCH_FINISHED, "initial batch");
 
-    // 每 tick 1/120 概率，30 秒内生成概率 >99%；超时视为失败。
+    // Creeper 仅在夜晚生成（vanilla 机制）：/time set night 推进到 13000
+    send_chat_command(&mut client, "time set night");
+    recv_chat_until(&mut client, "13000");
+
+    // 夜晚每 tick 1/120 概率，30 秒内生成概率 >99%；超时视为失败。
     // 友好生物也可能先于 Creeper 生成：跳过非 Creeper 的 ADD_ENTITY。
     let deadline = Instant::now() + Duration::from_secs(30);
     let add = loop {
@@ -585,6 +589,66 @@ fn creeper_spawns_in_region() {
     let _z = r.read_f64_be().unwrap();
     assert_eq!(y, -60.0, "creeper spawns on flat surface (superflat at Y=-64)");
     assert!(entity_id >= 1000, "region entity ids start at 1000");
+}
+
+/// 敌对生物 AI：Creeper 靠近玩家 3 格内点燃引信（实体状态 1 闪烁）并爆炸。
+#[test]
+fn creeper_chases_and_explodes_near_player() {
+    let server = TestServer::start("creeper-ai");
+    let mut client = FakeClient::connect(&server.addr);
+    join_to_play(&mut client);
+    client.recv_until(play_ids::CLIENTBOUND_CHUNK_BATCH_FINISHED, "initial batch");
+
+    // 夜晚 + 关闭友好生物干扰：只留 Creeper
+    send_chat_command(&mut client, "time set night");
+    recv_chat_until(&mut client, "13000");
+
+    // 等待 Creeper 生成并记录其位置
+    let deadline = Instant::now() + Duration::from_secs(30);
+    let (cx, cz) = loop {
+        assert!(Instant::now() < deadline, "no creeper spawned");
+        let (id, payload) = client.recv();
+        if id == play_ids::CLIENTBOUND_ADD_ENTITY {
+            let mut r = Reader::new(&payload);
+            let _entity_id = r.read_var_int().unwrap();
+            let _uuid = r.read_uuid().unwrap();
+            let entity_type = r.read_var_int().unwrap();
+            if entity_type == 23 {
+                let x = r.read_f64_be().unwrap();
+                let _y = r.read_f64_be().unwrap();
+                let z = r.read_f64_be().unwrap();
+                break (x, z);
+            }
+        }
+    };
+
+    // 玩家瞬移到 Creeper 旁边（3 格内触发引信）
+    let mut move_to = Writer::new();
+    move_to.write_f64_be(cx + 1.0);
+    move_to.write_f64_be(-60.0);
+    move_to.write_f64_be(cz + 1.0);
+    move_to.write_bool(true);
+    client.send(play_ids::SERVERBOUND_MOVE_POS, &move_to.into_bytes());
+
+    // 等待实体状态 1（点燃引信闪烁）→ 再等待爆炸包（半径 3）
+    let deadline = Instant::now() + Duration::from_secs(20);
+    let mut saw_fuse = false;
+    let mut saw_explosion = false;
+    while Instant::now() < deadline && !saw_explosion {
+        let (id, payload) = client.recv();
+        if id == play_ids::CLIENTBOUND_ENTITY_EVENT && !saw_fuse {
+            let mut r = Reader::new(&payload);
+            let _entity = r.read_i32_be().unwrap();
+            let status = r.read_i8().unwrap();
+            if status == 1 {
+                saw_fuse = true;
+            }
+        } else if id == play_ids::CLIENTBOUND_EXPLOSION {
+            saw_explosion = true;
+        }
+    }
+    assert!(saw_fuse, "creeper should start fusing near player");
+    assert!(saw_explosion, "creeper should explode after fuse");
 }
 
 /// 服务端命令：`/gamemode creative`、`/gamerule`（含 level.dat 持久化）与
