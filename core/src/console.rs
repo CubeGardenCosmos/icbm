@@ -20,7 +20,7 @@ use std::sync::{Arc, Mutex, OnceLock};
 
 use flate2::write::GzEncoder;
 use icbm_gameplay_icbm::bmtool::{BmToolCommand, format_bmtool_tps};
-use icbm_gameplay_minecraft::commands::{self, Command, GameMode};
+use icbm_gameplay_minecraft::commands::{self, Command, GameMode, WhitelistAction};
 use crate::net::play::about_message;
 use icbm_mc_767::packets::play::clientbound::{
     CGameEvent, CPlayerAbilities, CPlayerInfoUpdate, PlayerInfoEntry,
@@ -236,7 +236,8 @@ fn run_stdin_console(server: Server) {
 
 /// 控制台命令名（升序；补全与提示用）。
 const CONSOLE_COMMANDS: &[&str] = &[
-    "about", "bmtool", "gamemode", "gamerule", "help", "list", "regions", "say", "stop",
+    "about", "ban", "bmtool", "fill", "gamemode", "gamerule", "give", "help", "list", "regions",
+    "say", "setblock", "stop", "tp", "whitelist",
 ];
 
 /// rustyline 补全/高亮/提示助手（参考 master `IcbmCommandCompleter`）。
@@ -403,6 +404,30 @@ impl Server {
                 }
                 Command::Help => print_help(),
                 Command::About => info!("{}", about_message()),
+                Command::Teleport { target, x, y, z } => {
+                    let feedback = apply_teleport(self, target.as_deref(), x, y, z);
+                    info!("{feedback}");
+                }
+                Command::SetBlock { x, y, z, block } => {
+                    let feedback = apply_setblock(self, x, y, z, &block);
+                    info!("{feedback}");
+                }
+                Command::Fill { from, to, block } => {
+                    let feedback = apply_fill(self, from, to, &block);
+                    info!("{feedback}");
+                }
+                Command::Give { target, item, count } => {
+                    let feedback = apply_give(self, &target, &item, count);
+                    info!("{feedback}");
+                }
+                Command::Ban { target, reason } => {
+                    let feedback = apply_ban(self, &target, reason.as_deref());
+                    info!("{feedback}");
+                }
+                Command::Whitelist { action } => {
+                    let feedback = apply_whitelist(self, &action);
+                    info!("{feedback}");
+                }
             }
             return;
         }
@@ -523,6 +548,251 @@ pub fn apply_gamemode(server: &Server, target: Option<&str>, mode: GameMode) -> 
     });
     let name = client.name.lock().expect("name").clone();
     format!("已将 {name} 的游戏模式设为 {}", mode.name())
+}
+
+/// 执行 `/tp`：更新玩家位置（支持跨 region，走 `update_position` 的迁移路径）。
+///
+/// 目标缺省为第一个在线玩家；只支持绝对坐标（相对 `~` 暂不支持）。
+#[must_use]
+pub fn apply_teleport(server: &Server, target: Option<&str>, x: f64, y: f64, z: f64) -> String {
+    use crate::net::play::update_position_for_teleport;
+    let client = {
+        let world = server.world.lock().expect("world lock");
+        target.map_or_else(
+            || world.players.values().next().cloned(),
+            |name| {
+                world
+                    .players
+                    .values()
+                    .find(|c| c.name.lock().expect("name").as_str() == name)
+                    .cloned()
+            },
+        )
+    };
+    let Some(client) = client else {
+        return target.map_or_else(
+            || "没有在线玩家".to_owned(),
+            |name| format!("找不到玩家 {name}"),
+        );
+    };
+    match update_position_for_teleport(server, &client, x, y, z) {
+        Ok(()) => {
+            let name = client.name.lock().expect("name").clone();
+            format!("已将 {name} 传送到 ({x}, {y}, {z})")
+        }
+        Err(err) => format!("传送失败：{err}"),
+    }
+}
+
+/// 执行 `/setblock`：发 IPC 到所在 region 修改方块。
+#[must_use]
+pub fn apply_setblock(server: &Server, x: i32, y: i32, z: i32, block: &str) -> String {
+    let Some(state_id) = icbm_mc_767::registry::name_to_state_id(&format!("minecraft:{block}"))
+    else {
+        return format!("未知方块: {block}");
+    };
+    let region = icbm_region::RegionId::from_overworld_block(x, z);
+    // 确保 region 已拉起（懒启动）
+    if let Err(err) = server.ensure_region(region) {
+        return format!("setblock 失败：无法拉起区域 {}", region.service_name());
+    }
+    let body = icbm_region::protocol::encode_block_update(
+        icbm_region::protocol::DIM_OVERWORLD,
+        x,
+        y,
+        z,
+        state_id,
+    );
+    if let Err(err) = server.ipc.send(
+        &region.service_name(),
+        icbm_region::protocol::kind::BLOCK_UPDATE,
+        &body,
+    ) {
+        return format!("setblock 失败：{err}");
+    }
+    format!("已放置 {block} 于 ({x}, {y}, {z})")
+}
+
+/// 执行 `/fill`：遍历区域内方块逐个发 IPC（数量超过限制时拒绝）。
+#[must_use]
+pub fn apply_fill(
+    server: &Server,
+    from: (i32, i32, i32),
+    to: (i32, i32, i32),
+    block: &str,
+) -> String {
+    let Some(state_id) = icbm_mc_767::registry::name_to_state_id(&format!("minecraft:{block}"))
+    else {
+        return format!("未知方块: {block}");
+    };
+    let (x1, y1, z1) = from;
+    let (x2, y2, z2) = to;
+    let (min_x, max_x) = (x1.min(x2), x1.max(x2));
+    let (min_y, max_y) = (y1.min(y2), y1.max(y2));
+    let (min_z, max_z) = (z1.min(z2), z1.max(z2));
+    let count = (max_x - min_x + 1).max(0) * (max_y - min_y + 1).max(0) * (max_z - min_z + 1).max(0);
+    // 与 vanilla `commandModificationBlockLimit` 一致：超过 32768 拒绝
+    if count > 32768 {
+        return format!("fill 区域过大：{count} 方块（上限 32768）");
+    }
+    // 按区域分组，逐区域发送（每个区域单独确认存在）
+    let mut sent = 0i64;
+    for bx in min_x..=max_x {
+        for by in min_y..=max_y {
+            for bz in min_z..=max_z {
+                let region = icbm_region::RegionId::from_overworld_block(bx, bz);
+                if let Err(err) = server.ensure_region(region) {
+                    return format!("fill 失败：无法拉起区域 {}", region.service_name());
+                }
+                let body = icbm_region::protocol::encode_block_update(
+                    icbm_region::protocol::DIM_OVERWORLD,
+                    bx,
+                    by,
+                    bz,
+                    state_id,
+                );
+                if let Err(err) = server.ipc.send(
+                    &region.service_name(),
+                    icbm_region::protocol::kind::BLOCK_UPDATE,
+                    &body,
+                ) {
+                    return format!("fill 失败：{err}");
+                }
+                sent += 1;
+            }
+        }
+    }
+    format!("已填充 {sent} 个方块（{block}）")
+}
+
+/// 执行 `/give`：向玩家物品栏槽位发送 `CSetSlot`（玩家物品栏 sync_id=-2）。
+#[must_use]
+pub fn apply_give(server: &Server, target: &str, item: &str, count: i32) -> String {
+    use icbm_mc_767::packets::play::clientbound::{CItemStack, CSetSlot};
+    let item_name = format!("minecraft:{item}");
+    if icbm_mc_767::item_ids::item_id(item).is_none() {
+        return format!("未知物品: {item}");
+    }
+    let count = count.clamp(1, 64);
+    let client = {
+        let world = server.world.lock().expect("world lock");
+        world
+            .players
+            .values()
+            .find(|c| c.name.lock().expect("name").as_str() == target)
+            .cloned()
+    };
+    let Some(client) = client else {
+        return format!("找不到玩家 {target}");
+    };
+    // 主手槽（0）放入物品；后续槽位扩展可在此处排队
+    let _ = server;
+    let _ = item_name;
+    let stack = CItemStack::of(item, count);
+    let _ = client.send_encoded(CSetSlot::packet_id(), |w| {
+        CSetSlot {
+            sync_id: -2,
+            revision: 0,
+            slot: 0,
+            stack,
+        }
+        .encode(w);
+    });
+    format!("已给 {target} {count} 个 {item}")
+}
+
+/// 执行 `/ban`：加入封禁列表并踢出在线玩家。
+#[must_use]
+pub fn apply_ban(server: &Server, target: &str, reason: Option<&str>) -> String {
+    // 先按玩家名找到 UUID（离线模式：offline uuid；在线玩家取真实 UUID）
+    let (uuid, name) = {
+        let world = server.world.lock().expect("world lock");
+        world
+            .players
+            .values()
+            .find(|c| c.name.lock().expect("name").as_str() == target)
+            .map_or_else(
+                || {
+                    // 离线玩家：按离线 UUID 计算（与登录一致）
+                    let uuid = crate::client::offline_uuid(target);
+                    (uuid, target.to_owned())
+                },
+                |c| {
+                    let name = c.name.lock().expect("name").clone();
+                    let uuid = *c.uuid.lock().expect("uuid");
+                    (uuid, name)
+                },
+            )
+    };
+    let mut lists = server.lists.lock().expect("lists");
+    if let Err(err) = lists.banned.add(uuid, &name) {
+        return format!("封禁失败：{err}");
+    }
+    let _ = WhitelistAction::List; // 保持导入
+    drop(lists);
+    // 踢出在线玩家
+    let players: Vec<std::sync::Arc<crate::client::Client>> = {
+        let world = server.world.lock().expect("world lock");
+        world.players.values().cloned().collect()
+    };
+    for player in players {
+        if player.name.lock().expect("name").eq_ignore_ascii_case(target) {
+            let msg = reason.map_or_else(
+                || "你已被封禁".to_owned(),
+                |r| format!("你已被封禁：{r}"),
+            );
+            player.kick(&msg);
+        }
+    }
+    reason.map_or_else(
+        || format!("已封禁 {name}"),
+        |r| format!("已封禁 {name}：{r}"),
+    )
+}
+
+/// 执行 `/whitelist`（on/off/add/remove/list）。
+#[must_use]
+pub fn apply_whitelist(server: &Server, action: &WhitelistAction) -> String {
+    use icbm_gameplay_minecraft::commands::WhitelistAction as W;
+    let mut lists = server.lists.lock().expect("lists");
+    match action {
+        W::On => {
+            lists.whitelist_enabled = true;
+            "白名单已启用".to_owned()
+        }
+        W::Off => {
+            lists.whitelist_enabled = false;
+            "白名单已关闭".to_owned()
+        }
+        W::Add(name) => {
+            let uuid = crate::client::offline_uuid(name);
+            match lists.whitelist.add(uuid, name) {
+                Ok(()) => format!("已将 {name} 加入白名单"),
+                Err(err) => format!("添加白名单失败：{err}"),
+            }
+        }
+        W::Remove(name) => {
+            let uuid = crate::client::offline_uuid(name);
+            match lists.whitelist.remove(&uuid, name) {
+                Ok(true) => format!("已从白名单移除 {name}"),
+                Ok(false) => format!("白名单中没有 {name}"),
+                Err(err) => format!("移除白名单失败：{err}"),
+            }
+        }
+        W::List => {
+            if lists.whitelist.is_empty() {
+                "白名单为空".to_owned()
+            } else {
+                let names: Vec<&str> = lists
+                    .whitelist
+                    .entries()
+                    .iter()
+                    .map(|entry| entry.name.as_str())
+                    .collect();
+                format!("白名单 ({}): {}", names.len(), names.join(", "))
+            }
+        }
+    }
 }
 
 /// 广播系统消息（`say`）。

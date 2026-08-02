@@ -12,9 +12,9 @@ use tracing::{debug, error, info, warn};
 use uuid::Uuid;
 
 use crate::protocol::{
-    CORE_SERVICE, DIM_OVERWORLD, Ipc, IpcError, IpcMessage, decode_chunk_request,
-    decode_player_enter, decode_player_leave, decode_register_ack, encode_chunk_data,
-    encode_entity_data, encode_heartbeat, encode_register, encode_stats, kind,
+    CORE_SERVICE, DIM_OVERWORLD, Ipc, IpcError, IpcMessage, decode_block_update,
+    decode_chunk_request, decode_player_enter, decode_player_leave, decode_register_ack,
+    encode_chunk_data, encode_entity_data, encode_heartbeat, encode_register, encode_stats, kind,
 };
 use crate::store::ChunkStore;
 use crate::{Face, RegionId};
@@ -201,6 +201,26 @@ impl RegionService {
     /// 每 tick 最多发送的区块数（8 × 约 42KB ≈ 336KB < 512KiB 单帧上限；
     /// 仍保留分批发送作流控，避免瞬时占满 channel 影响心跳）。
     const CHUNKS_PER_TICK: usize = 8;
+
+    /// 应用 `setblock`/`fill` 方块修改并向区域玩家广播 `CBlockUpdate`。
+    fn apply_block_update(
+        &mut self,
+        face: Face,
+        x: i32,
+        y: i32,
+        z: i32,
+        state_id: i32,
+    ) -> Result<(), RegionError> {
+        self.store.set_block(face, x, y, z, state_id)?;
+        let packet = icbm_mc_767::packets::play::clientbound::CBlockUpdate {
+            position: icbm_mc_767::packets::play::BlockPos::new(x, y, z),
+            state_id,
+        };
+        self.send_entity_packet(play_ids::CLIENTBOUND_BLOCK_UPDATE, |w| {
+            packet.encode(w);
+        })?;
+        Ok(())
+    }
     /// 新建服务（连接 datarouter、打开存档）。
     pub fn new(config: RegionConfig) -> Result<Self, RegionError> {
         let ipc = Ipc::connect(
@@ -377,6 +397,13 @@ impl RegionService {
                 info!(id = %self.config.id.service_name(), "unload requested, flushing");
                 self.store.flush()?;
                 self.running = false;
+            }
+            kind::BLOCK_UPDATE => {
+                let (dim, x, y, z, state_id) = decode_block_update(&message.body)?;
+                let Some(face) = Face::from_byte(dim) else {
+                    return Err(RegionError::InvalidMessage(format!("bad dim {dim}")));
+                };
+                self.apply_block_update(face, x, y, z, state_id)?;
             }
             kind::REGION_STATS => {
                 let tps = if self.state == RegionState::Simulating {

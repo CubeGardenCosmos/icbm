@@ -62,10 +62,13 @@ impl GameMode {
 
 /// 顶层命令名（客户端命令树与 Tab 补全建议用；icbm 命名空间的 `bmtool` 由
 /// `icbm-gameplay-icbm` 提供，core 汇总时追加）。
-pub const COMMAND_NAMES: &[&str] = &["about", "gamemode", "gamerule", "help"];
+pub const COMMAND_NAMES: &[&str] = &[
+    "about", "ban", "fill", "gamemode", "gamerule", "give", "help", "setblock", "tp",
+    "whitelist",
+];
 
 /// 解析后的命令。
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq)]
 pub enum Command {
     /// `/gamemode <模式> [玩家]`。
     GameMode {
@@ -78,6 +81,41 @@ pub enum Command {
     Help,
     /// `/about`（品牌与构建信息）。
     About,
+    /// `/tp <玩家> <x> <y> <z>`（或 `/tp <x> <y> <z>`）。
+    Teleport {
+        target: Option<String>,
+        x: f64,
+        y: f64,
+        z: f64,
+    },
+    /// `/setblock <x> <y> <z> <方块>`。
+    SetBlock {
+        x: i32,
+        y: i32,
+        z: i32,
+        block: String,
+    },
+    /// `/fill <x1> <y1> <z1> <x2> <y2> <z2> <方块>`。
+    Fill {
+        from: (i32, i32, i32),
+        to: (i32, i32, i32),
+        block: String,
+    },
+    /// `/give <玩家> <物品> [数量]`。
+    Give {
+        target: String,
+        item: String,
+        count: i32,
+    },
+    /// `/ban <玩家> [原因]`。
+    Ban {
+        target: String,
+        reason: Option<String>,
+    },
+    /// `/whitelist on|off|add <玩家>|remove <玩家>|list`。
+    Whitelist {
+        action: WhitelistAction,
+    },
 }
 
 /// 解析命令行的第一段（`/gamemode ...` / `/gamerule ...` / `/help`）。
@@ -105,11 +143,129 @@ pub fn parse_command(line: &str) -> Option<Command> {
         }
         "help" => Some(Command::Help),
         "about" => Some(Command::About),
+        "tp" => parse_tp(parts),
+        "setblock" => parse_setblock(parts),
+        "fill" => parse_fill(parts),
+        "give" => parse_give(parts),
+        "ban" => {
+            let target = parts.next()?.to_owned();
+            let reason = parts.next().map(str::to_owned);
+            Some(Command::Ban { target, reason })
+        }
+        "whitelist" => parse_whitelist(parts),
         _ => None,
     }
 }
 
-/// 执行 `/gamerule`（查询或设置），返回反馈文本。
+/// 解析 `/tp`：`[玩家] <x> <y> <z>`（相对坐标 `~`/`^` 暂不支持）。
+fn parse_tp(parts: std::str::SplitWhitespace<'_>) -> Option<Command> {
+    let values: Vec<&str> = parts.collect();
+    match values.len() {
+        3 => {
+            let x = values[0].parse().ok()?;
+            let y = values[1].parse().ok()?;
+            let z = values[2].parse().ok()?;
+            Some(Command::Teleport {
+                target: None,
+                x,
+                y,
+                z,
+            })
+        }
+        4 => {
+            let x = values[1].parse().ok()?;
+            let y = values[2].parse().ok()?;
+            let z = values[3].parse().ok()?;
+            Some(Command::Teleport {
+                target: Some(values[0].to_owned()),
+                x,
+                y,
+                z,
+            })
+        }
+        _ => None,
+    }
+}
+
+/// 解析 `/setblock <x> <y> <z> <方块>`（方块名可带 `minecraft:` 前缀）。
+fn parse_setblock(parts: std::str::SplitWhitespace<'_>) -> Option<Command> {
+    let values: Vec<&str> = parts.collect();
+    if values.len() != 4 {
+        return None;
+    }
+    Some(Command::SetBlock {
+        x: values[0].parse().ok()?,
+        y: values[1].parse().ok()?,
+        z: values[2].parse().ok()?,
+        block: normalize_name(values[3]),
+    })
+}
+
+/// 解析 `/fill <x1> <y1> <z1> <x2> <y2> <z2> <方块>`。
+fn parse_fill(parts: std::str::SplitWhitespace<'_>) -> Option<Command> {
+    let values: Vec<&str> = parts.collect();
+    if values.len() != 7 {
+        return None;
+    }
+    Some(Command::Fill {
+        from: (values[0].parse().ok()?, values[1].parse().ok()?, values[2].parse().ok()?),
+        to: (values[3].parse().ok()?, values[4].parse().ok()?, values[5].parse().ok()?),
+        block: normalize_name(values[6]),
+    })
+}
+
+/// 解析 `/give <玩家> <物品> [数量]`。
+fn parse_give(parts: std::str::SplitWhitespace<'_>) -> Option<Command> {
+    let values: Vec<&str> = parts.collect();
+    match values.len() {
+        2 => Some(Command::Give {
+            target: values[0].to_owned(),
+            item: normalize_name(values[1]),
+            count: 1,
+        }),
+        3 => Some(Command::Give {
+            target: values[0].to_owned(),
+            item: normalize_name(values[1]),
+            count: values[2].parse().ok()?,
+        }),
+        _ => None,
+    }
+}
+
+/// 白名单动作。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum WhitelistAction {
+    /// 启用白名单。
+    On,
+    /// 关闭白名单。
+    Off,
+    /// 添加玩家。
+    Add(String),
+    /// 移除玩家。
+    Remove(String),
+    /// 列出玩家。
+    List,
+}
+
+/// 解析 `/whitelist` 子命令。
+fn parse_whitelist(mut parts: std::str::SplitWhitespace<'_>) -> Option<Command> {
+    let action = parts.next()?;
+    let action = match action {
+        "on" => WhitelistAction::On,
+        "off" => WhitelistAction::Off,
+        "list" => WhitelistAction::List,
+        "add" => WhitelistAction::Add(parts.next()?.to_owned()),
+        "remove" => WhitelistAction::Remove(parts.next()?.to_owned()),
+        _ => return None,
+    };
+    Some(Command::Whitelist { action })
+}
+
+/// 规范化方块/物品名：去 `minecraft:` 前缀（存储与网络 ID 表使用裸名）。
+#[must_use]
+pub fn normalize_name(name: &str) -> String {
+    name.strip_prefix("minecraft:").unwrap_or(name).to_owned()
+}
 pub fn apply_gamerule(
     store: &mut GameRuleStore,
     rule: &str,

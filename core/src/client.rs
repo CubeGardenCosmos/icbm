@@ -370,6 +370,12 @@ impl Client {
         *self.last_move.lock().expect("last move") = (position, Instant::now());
     }
 
+    /// 分配传送 ID（`CPlayerPosition` 用）。
+    #[must_use]
+    pub fn next_teleport_id(&self) -> i32 {
+        self.teleport_id.fetch_add(1, Ordering::Relaxed) + 1
+    }
+
     /// 对端 IP（正版验证 `hasJoined&ip=` 参数）。
     #[must_use]
     pub fn peer_ip(&self) -> Option<String> {
@@ -757,6 +763,14 @@ fn handle_login_key(
 /// 完成登录：压缩 → 登录成功（正版/离线共用）。
 fn finish_login(server: &Server, client: &Arc<Client>, uuid: Uuid) -> Result<(), NetError> {
     let name = client.name.lock().expect("name").clone();
+    // 白名单/封禁检查（登录名单：封禁拒绝、白名单启用时拒绝未列入者）
+    {
+        let lists = server.lists.lock().expect("lists");
+        if let Err(reason) = lists.check_login(&uuid, &name) {
+            client.kick(&reason);
+            return Ok(());
+        }
+    }
     // 压缩
     let threshold = server.config.compression_threshold;
     if threshold > 0 {

@@ -193,6 +193,32 @@ impl ChunkColumn {
         }
         heights
     }
+
+    /// 写入世界坐标方块状态 ID（`setblock`/`fill`/流体/红石/TNT 共用）。
+    ///
+    /// 越界（超出区块列高或世界 Y 范围）时静默忽略并返回 `false`；写入空气会
+    /// 自然更新 heightmap（调用方如需要重发区块，用 `network_chunk_payload`）。
+    pub fn set_block(&mut self, x: u32, world_y: i32, z: u32, state_id: i32) -> bool {
+        let base_y = self.bottom_section_y * 16;
+        if world_y < base_y {
+            return false;
+        }
+        let relative = world_y - base_y;
+        let section_index = (relative / 16) as usize;
+        if section_index >= self.sections.len() {
+            return false;
+        }
+        let local_y = relative % 16;
+        let index = ((local_y << 4 | z as i32) << 4 | x as i32) as usize;
+        self.sections[section_index][index] = state_id;
+        true
+    }
+
+    /// 世界坐标 → 区块内相对坐标（0..16）。
+    #[must_use]
+    pub const fn local_coord(block: i32) -> u32 {
+        (block & 0xF) as u32
+    }
 }
 
 /// 生成 flat 区块。

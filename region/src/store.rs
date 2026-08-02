@@ -118,6 +118,31 @@ impl ChunkStore {
 
     /// 取区块（内存 → Anvil → flat 生成）。
     pub fn get_chunk(&mut self, face: Face, cx: i32, cz: i32) -> Result<&ChunkColumn, StoreError> {
+        self.ensure_loaded(face, cx, cz)?;
+        let map = match face {
+            Face::Overworld => &self.overworld,
+            Face::Nether => &self.nether,
+        };
+        Ok(map.get(&(cx, cz)).expect("chunk just inserted"))
+    }
+
+    /// 取区块（可变引用，供方块修改）。
+    pub fn get_chunk_mut(
+        &mut self,
+        face: Face,
+        cx: i32,
+        cz: i32,
+    ) -> Result<&mut ChunkColumn, StoreError> {
+        self.ensure_loaded(face, cx, cz)?;
+        let map = match face {
+            Face::Overworld => &mut self.overworld,
+            Face::Nether => &mut self.nether,
+        };
+        Ok(map.get_mut(&(cx, cz)).expect("chunk just inserted"))
+    }
+
+    /// 确保区块已加载（内存 → Anvil → flat 生成）。
+    fn ensure_loaded(&mut self, face: Face, cx: i32, cz: i32) -> Result<(), StoreError> {
         self.check_owned(face, cx, cz)?;
         let loaded = match face {
             Face::Overworld => self.overworld.contains_key(&(cx, cz)),
@@ -135,11 +160,7 @@ impl ChunkStore {
             };
             self.loaded += 1;
         }
-        let map = match face {
-            Face::Overworld => &self.overworld,
-            Face::Nether => &self.nether,
-        };
-        Ok(map.get(&(cx, cz)).expect("chunk just inserted"))
+        Ok(())
     }
 
     /// 从 Anvil 加载或生成主世界区块。
@@ -183,6 +204,47 @@ impl ChunkStore {
         }
         self.overworld_file.flush()?;
         Ok(())
+    }
+
+    /// 设置方块状态 ID（`setblock`/`fill`）。
+    ///
+    /// 返回 `(chunk_x, chunk_z, 新状态)`；区块不存在时先生成。越界或非本区域
+    /// 区块返回 `Err(NotOwned)`（调用方按区域边界拒绝）。
+    pub fn set_block(
+        &mut self,
+        face: Face,
+        x: i32,
+        y: i32,
+        z: i32,
+        state_id: i32,
+    ) -> Result<(i32, i32), StoreError> {
+        let cx = x.div_euclid(16);
+        let cz = z.div_euclid(16);
+        self.check_owned(face, cx, cz)?;
+        let column = self.get_chunk_mut(face, cx, cz)?;
+        let ok = column.set_block(
+            icbm_terrain_gen::ChunkColumn::local_coord(x),
+            y,
+            icbm_terrain_gen::ChunkColumn::local_coord(z),
+            state_id,
+        );
+        if !ok {
+            return Err(StoreError::NotOwned("set_block out of range", cx, cz));
+        }
+        Ok((cx, cz))
+    }
+
+    /// 取区块内方块状态 ID（供 region 模拟查询）。
+    pub fn block_at(&mut self, face: Face, x: i32, y: i32, z: i32) -> Result<i32, StoreError> {
+        let cx = x.div_euclid(16);
+        let cz = z.div_euclid(16);
+        self.check_owned(face, cx, cz)?;
+        let column = self.get_chunk(face, cx, cz)?;
+        Ok(column.block_at(
+            icbm_terrain_gen::ChunkColumn::local_coord(x),
+            y,
+            icbm_terrain_gen::ChunkColumn::local_coord(z),
+        ))
     }
 }
 

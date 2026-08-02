@@ -674,7 +674,10 @@ fn run_command_tab_completion() {
     let texts = request_suggestions(&mut client, "/", 1);
     assert_eq!(
         texts,
-        vec!["about", "bmtool", "gamemode", "gamerule", "help"]
+        vec![
+            "about", "ban", "bmtool", "fill", "gamemode", "gamerule", "give", "help", "setblock",
+            "tp", "whitelist",
+        ]
     );
 
     // "/gamemode cr" → creative；替换区间覆盖 "cr"（起点 10、长度 2）。

@@ -34,7 +34,7 @@ time = { version = "0.3", default-features = false, features = ["std", "formatti
 tracing = { version = "0.1", default-features = false }
 tracing-subscriber = { version = "0.3", default-features = false, features = ["fmt", "env-filter", "ansi", "time", "registry", "local-time", "std"] }
 ureq = { version = "3", default-features = false, features = ["json"] }
-uuid = { version = "1", features = ["v4"] }
+uuid = { version = "1", features = ["v4", "serde"] }
 
 [lints]
 workspace = true

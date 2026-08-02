@@ -66,6 +66,18 @@ impl RegionId {
         }
     }
 
+    /// 从主世界方块坐标求区域（32 区块 = 512 方块）。
+    #[must_use]
+    pub const fn from_overworld_block(x: i32, z: i32) -> Self {
+        Self::from_overworld_chunk(x.div_euclid(16), z.div_euclid(16))
+    }
+
+    /// 从地狱方块坐标求区域（4 区块 = 64 方块）。
+    #[must_use]
+    pub const fn from_nether_block(x: i32, z: i32) -> Self {
+        Self::from_nether_chunk(x.div_euclid(16), z.div_euclid(16))
+    }
+
     /// datarouter 服务名（`icbm.region.o_<rx>_<rz>`）。
     #[must_use]
     pub fn service_name(&self) -> String {

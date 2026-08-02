@@ -94,6 +94,8 @@ pub struct ServerInner {
     pub online_mode: crate::net::crypto::OnlineMode,
     /// 登录 RSA 密钥对（正版/加密登录用）。
     pub key_store: crate::net::crypto::KeyStore,
+    /// 白名单与封禁列表。
+    pub lists: std::sync::Mutex<crate::lists::LoginLists>,
     /// 收到的 `CHUNK_DATA` 计数（诊断）。
     pub chunk_diag: std::sync::atomic::AtomicU64,
 }
@@ -127,6 +129,7 @@ impl Server {
         let ipc = Ipc::connect(&config.shm_name, "icbm.core", auth_token)?;
         info!("connected to datarouter {}", config.shm_name);
         let world = Mutex::new(WorldState::new(config.world_dir.clone()));
+        let world_dir_for_lists = config.world_dir.clone();
         // 从 level.dat 恢复游戏规则（`GameRules` 复合，对照 `LevelSave` 启动路径）
         if let Ok(level) = icbm_anvil::level::read_level_dat(&level_path) {
             let mut state = world.lock().expect("world lock");
@@ -146,6 +149,9 @@ impl Server {
                 online_mode: crate::net::crypto::online_mode_from_env(),
                 key_store: crate::net::crypto::KeyStore::new()
                     .map_err(ServerError::Crypto)?,
+                lists: std::sync::Mutex::new(crate::lists::LoginLists::load(
+                    world_dir_for_lists,
+                )),
                 chunk_diag: std::sync::atomic::AtomicU64::new(0),
             }),
         })

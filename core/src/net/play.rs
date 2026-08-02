@@ -7,7 +7,9 @@ use std::time::{Duration, Instant};
 use icbm_gameplay_icbm::bmtool::{BmToolTpsData, format_bmtool_tps};
 use icbm_gameplay_minecraft::commands::{self, Command};
 use icbm_mc_767::codec::Reader;
-use icbm_mc_767::packets::play::clientbound::{CCommandSuggestions, CCommands, CommandTreeNode};
+use icbm_mc_767::packets::play::clientbound::{
+    CCommandSuggestions, CCommands, CPlayerPosition, CommandTreeNode,
+};
 use icbm_mc_767::packets::play::serverbound::{
     SChatAck, SChatCommand, SChatCommandSigned, SChatMessage, SCommandSuggestionRequest,
     SConfirmTeleport, SKeepAlive, SMovePlayerPos, SMovePlayerPosRot, SMovePlayerRot,
@@ -394,6 +396,40 @@ fn update_position(
     Ok(())
 }
 
+/// 玩家传送：设置新位置并处理跨 region 迁移（`/tp` 命令用）。
+///
+/// 复用 [`update_position`] 的迁移路径：先更新位置，再处理 region 归属变化、
+/// 补视野区块；同时发 `CPlayerPosition` 同步客户端，并重置速度基准。
+pub fn update_position_for_teleport(
+    server: &Server,
+    client: &Arc<Client>,
+    x: f64,
+    y: f64,
+    z: f64,
+) -> Result<(), NetError> {
+    update_position(server, client, |pos| {
+        pos.x = x;
+        pos.y = y;
+        pos.z = z;
+    })?;
+    // 同步客户端位置（绝对坐标、无标志位、新传送 ID）
+    let teleport_id = client.next_teleport_id();
+    client.send_encoded(CPlayerPosition::packet_id(), |w| {
+        CPlayerPosition {
+            x,
+            y,
+            z,
+            yaw: client.position.lock().expect("position").yaw,
+            pitch: client.position.lock().expect("position").pitch,
+            flags: 0,
+            teleport_id,
+        }
+        .encode(w);
+    })?;
+    client.reset_move_baseline();
+    Ok(())
+}
+
 /// 广播聊天。
 fn broadcast_chat(server: &Server, client: &Arc<Client>, message: &str) {
     if message.is_empty() || message.len() > 256 {
@@ -433,10 +469,34 @@ fn handle_player_command(server: &Server, client: &Arc<Client>, command: &str) {
             }
         }
         Some(Command::Help) => {
-            let _ = client.send_system_chat("可用命令: /about, /gamemode, /gamerule, /bmtool tps", false);
+            let _ = client.send_system_chat("可用命令: /about, /gamemode, /gamerule, /bmtool tps, /tp, /setblock, /fill, /give", false);
         }
         Some(Command::About) => {
             let _ = client.send_system_chat(&about_message(), false);
+        }
+        Some(Command::Teleport { target, x, y, z }) => {
+            let feedback = crate::console::apply_teleport(server, target.as_deref(), x, y, z);
+            let _ = client.send_system_chat(&feedback, false);
+        }
+        Some(Command::SetBlock { x, y, z, block }) => {
+            let feedback = crate::console::apply_setblock(server, x, y, z, &block);
+            let _ = client.send_system_chat(&feedback, false);
+        }
+        Some(Command::Fill { from, to, block }) => {
+            let feedback = crate::console::apply_fill(server, from, to, &block);
+            let _ = client.send_system_chat(&feedback, false);
+        }
+        Some(Command::Give { target, item, count }) => {
+            let feedback = crate::console::apply_give(server, &target, &item, count);
+            let _ = client.send_system_chat(&feedback, false);
+        }
+        Some(Command::Ban { target, reason }) => {
+            let feedback = crate::console::apply_ban(server, &target, reason.as_deref());
+            let _ = client.send_system_chat(&feedback, false);
+        }
+        Some(Command::Whitelist { action }) => {
+            let feedback = crate::console::apply_whitelist(server, &action);
+            let _ = client.send_system_chat(&feedback, false);
         }
         None => {}
     }
@@ -451,7 +511,10 @@ fn handle_player_command(server: &Server, client: &Arc<Client>, command: &str) {
 
 /// 顶层命令名（minecraft 命名空间 + icbm 命名空间 `bmtool`；升序，与
 /// `command_suggestions` 的排序约定一致）。
-const TOP_LEVEL_COMMANDS: &[&str] = &["about", "bmtool", "gamemode", "gamerule", "help"];
+const TOP_LEVEL_COMMANDS: &[&str] = &[
+    "about", "ban", "bmtool", "fill", "gamemode", "gamerule", "give", "help", "setblock", "tp",
+    "whitelist",
+];
 
 /// 构建客户端命令树（0x11 `CommandTreeS2CPacket`）。
 ///
@@ -463,46 +526,86 @@ pub fn build_command_tree() -> CCommands {
     CCommands {
         nodes: vec![
             Node::Root {
-                children: vec![1, 2, 3, 4, 5],
+                children: vec![1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11],
             },
             Node::Literal {
                 name: "about".to_owned(),
                 children: vec![],
             },
             Node::Literal {
-                name: "gamemode".to_owned(),
-                children: vec![6],
-            },
-            Node::Literal {
-                name: "gamerule".to_owned(),
-                children: vec![7],
+                name: "ban".to_owned(),
+                children: vec![12],
             },
             Node::Literal {
                 name: "bmtool".to_owned(),
-                children: vec![8],
+                children: vec![19],
+            },
+            Node::Literal {
+                name: "fill".to_owned(),
+                children: vec![13],
+            },
+            Node::Literal {
+                name: "gamemode".to_owned(),
+                children: vec![14],
+            },
+            Node::Literal {
+                name: "gamerule".to_owned(),
+                children: vec![15],
+            },
+            Node::Literal {
+                name: "give".to_owned(),
+                children: vec![16],
             },
             Node::Literal {
                 name: "help".to_owned(),
                 children: vec![],
             },
-            Node::Argument {
-                name: "mode".to_owned(),
-                children: vec![9],
-            },
-            Node::Argument {
-                name: "rule".to_owned(),
-                children: vec![10],
+            Node::Literal {
+                name: "setblock".to_owned(),
+                children: vec![17],
             },
             Node::Literal {
-                name: "tps".to_owned(),
-                children: vec![],
+                name: "tp".to_owned(),
+                children: vec![18],
+            },
+            Node::Literal {
+                name: "whitelist".to_owned(),
+                children: vec![20],
             },
             Node::Argument {
                 name: "target".to_owned(),
                 children: vec![],
             },
             Node::Argument {
-                name: "value".to_owned(),
+                name: "from".to_owned(),
+                children: vec![],
+            },
+            Node::Argument {
+                name: "mode".to_owned(),
+                children: vec![],
+            },
+            Node::Argument {
+                name: "rule".to_owned(),
+                children: vec![],
+            },
+            Node::Argument {
+                name: "item".to_owned(),
+                children: vec![],
+            },
+            Node::Argument {
+                name: "pos".to_owned(),
+                children: vec![],
+            },
+            Node::Argument {
+                name: "destination".to_owned(),
+                children: vec![],
+            },
+            Node::Literal {
+                name: "tps".to_owned(),
+                children: vec![],
+            },
+            Node::Argument {
+                name: "action".to_owned(),
                 children: vec![],
             },
         ],
@@ -561,13 +664,19 @@ fn command_suggestions(server: &Server, input: &str) -> (i32, i32, Vec<String>) 
             .into_iter()
             .map(str::to_owned)
             .collect(),
-        ["gamemode", _] => online_player_names(server),
+        [cmd, _] if matches!(*cmd, "gamemode" | "give" | "ban") => online_player_names(server),
         ["gamerule"] => icbm_gameplay_minecraft::gamerules::GAME_RULES
             .iter()
             .map(|rule| rule.name.to_owned())
             .collect(),
         ["gamerule", rule] => gamerule_value_suggestions(rule),
         ["bmtool"] => vec!["tps".to_owned()],
+        ["whitelist"] => {
+            vec!["on", "off", "add", "remove", "list"]
+                .into_iter()
+                .map(str::to_owned)
+                .collect()
+        }
         _ => Vec::new(),
     };
     candidates.retain(|candidate| candidate.starts_with(typing));

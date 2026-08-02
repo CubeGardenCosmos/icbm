@@ -43,6 +43,8 @@ pub mod kind {
     pub const REGION_STATS_RESP: u8 = 0x09;
     /// R→C：实体包（AddEntity/MoveEntityPos 等，core 转发给区域玩家）。
     pub const ENTITY_DATA: u8 = 0x0A;
+    /// C→R：方块修改（`setblock`/`fill`：`[u8 dim][i32 x][i32 y][i32 z][i32 state_id]`）。
+    pub const BLOCK_UPDATE: u8 = 0x0B;
 }
 
 /// IPC 错误。
@@ -398,6 +400,32 @@ pub fn decode_entity_data(body: &[u8]) -> Result<(u8, i32, i32, i32, &[u8]), Ipc
     ))
 }
 
+/// `BLOCK_UPDATE` 载荷：`[u8 dim][i32 x][i32 y][i32 z][i32 state_id]`。
+#[must_use]
+pub fn encode_block_update(dim: u8, x: i32, y: i32, z: i32, state_id: i32) -> Vec<u8> {
+    let mut out = Vec::with_capacity(21);
+    out.push(dim);
+    out.extend_from_slice(&x.to_le_bytes());
+    out.extend_from_slice(&y.to_le_bytes());
+    out.extend_from_slice(&z.to_le_bytes());
+    out.extend_from_slice(&state_id.to_le_bytes());
+    out
+}
+
+/// 解析 `BLOCK_UPDATE` 载荷。
+pub fn decode_block_update(body: &[u8]) -> Result<(u8, i32, i32, i32, i32), IpcError> {
+    if body.len() < 17 {
+        return Err(IpcError::Length("block update", body.len()));
+    }
+    Ok((
+        body[0],
+        i32::from_le_bytes(body[1..5].try_into().expect("slice")),
+        i32::from_le_bytes(body[5..9].try_into().expect("slice")),
+        i32::from_le_bytes(body[9..13].try_into().expect("slice")),
+        i32::from_le_bytes(body[13..17].try_into().expect("slice")),
+    ))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -458,6 +486,13 @@ mod tests {
         let (dim, rx, rz, packet_id, data) = decode_entity_data(&body).unwrap();
         assert_eq!((dim, rx, rz, packet_id), (DIM_OVERWORLD, 3, -2, 0x2E));
         assert_eq!(data, &payload[..]);
+    }
+
+    #[test]
+    fn block_update_round_trip() {
+        let body = encode_block_update(DIM_OVERWORLD, 12, 64, -8, 9);
+        let (dim, x, y, z, state) = decode_block_update(&body).unwrap();
+        assert_eq!((dim, x, y, z, state), (DIM_OVERWORLD, 12, 64, -8, 9));
     }
 
     #[test]
