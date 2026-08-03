@@ -15,10 +15,10 @@ use crate::protocol::{
     CORE_SERVICE, DIM_OVERWORLD, Ipc, IpcError, IpcMessage, decode_block_nbt_get,
     decode_block_nbt_resp, decode_block_nbt_set, decode_block_query, decode_block_raycast,
     decode_block_update, decode_chunk_request, decode_gamerule_update, decode_player_enter,
-    decode_player_leave, decode_player_move, decode_register_ack, decode_time_update,
-    encode_block_nbt_resp, encode_block_query_resp, encode_block_raycast_resp,
-    encode_chunk_data, encode_command_execute, encode_entity_data, encode_heartbeat,
-    encode_register, encode_stats, kind,
+    decode_player_leave, decode_player_move, decode_register_ack, decode_surface_query,
+    decode_time_update, decode_weather_update, encode_block_nbt_resp, encode_block_query_resp,
+    encode_block_raycast_resp, encode_chunk_data, encode_command_execute, encode_entity_data,
+    encode_heartbeat, encode_register, encode_stats, encode_surface_resp, kind,
 };
 use crate::store::ChunkStore;
 use crate::{Face, RegionId};
@@ -196,6 +196,9 @@ struct Creeper {
     fuse: i32,
 }
 
+/// 传送门框架检测结果：`(朝向, 待填充方块列表)`。
+type FoundFrame = (crate::portal::PortalAxis, Vec<(i32, i32, i32)>);
+
 /// region 服务。
 pub struct RegionService {
     config: RegionConfig,
@@ -312,40 +315,50 @@ impl RegionService {
         let lookup = |bx: i32, by: i32, bz: i32| {
             snapshot.get(&(bx, by, bz)).copied().unwrap_or(0)
         };
-        // 该黑曜石可能属于两种朝向的框架左下角/右下角等位置；简化：从放置点
-        // 作为左下角检测两种朝向，并向上/向左平移若干格再试（覆盖柱位）
-        for (axis, dx, dz) in [
-            (PortalAxis::X, 0, 0),
-            (PortalAxis::Z, 0, 0),
-            (PortalAxis::X, -1, 0),
-            (PortalAxis::Z, 0, -1),
-        ] {
-            let base_x = x + dx;
-            let base_z = z + dz;
-            for bottom in (y - 4)..=y {
-                let Some(fill) = detect_portal_frame(base_x, base_z, bottom, axis, &lookup)
-                else {
-                    continue;
+        // 放置点可能是框架任意一格（底部/顶部横梁、两侧立柱），对两种朝向分别
+        // 搜索框架原点（原点 = 放置点沿厚度方向不动、沿宽度方向回退 0..3 格）。
+        let found: Option<FoundFrame> = {
+            let mut result = None;
+            'search: for axis in [PortalAxis::X, PortalAxis::Z] {
+                let (dx_offsets, dz_offsets): (Vec<i32>, Vec<i32>) = match axis {
+                    PortalAxis::X => (vec![0], (-3..=0).collect()),
+                    PortalAxis::Z => ((-3..=0).collect(), vec![0]),
                 };
-                // 填充传送门方块
-                let state = portal_state(axis);
-                for (fx, fy, fz) in &fill {
-                    if self
-                        .store
-                        .set_block(Face::Overworld, *fx, *fy, *fz, state)
-                        .is_ok()
-                    {
-                        let packet =
-                            icbm_mc_767::packets::play::clientbound::CBlockUpdate {
-                                position: icbm_mc_767::packets::play::BlockPos::new(*fx, *fy, *fz),
-                                state_id: state,
-                            };
-                        self.send_entity_packet(play_ids::CLIENTBOUND_BLOCK_UPDATE, |w| {
-                            packet.encode(w);
-                        })?;
+                for &dx in &dx_offsets {
+                    for &dz in &dz_offsets {
+                        let base_x = x + dx;
+                        let base_z = z + dz;
+                        for bottom in (y - 4)..=y {
+                            if let Some(fill) =
+                                detect_portal_frame(base_x, base_z, bottom, axis, &lookup)
+                            {
+                                result = Some((axis, fill));
+                                break 'search;
+                            }
+                        }
                     }
                 }
-                return Ok(());
+            }
+            result
+        };
+        let Some((axis, fill)) = found else {
+            return Ok(());
+        };
+        // 填充传送门方块
+        let state = portal_state(axis);
+        for (fx, fy, fz) in &fill {
+            if self
+                .store
+                .set_block(Face::Overworld, *fx, *fy, *fz, state)
+                .is_ok()
+            {
+                let packet = icbm_mc_767::packets::play::clientbound::CBlockUpdate {
+                    position: icbm_mc_767::packets::play::BlockPos::new(*fx, *fy, *fz),
+                    state_id: state,
+                };
+                self.send_entity_packet(play_ids::CLIENTBOUND_BLOCK_UPDATE, |w| {
+                    packet.encode(w);
+                })?;
             }
         }
         Ok(())
@@ -356,8 +369,9 @@ impl RegionService {
     /// 每 tick 检查已加载区块列（高度范围），收集扩散更新后统一写入并广播
     /// `CBlockUpdate`（避免 tick 中多次借锁）。
     fn tick_fluids(&mut self) -> Result<(), RegionError> {
-        // 只遍历含流体的区块（脏区块跟踪，避免每 tick 全量扫描 384 高度）
-        let chunks = self.store.dirty_overworld_chunks();
+        // 只遍历含流体的区块（流体脏区块跟踪，避免每 tick 全量扫描 384 高度
+        // 拖慢 region tick、延迟 IPC 响应）
+        let chunks = self.store.fluid_chunks();
         if chunks.is_empty() {
             return Ok(());
         }
@@ -386,6 +400,8 @@ impl RegionService {
                     .is_ok()
                 {
                     updates.push((x, y, z, state));
+                    // 扩散未稳定：下一 tick 继续
+                    self.store.mark_fluid_dirty(cx, cz);
                 }
             }
         }
@@ -620,6 +636,30 @@ impl RegionService {
                     };
                 }
             }
+            kind::WEATHER_UPDATE => {
+                if let Ok((raining, thundering, rain, thunder)) =
+                    decode_weather_update(&message.body)
+                {
+                    let toggled = self.weather.apply_from_core(raining, thundering, rain, thunder);
+                    // 晴雨切换：广播 START/STOP（对照 vanilla `tickWeather`）
+                    if toggled {
+                        let event = if raining {
+                            crate::weather::GAME_EVENT_RAIN_STARTED
+                        } else {
+                            crate::weather::GAME_EVENT_RAIN_STOPPED
+                        };
+                        let packet = icbm_mc_767::packets::play::clientbound::CGameEvent {
+                            event,
+                            value: 0.0,
+                        };
+                        self.send_entity_packet(play_ids::CLIENTBOUND_GAME_EVENT, |w| {
+                            packet.encode(w);
+                        })?;
+                    }
+                    // 梯度广播
+                    self.sync_weather_to_players()?;
+                }
+            }
             kind::BLOCK_NBT_GET => {
                 let (dim, x, y, z) = decode_block_nbt_get(&message.body)?;
                 let nbt = self.store.block_entity(x, y, z).cloned();
@@ -642,6 +682,12 @@ impl RegionService {
                     kind::BLOCK_RAYCAST_RESP,
                     &encode_block_raycast_resp(hit, x, y, z),
                 )?;
+            }
+            kind::SURFACE_QUERY => {
+                let (dim, x, z) = decode_surface_query(&message.body)?;
+                let _ = dim;
+                let y = surface_height(&mut self.store, x, z);
+                self.ipc.send(CORE_SERVICE, kind::SURFACE_RESP, &encode_surface_resp(y))?;
             }
             kind::BLOCK_QUERY => {
                 let (dim, x, y, z) = decode_block_query(&message.body)?;
@@ -936,13 +982,17 @@ impl RegionService {
                 lamp_updates.push((x, y, z, target));
             }
         }
-        // 4. 应用更新并广播
+        // 4. 应用更新并广播。若本 tick 有线/灯状态变化，重新标记区块脏，
+        // 让功率沿导线逐 tick 传播（对照 vanilla 红石 1 tick/格的传播速率）；
+        // 若仍持续变化，下一 tick 继续处理直到稳定。
+        let mut any_changed = false;
         for (x, y, z, state) in wire_updates.into_iter().chain(lamp_updates) {
             if self
                 .store
                 .set_block(Face::Overworld, x, y, z, state)
                 .is_ok()
             {
+                any_changed = true;
                 let packet = icbm_mc_767::packets::play::clientbound::CBlockUpdate {
                     position: icbm_mc_767::packets::play::BlockPos::new(x, y, z),
                     state_id: state,
@@ -950,6 +1000,11 @@ impl RegionService {
                 self.send_entity_packet(play_ids::CLIENTBOUND_BLOCK_UPDATE, |w| {
                     packet.encode(w);
                 })?;
+            }
+        }
+        if any_changed {
+            for (cx, cz) in chunks {
+                self.store.mark_redstone_dirty(cx, cz);
             }
         }
         Ok(())
@@ -962,10 +1017,9 @@ impl RegionService {
 
     /// 世界时间 tick：`doDaylightCycle` 控制推进，广播 `CUpdateTime`。
     fn tick_time(&mut self) -> Result<(), RegionError> {
+        // 世界时间由 core 全局管理（`TIME_UPDATE` 每秒同步），region 不再
+        // 自行推进，避免跨区域漂移。这里只负责广播 `CUpdateTime`。
         let daylight = self.gamerule_bool("doDaylightCycle");
-        if daylight {
-            self.world_time = self.world_time.wrapping_add(1);
-        }
         // 约每秒广播一次（节流，避免每 tick 刷包）
         if self.last_time_broadcast.elapsed() >= Duration::from_secs(1) {
             let packet = icbm_mc_767::packets::play::clientbound::CUpdateTime {
@@ -1072,50 +1126,36 @@ impl RegionService {
         if random_ticks == 0 {
             return Ok(());
         }
-        let chunks = self.store.loaded_overworld_chunks();
-        if chunks.is_empty() {
+        // 只处理存在作物的位置（set_block 维护；避免每 tick 全量 heightmap 扫描
+        // ——289 区块 × 384×256 计算会让 region tick 数百毫秒、延迟 IPC 响应）
+        let positions = self.store.crop_positions();
+        if positions.is_empty() {
             return Ok(());
         }
-        // 先收集生长事件（避免持有 &store 与 set_block 冲突）
         let mut growth: Vec<(i32, i32, i32, i32)> = Vec::new();
-        for (cx, cz) in chunks {
-            let heights = {
-                let column = self.store.get_chunk(Face::Overworld, cx, cz)?;
-                column.heightmap_heights()
+        for &(x, y, z) in &positions {
+            // 每 tick 以 randomTickSpeed 概率抽查（vanilla 随机 tick 近似）
+            if self.rand_f64() >= 1.0 / random_ticks.max(1) as f64 {
+                continue;
+            }
+            let state = self.store.block_at(Face::Overworld, x, y, z).unwrap_or(0);
+            let Some(crop) = crate::crops::is_crop(state) else {
+                continue;
             };
-            for _ in 0..random_ticks {
-                let local_x = (self.next_random() % 16) as u32;
-                let local_z = (self.next_random() % 16) as u32;
-                let top = heights[(local_z * 16 + local_x) as usize]; // 地表顶 y + 1
-                let world_y = top - 1;
-                if world_y < -64 {
-                    continue;
-                }
-                let state = {
-                    let column = self.store.get_chunk(Face::Overworld, cx, cz)?;
-                    column.block_at(local_x, world_y, local_z)
-                };
-                let Some(crop) = crate::crops::is_crop(state) else {
-                    continue;
-                };
-                let age = state - crop.base;
-                if age >= crop.max_age {
-                    continue; // 已成熟
-                }
-                // 生长概率：可可 2/3，其余 1/3（对照 `CropBlock`/`CocoaBlock`）
-                let chance = if crop.base == icbm_mc_767::packets::play::block_state_ids::COCOA_AGE_0 {
-                    2.0 / 3.0
-                } else {
-                    1.0 / 3.0
-                };
-                if self.rand_f64() < chance {
-                    growth.push((
-                        cx * 16 + i32::try_from(local_x).unwrap_or(0),
-                        world_y,
-                        cz * 16 + i32::try_from(local_z).unwrap_or(0),
-                        crate::crops::crop_state(crop, age + 1),
-                    ));
-                }
+            let age = state - crop.base;
+            if age >= crop.max_age {
+                continue; // 已成熟
+            }
+            // 生长概率：可可 2/3，其余 1/3（对照 `CropBlock`/`CocoaBlock`）
+            let chance = if crop.base
+                == icbm_mc_767::packets::play::block_state_ids::COCOA_AGE_0
+            {
+                2.0 / 3.0
+            } else {
+                1.0 / 3.0
+            };
+            if self.rand_f64() < chance {
+                growth.push((x, y, z, crate::crops::crop_state(crop, age + 1)));
             }
         }
         for (x, y, z, state) in growth {
@@ -1132,19 +1172,10 @@ impl RegionService {
     }
 
     /// 天气 tick：晴雨/雷暴切换与梯度插值，广播 `GAME_EVENT`。
-    fn tick_weather(&mut self) -> Result<(), RegionError> {
-        let do_weather_cycle = self.gamerule_bool("doWeatherCycle");
-        let events = self.weather.tick(do_weather_cycle);
-        for (event, value) in events {
-            let packet = icbm_mc_767::packets::play::clientbound::CGameEvent {
-                event,
-                value,
-            };
-            self.send_entity_packet(play_ids::CLIENTBOUND_GAME_EVENT, |w| {
-                packet.encode(w);
-            })?;
-        }
-        Ok(())
+    fn tick_weather(&self) -> Result<(), RegionError> {
+        // 天气由 core 全局管理（`WEATHER_UPDATE` 同步），region 不再自行推进。
+        // 这里只把当前梯度广播给玩家（客户端据此渲染天气）。
+        self.sync_weather_to_players()
     }
 
     /// 玩家进入后同步当前天气梯度（对照 `PlayerManager.onPlayerConnect` 的
@@ -1494,6 +1525,19 @@ fn raycast_block(
         }
     }
     (false, x, y, z)
+}
+
+/// 查询世界坐标 (x, z) 列的地表高度（最高非空气方块 y + 1；整列为空时 = 世界最低 Y）。
+/// 供 core 出生点适配（新玩家出生在真实地表上）。
+fn surface_height(store: &mut ChunkStore, x: i32, z: i32) -> i32 {
+    let cx = x.div_euclid(16);
+    let cz = z.div_euclid(16);
+    let Ok(column) = store.get_chunk(Face::Overworld, cx, cz) else {
+        return -64;
+    };
+    let local_x = (x & 0xF) as u32;
+    let local_z = (z & 0xF) as u32;
+    column.heightmap_heights()[(local_z * 16 + local_x) as usize]
 }
 
 /// 运行 region（core 二进制 `--region` 模式的入口）。

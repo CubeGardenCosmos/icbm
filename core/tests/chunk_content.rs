@@ -129,9 +129,10 @@ impl TestServer {
                 "--shm",
                 &shm_name,
             ])
+            .env("ICBM_ONLINE_MODE", "offline") // 测试用离线登录（默认已开正版验证）
             .process_group(0) // 独立进程组：Drop 时整组清理 region 子进程
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
+            .stdout(Stdio::inherit())
+            .stderr(Stdio::inherit())
             .spawn()
             .expect("spawn");
         let deadline = Instant::now() + Duration::from_secs(15);
@@ -870,6 +871,201 @@ fn piston_pushes_blocks_on_power() {
     }
     assert!(head_seen, "piston head should appear at z=11");
     assert!(stone_seen, "stone should be pushed to z=12");
+}
+
+/// 地狱传送门：经典 4×5 黑曜石框架自动填充传送门方块；玩家站入触发维度切换。
+#[test]
+fn nether_portal_builds_and_activates() {
+    let server = TestServer::start("portal");
+    let mut client = FakeClient::connect(&server.addr);
+    join_to_play(&mut client);
+    client.recv_until(play_ids::CLIENTBOUND_CHUNK_BATCH_FINISHED, "initial batch");
+
+    // 经典 4×5 框架（x=20，z=0..3，y=-58..-54，建在地表上方空气中）：
+    // 底部/顶部横梁 + 两侧立柱
+    send_chat_command(&mut client, "fill 20 -58 0 20 -58 3 obsidian");
+    recv_chat_until(&mut client, "已填充");
+    send_chat_command(&mut client, "fill 20 -54 0 20 -54 3 obsidian");
+    recv_chat_until(&mut client, "已填充");
+    send_chat_command(&mut client, "fill 20 -57 0 20 -55 0 obsidian");
+    recv_chat_until(&mut client, "已填充");
+    send_chat_command(&mut client, "fill 20 -57 3 20 -55 3 obsidian");
+    recv_chat_until(&mut client, "已填充");
+
+    // 玩家站入传送门内部 (20,-56,1) → CRespawn（维度切换）；
+    // 这同时验证了框架被检测、传送门方块被填充、站入触发三条链路。
+    let mut move_in = Writer::new();
+    move_in.write_f64_be(20.0);
+    move_in.write_f64_be(-56.0);
+    move_in.write_f64_be(1.0);
+    move_in.write_bool(true);
+    client.send(play_ids::SERVERBOUND_MOVE_POS, &move_in.into_bytes());
+
+    let deadline = Instant::now() + Duration::from_secs(15);
+    let respawn = loop {
+        assert!(Instant::now() < deadline, "no respawn after entering portal");
+        let (id, payload) = client.recv();
+        if id == play_ids::CLIENTBOUND_RESPAWN {
+            break payload;
+        }
+    };
+    // CRespawn 载荷：CommonPlayerSpawnInfo.dimensionName 应为 the_nether
+    let mut r = Reader::new(&respawn);
+    let _dimension_type = r.read_var_int().unwrap();
+    let dimension_name = r.read_string().unwrap();
+    assert_eq!(dimension_name, "minecraft:the_nether", "switched to nether");
+}
+
+/// 玩家数据持久化：离线后重新进入恢复游戏模式与位置。
+#[test]
+fn playerdata_persists_gamemode_and_position() {
+    let server = TestServer::start("playerdata");
+    let mut client = FakeClient::connect(&server.addr);
+    join_to_play(&mut client);
+    client.recv_until(play_ids::CLIENTBOUND_CHUNK_BATCH_FINISHED, "initial batch");
+
+    // 改创造 + 传送到远处
+    send_chat_command(&mut client, "gamemode creative");
+    recv_chat_until(&mut client, "creative");
+    send_chat_command(&mut client, "tp 30 -60 40");
+    recv_chat_until(&mut client, "传送到");
+    // 等服务端把玩家位置更新到 (30,-60,40)（发送一个位置包触发）
+    let mut move_to = Writer::new();
+    move_to.write_f64_be(30.0);
+    move_to.write_f64_be(-60.0);
+    move_to.write_f64_be(40.0);
+    move_to.write_bool(true);
+    client.send(play_ids::SERVERBOUND_MOVE_POS, &move_to.into_bytes());
+    std::thread::sleep(std::time::Duration::from_millis(500));
+
+    // 断开（关闭连接 → on_disconnect 保存存档）
+    drop(client);
+    std::thread::sleep(std::time::Duration::from_millis(500));
+
+    // 存档文件应包含创造模式与位置
+    let data_dir = server.world_dir.join("playerdata");
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while std::fs::read_dir(&data_dir).map(|d| d.count()).unwrap_or(0) == 0 {
+        assert!(Instant::now() < deadline, "playerdata file not written");
+        std::thread::sleep(std::time::Duration::from_millis(50));
+    }
+    let files: Vec<_> = std::fs::read_dir(&data_dir)
+        .expect("playerdata dir")
+        .map(|e| e.unwrap().path())
+        .collect();
+    assert_eq!(files.len(), 1, "one playerdata file");
+    let nbt = icbm_anvil::player::read_player(&files[0])
+        .expect("read playerdata")
+        .expect("exists");
+    let icbm_mc_767::nbt::Nbt::Compound(root) = nbt else { panic!("playerdata compound") };
+    assert_eq!(root.get_i32("playerGameType"), Some(1), "creative saved");
+    let icbm_mc_767::nbt::Nbt::List(pos_list) = root.get("Pos").expect("Pos") else {
+        panic!("Pos list");
+    };
+    let pos: Vec<f64> = pos_list
+        .values
+        .iter()
+        .filter_map(|v| {
+            if let icbm_mc_767::nbt::Nbt::Double(d) = v {
+                Some(*d)
+            } else {
+                None
+            }
+        })
+        .collect();
+    assert_eq!(pos, vec![30.0, -60.0, 40.0], "position saved");
+
+    // 重新连接：位置应恢复（进入时按存档位置发 CPlayerPosition）。
+    // 注意：join_to_play 会消费位置包，这里自定义连接以捕获它。
+    let mut client2 = FakeClient::connect(&server.addr);
+    let mut intent = Writer::new();
+    intent.write_var_int(PROTOCOL_VERSION);
+    intent.write_string("127.0.0.1");
+    intent.write_u16_be(25565);
+    intent.write_var_int(2);
+    client2.send(0x00, &intent.into_bytes());
+    let mut start = Writer::new();
+    start.write_string("diagplayer");
+    start.write_uuid(&Uuid::nil());
+    client2.send(login_ids::SERVERBOUND_START, &start.into_bytes());
+    let (cid, payload) = client2.recv();
+    assert_eq!(cid, login_ids::CLIENTBOUND_COMPRESSION);
+    let mut r = Reader::new(&payload);
+    client2.compression_threshold = Some(r.read_var_int().unwrap());
+    client2.recv_until(login_ids::CLIENTBOUND_SUCCESS, "success");
+    client2.send(login_ids::SERVERBOUND_ACKNOWLEDGED, &[]);
+    client2.recv_until(
+        icbm_mc_767::packets::config_ids::CLIENTBOUND_CUSTOM_PAYLOAD,
+        "brand",
+    );
+    client2.recv_until(
+        icbm_mc_767::packets::config_ids::CLIENTBOUND_UPDATE_ENABLED_FEATURES,
+        "features",
+    );
+    client2.recv_until(
+        icbm_mc_767::packets::config_ids::CLIENTBOUND_KNOWN_PACKS,
+        "packs",
+    );
+    let mut packs = Writer::new();
+    packs.write_var_int(0);
+    client2.send(
+        icbm_mc_767::packets::config_ids::SERVERBOUND_KNOWN_PACKS,
+        &packs.into_bytes(),
+    );
+    for i in 0..11 {
+        client2.recv_until(
+            icbm_mc_767::packets::config_ids::CLIENTBOUND_REGISTRY_DATA,
+            &format!("reg {i}"),
+        );
+    }
+    client2.recv_until(
+        icbm_mc_767::packets::config_ids::CLIENTBOUND_UPDATE_TAGS,
+        "tags",
+    );
+    client2.recv_until(
+        icbm_mc_767::packets::config_ids::CLIENTBOUND_FINISH_CONFIGURATION,
+        "finish",
+    );
+    client2.send(
+        icbm_mc_767::packets::config_ids::SERVERBOUND_FINISH_CONFIGURATION,
+        &[],
+    );
+    client2.recv_until(play_ids::CLIENTBOUND_LOGIN, "login");
+    client2.recv_until(play_ids::CLIENTBOUND_SET_CHUNK_CACHE_CENTER, "center");
+    client2.recv_until(play_ids::CLIENTBOUND_SET_CHUNK_CACHE_RADIUS, "radius");
+    client2.recv_until(play_ids::CLIENTBOUND_CHANGE_DIFFICULTY, "difficulty");
+    client2.recv_until(play_ids::CLIENTBOUND_PLAYER_ABILITIES, "abilities");
+    client2.recv_until(play_ids::CLIENTBOUND_PLAYER_INFO_UPDATE, "info");
+    client2.recv_until(play_ids::CLIENTBOUND_SET_DEFAULT_SPAWN_POSITION, "spawn");
+    client2.recv_until(play_ids::CLIENTBOUND_COMMANDS, "commands");
+    client2.recv_until(play_ids::CLIENTBOUND_CUSTOM_PAYLOAD, "register");
+    let pos = client2.recv_until(play_ids::CLIENTBOUND_PLAYER_POSITION, "restored position");
+    let mut r = Reader::new(&pos);
+    let x = r.read_f64_be().unwrap();
+    let y = r.read_f64_be().unwrap();
+    let z = r.read_f64_be().unwrap();
+    assert_eq!((x, y, z), (30.0, -60.0, 40.0), "position restored");
+}
+
+/// `/weather` 指令：core 全局天气同步到 region（晴天/下雨/雷暴反馈）。
+#[test]
+fn weather_command_sets_global_weather() {
+    let server = TestServer::start("weather");
+    let mut client = FakeClient::connect(&server.addr);
+    join_to_play(&mut client);
+    client.recv_until(play_ids::CLIENTBOUND_CHUNK_BATCH_FINISHED, "initial batch");
+
+    send_chat_command(&mut client, "weather rain");
+    let text = recv_chat_until(&mut client, "下雨");
+    assert!(text.contains("已设为"), "weather feedback: {text}");
+
+    send_chat_command(&mut client, "weather clear");
+    let text = recv_chat_until(&mut client, "晴朗");
+    assert!(text.contains("已设为"), "weather feedback: {text}");
+
+    send_chat_command(&mut client, "weather thunder");
+    let text = recv_chat_until(&mut client, "雷暴");
+    assert!(text.contains("已设为"), "weather feedback: {text}");
 }
 
 /// 服务端命令：`/gamemode creative`、`/gamerule`（含 level.dat 持久化）与

@@ -188,6 +188,8 @@ pub struct Client {
     pub barrier_query_pending: std::sync::atomic::AtomicBool,
     /// 屏障检测结果（-1 = 无查询）。
     pub pending_barrier_state: std::sync::atomic::AtomicI32,
+    /// 传送门检测挂起（receiver 据此路由 `BLOCK_QUERY_RESP` 到 `pending_portal_block`）。
+    pub portal_query_pending: std::sync::atomic::AtomicBool,
     /// 最近一次非屏障位置的合法位置（屏障拦截后回退用）。
     pub last_valid_position: Mutex<Position>,
     /// `/data` 请求挂起标志（receiver 收到 `BLOCK_NBT_RESP` 后写入响应）。
@@ -196,6 +198,10 @@ pub struct Client {
     pub pending_block_nbt: Mutex<Option<icbm_mc_767::nbt::Nbt>>,
     /// 末影珍珠射线检测结果（`BLOCK_RAYCAST_RESP` 写入；None = 未请求）。
     pub pending_raycast: Mutex<Option<(bool, f64, f64, f64)>>,
+    /// 地表高度查询结果（`SURFACE_RESP` 写入；None = 未请求）。
+    pub pending_surface: Mutex<Option<i32>>,
+    /// 地表高度查询挂起（receiver 据此路由 `SURFACE_RESP`）。
+    pub surface_query_pending: std::sync::atomic::AtomicBool,
     /// 末影珍珠射线请求挂起（receiver 据此路由响应）。
     pub raycast_pending: std::sync::atomic::AtomicBool,
 }
@@ -257,6 +263,7 @@ impl Client {
             pending_portal_block: std::sync::atomic::AtomicI32::new(-1),
             barrier_query_pending: std::sync::atomic::AtomicBool::new(false),
             pending_barrier_state: std::sync::atomic::AtomicI32::new(-1),
+            portal_query_pending: std::sync::atomic::AtomicBool::new(false),
             last_valid_position: Mutex::new(Position {
                 x: 0.0,
                 y: f64::from(OVERWORLD_SURFACE_FEET_Y),
@@ -268,6 +275,8 @@ impl Client {
             pending_block_nbt: Mutex::new(None),
             pending_raycast: Mutex::new(None),
             raycast_pending: std::sync::atomic::AtomicBool::new(false),
+            pending_surface: Mutex::new(None),
+            surface_query_pending: std::sync::atomic::AtomicBool::new(false),
         })
     }
 
@@ -928,9 +937,23 @@ fn send_config_data(client: &Arc<Client>) -> Result<(), NetError> {
 
 /// 进入 Play：加入游戏 → 区块加载 → 位置同步。
 pub fn enter_play(server: &Server, client: &Arc<Client>) -> Result<(), NetError> {
+    // 先注册玩家（receiver 需要据此路由 surface 查询等响应）
+    {
+        let mut world = server.world.lock().expect("world lock");
+        let _ = world
+            .players
+            .insert(*client.uuid.lock().expect("uuid"), Arc::clone(client));
+    }
+    // 恢复玩家数据（游戏模式/位置；无存档则为新玩家）
+    let has_saved_position = load_player_data(server, client);
     // 出生游戏模式（配置缺省；`Client::new` 默认生存）
     if let Some(mode) = GameMode::from_id(server.config.default_gamemode) {
         *client.gamemode.lock().expect("gamemode") = mode;
+    }
+    // 新玩家（无存档）：出生点钳制到地表——超平坦/旧世界地表高度可能不在
+    // 固定 -60，直接按地形查询避免“出生点埋在地里”。
+    if !has_saved_position {
+        crate::net::play::adjust_spawn_to_surface(server, client)?;
     }
     send_join_sequence(server, client)?;
 
@@ -949,13 +972,6 @@ pub fn enter_play(server: &Server, client: &Arc<Client>) -> Result<(), NetError>
         },
     )?;
 
-    // 注册玩家（此后 receiver 可转发区块/聊天）
-    {
-        let mut world = server.world.lock().expect("world lock");
-        let _ = world
-            .players
-            .insert(*client.uuid.lock().expect("uuid"), Arc::clone(client));
-    }
     // 玩家所在 region（实体/区块转发用；先于区块加载设置，避免进服早期
     // region 发来的实体包被丢弃）。Y>400 虚拟区不关联任何 region（core 接管）。
     {
@@ -1142,8 +1158,101 @@ fn send_abilities(client: &Arc<Client>) -> Result<(), NetError> {
 }
 
 /// 断线清理。
+/// 读取玩家存档（playerdata/<uuid>.dat）：恢复游戏模式与位置。
+/// 返回是否有存档（无存档 = 新玩家）。
+fn load_player_data(server: &Server, client: &Arc<Client>) -> bool {
+    use icbm_mc_767::nbt::{Nbt, NbtCompound};
+    let uuid = *client.uuid.lock().expect("uuid");
+    let path = server
+        .config
+        .world_dir
+        .join("playerdata")
+        .join(icbm_anvil::player::player_file_name(&uuid));
+    let Ok(Some(nbt)) = icbm_anvil::player::read_player(&path) else {
+        return false;
+    };
+    let Nbt::Compound(root) = nbt else {
+        return false;
+    };
+    // 位置：Pos（f64 列表）
+    if let Some(Nbt::List(list)) = root.get("Pos")
+        && list.values.len() >= 3
+    {
+        let pos: Vec<f64> = list
+            .values
+            .iter()
+            .filter_map(|v| match v {
+                Nbt::Double(d) => Some(*d),
+                Nbt::Float(f) => Some(f64::from(*f)),
+                _ => None,
+            })
+            .collect();
+        if pos.len() >= 3 {
+            let mut position = client.position.lock().expect("position");
+            position.x = pos[0];
+            position.y = pos[1];
+            position.z = pos[2];
+        }
+    }
+    // 游戏模式：playerGameType（int）
+    if let Some(Nbt::Int(game_type)) = root.get("playerGameType")
+        && let Some(mode) = GameMode::from_id(u8::try_from(*game_type).unwrap_or(0))
+    {
+        *client.gamemode.lock().expect("gamemode") = mode;
+    }
+    // 维度
+    if let Some(Nbt::String(dim)) = root.get("Dimension") {
+        let dim_id = match dim.as_str() {
+            "minecraft:the_nether" => 1,
+            "minecraft:the_end" => 2,
+            _ => 0,
+        };
+        client.dimension.store(dim_id, Ordering::Relaxed);
+    }
+    debug!(%uuid, "player data loaded");
+    true
+}
+
+/// 保存玩家存档（游戏模式与位置；离线后可恢复）。
+fn save_player_data(server: &Server, client: &Arc<Client>) {
+    use icbm_mc_767::nbt::{Nbt, NbtCompound, NbtList};
+    let uuid = *client.uuid.lock().expect("uuid");
+    let position = *client.position.lock().expect("position");
+    let gamemode = client.gamemode.lock().expect("gamemode").id();
+    let dimension = match client.dimension.load(Ordering::Relaxed) {
+        1 => "minecraft:the_nether",
+        2 => "minecraft:the_end",
+        _ => "minecraft:overworld",
+    };
+    let mut root = NbtCompound::new();
+    root.insert("DataVersion", Nbt::Int(icbm_mc_767::protocol::DATA_VERSION));
+    let mut pos = NbtList::from_values(vec![
+        Nbt::Double(position.x),
+        Nbt::Double(position.y),
+        Nbt::Double(position.z),
+    ]);
+    pos.tag = icbm_mc_767::nbt::TagId::Double;
+    root.insert("Pos", Nbt::List(Box::new(pos)));
+    let mut rot = NbtList::from_values(vec![
+        Nbt::Float(position.yaw),
+        Nbt::Float(position.pitch),
+    ]);
+    rot.tag = icbm_mc_767::nbt::TagId::Float;
+    root.insert("Rotation", Nbt::List(Box::new(rot)));
+    root.insert("Dimension", Nbt::String(dimension.to_owned()));
+    root.insert("playerGameType", Nbt::Int(i32::from(gamemode)));
+    let dir = server.config.world_dir.join("playerdata");
+    if std::fs::create_dir_all(&dir).is_ok() {
+        let path = dir.join(icbm_anvil::player::player_file_name(&uuid));
+        if let Err(err) = icbm_anvil::player::write_player(&path, &Nbt::Compound(Box::new(root))) {
+            warn!(%err, %uuid, "failed to save player data");
+        }
+    }
+}
+
 fn on_disconnect(server: &Server, client: &Arc<Client>) {
     client.dump_tx_log();
+    save_player_data(server, client);
     let mut world = server.world.lock().expect("world lock");
     if world
         .players

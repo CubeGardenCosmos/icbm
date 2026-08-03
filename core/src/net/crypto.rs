@@ -312,8 +312,10 @@ pub enum OnlineMode {
 #[must_use]
 pub fn online_mode_from_env() -> OnlineMode {
     match std::env::var("ICBM_ONLINE_MODE").as_deref() {
-        Ok("true" | "1" | "online") => OnlineMode::Online,
-        _ => OnlineMode::Offline,
+        // 默认正版验证：离线 UUID 无法匹配 Mojang 账号，客户端拉不到皮肤。
+        // 测试用 `ICBM_ONLINE_MODE=offline` 显式关闭。
+        Ok("false" | "0" | "offline") => OnlineMode::Offline,
+        _ => OnlineMode::Online,
     }
 }
 

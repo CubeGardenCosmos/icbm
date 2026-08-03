@@ -65,6 +65,12 @@ pub mod kind {
     pub const BLOCK_NBT_SET: u8 = 0x12;
     /// R→C：执行命令（`[u8 长][命令]`；命令方块触发，core 以控制台身份执行）。
     pub const COMMAND_EXECUTE: u8 = 0x13;
+    /// C→R：天气状态同步（`[u8 raining][u8 thundering][f32 rain_gradient][f32 thunder_gradient]`）。
+    pub const WEATHER_UPDATE: u8 = 0x15;
+    /// C→R：地表高度查询（`[u8 dim][i32 x][i32 z]` → `SURFACE_RESP`；出生点适配用）。
+    pub const SURFACE_QUERY: u8 = 0x16;
+    /// R→C：地表高度响应（`[i32 y]` = 最高非空气方块 y+1）。
+    pub const SURFACE_RESP: u8 = 0x96;
     /// C→R：方块射线检测（`[f64 ox][f64 oy][f64 oz][f64 dx][f64 dy][f64 dz][f64 max]`）。
     pub const BLOCK_RAYCAST: u8 = 0x14;
     /// R→C：射线命中响应（`[u8 hit][f64 x][f64 y][f64 z]`；未命中 hit=0）。
@@ -727,6 +733,66 @@ pub fn decode_block_raycast_resp(body: &[u8]) -> Result<(bool, f64, f64, f64), I
         f64::from_le_bytes(body[9..17].try_into().expect("slice")),
         f64::from_le_bytes(body[17..25].try_into().expect("slice")),
     ))
+}
+
+/// `WEATHER_UPDATE` 载荷：`[u8 raining][u8 thundering][f32 rain_gradient][f32 thunder_gradient]`。
+#[must_use]
+pub fn encode_weather_update(raining: bool, thundering: bool, rain: f32, thunder: f32) -> Vec<u8> {
+    let mut out = Vec::with_capacity(10);
+    out.push(u8::from(raining));
+    out.push(u8::from(thundering));
+    out.extend_from_slice(&rain.to_le_bytes());
+    out.extend_from_slice(&thunder.to_le_bytes());
+    out
+}
+
+/// 解析 `WEATHER_UPDATE` 载荷。
+pub fn decode_weather_update(body: &[u8]) -> Result<(bool, bool, f32, f32), IpcError> {
+    if body.len() < 10 {
+        return Err(IpcError::Length("weather update", body.len()));
+    }
+    Ok((
+        body[0] != 0,
+        body[1] != 0,
+        f32::from_le_bytes(body[2..6].try_into().expect("slice")),
+        f32::from_le_bytes(body[6..10].try_into().expect("slice")),
+    ))
+}
+
+/// `SURFACE_QUERY` 载荷：`[u8 dim][i32 x][i32 z]`。
+#[must_use]
+pub fn encode_surface_query(dim: u8, x: i32, z: i32) -> Vec<u8> {
+    let mut out = Vec::with_capacity(9);
+    out.push(dim);
+    out.extend_from_slice(&x.to_le_bytes());
+    out.extend_from_slice(&z.to_le_bytes());
+    out
+}
+
+/// 解析 `SURFACE_QUERY` 载荷。
+pub fn decode_surface_query(body: &[u8]) -> Result<(u8, i32, i32), IpcError> {
+    if body.len() < 9 {
+        return Err(IpcError::Length("surface query", body.len()));
+    }
+    Ok((
+        body[0],
+        i32::from_le_bytes(body[1..5].try_into().expect("slice")),
+        i32::from_le_bytes(body[5..9].try_into().expect("slice")),
+    ))
+}
+
+/// `SURFACE_RESP` 载荷：`[i32 y]`（最高非空气方块 y + 1；整列为空时 = 世界最低 Y）。
+#[must_use]
+pub fn encode_surface_resp(y: i32) -> Vec<u8> {
+    y.to_le_bytes().to_vec()
+}
+
+/// 解析 `SURFACE_RESP` 载荷。
+pub fn decode_surface_resp(body: &[u8]) -> Result<i32, IpcError> {
+    if body.len() < 4 {
+        return Err(IpcError::Length("surface resp", body.len()));
+    }
+    Ok(i32::from_le_bytes(body[0..4].try_into().expect("slice")))
 }
 
 #[cfg(test)]

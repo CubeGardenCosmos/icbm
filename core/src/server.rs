@@ -15,8 +15,8 @@ use icbm_region::RegionId;
 use icbm_region::protocol::{
     DIM_OVERWORLD, Ipc, IpcError, decode_block_nbt_resp, decode_block_query_resp,
     decode_block_raycast_resp, decode_chunk_data, decode_command_execute,
-    decode_entity_data, decode_heartbeat, decode_register, encode_register_ack,
-    encode_unload, kind,
+    decode_entity_data, decode_heartbeat, decode_register, decode_surface_resp,
+    encode_register_ack, encode_unload, kind,
 };
 use tracing::{debug, info, trace, warn};
 
@@ -100,6 +100,10 @@ pub struct ServerInner {
     pub lists: std::sync::Mutex<crate::lists::LoginLists>,
     /// 收到的 `CHUNK_DATA` 计数（诊断）。
     pub chunk_diag: std::sync::atomic::AtomicU64,
+    /// 全局世界时间（tick；core 管理，广播给所有 region，避免各 region 漂移）。
+    pub world_time: Mutex<i64>,
+    /// 全局天气（core 管理，广播给所有 region）。
+    pub weather: Mutex<icbm_region::weather::WeatherState>,
 }
 
 /// 服务器（可克隆共享）。
@@ -155,6 +159,8 @@ impl Server {
                     world_dir_for_lists,
                 )),
                 chunk_diag: std::sync::atomic::AtomicU64::new(0),
+                world_time: Mutex::new(0),
+                weather: Mutex::new(icbm_region::weather::WeatherState::new()),
             }),
         })
     }
@@ -429,6 +435,7 @@ fn spawn_receiver(server: &Server) {
     let server = server.clone();
     std::thread::spawn(move || {
         let mut last_icbm_push = Instant::now();
+        let mut last_env_sync = Instant::now();
         while server.running.load(Ordering::Relaxed) {
             match server.ipc.recv(100) {
                 Ok(Some(message)) => {
@@ -458,9 +465,74 @@ fn spawn_receiver(server: &Server) {
                 push_icbm_snapshots(&server);
                 last_icbm_push = Instant::now();
             }
+            // 全局时间/天气：每秒推进并广播给所有 region（core 管理，
+            // region 不再各自推进，避免跨区域不一致）
+            if last_env_sync.elapsed() >= Duration::from_secs(1) {
+                sync_global_time_weather(&server);
+                last_env_sync = Instant::now();
+            }
         }
         info!("datarouter receiver stopped");
     });
+}
+
+/// 推进全局时间/天气并广播 `TIME_UPDATE`/`WEATHER_UPDATE` 给所有 region。
+///
+/// 对照 vanilla `MinecraftServer.tick`：主世界时间与天气由服务器统一推进，
+/// region 只负责把收到的状态广播给各自玩家。
+fn sync_global_time_weather(server: &Server) {
+    let regions: Vec<icbm_region::RegionId> = {
+        let world = server.world.lock().expect("world lock");
+        world.regions.ids()
+    };
+    if regions.is_empty() {
+        return;
+    }
+    let daylight = server
+        .world
+        .lock()
+        .expect("world lock")
+        .gamerules
+        .get("doDaylightCycle")
+        .is_none_or(|v| v == "true");
+    let weather_cycle = server
+        .world
+        .lock()
+        .expect("world lock")
+        .gamerules
+        .get("doWeatherCycle")
+        .is_none_or(|v| v == "true");
+    // 每秒推进 20 tick（与 region 20 TPS 一致）
+    let mut time = server.world_time.lock().expect("world time");
+    if daylight {
+        *time = time.wrapping_add(20);
+    }
+    let time_value = *time;
+    drop(time);
+    let (raining, thundering, rain, thunder) = {
+        let mut weather = server.weather.lock().expect("weather");
+        for _ in 0..20 {
+            let _ = weather.tick(weather_cycle);
+        }
+        (
+            weather.is_raining(),
+            weather.is_thundering(),
+            weather.rain_gradient(),
+            weather.thunder_gradient(),
+        )
+    };
+    for region in regions {
+        let _ = server.ipc.send(
+            &region.service_name(),
+            icbm_region::protocol::kind::TIME_UPDATE,
+            &icbm_region::protocol::encode_time_update(time_value, false),
+        );
+        let _ = server.ipc.send(
+            &region.service_name(),
+            icbm_region::protocol::kind::WEATHER_UPDATE,
+            &icbm_region::protocol::encode_weather_update(raining, thundering, rain, thunder),
+        );
+    }
 }
 
 /// 给已订阅且支持快照的玩家推送 ICBM 状态快照。
@@ -516,8 +588,18 @@ fn maintain_regions(server: &Server) {
             kind::REGION_UNLOAD,
             &encode_unload(DIM_OVERWORLD, id.rx, id.rz),
         );
+        // 等 region 完成 flush 并自然退出（不得立即 kill——SIGTERM 会在
+        // region 处理 UNLOAD/写 .mca 前打断它，导致方块变更丢失）。
+        // 给 3 秒宽限，仍未退出才强制终止。
         if let Some(pid) = pid {
-            let _ = kill_process(pid);
+            let deadline = Instant::now() + Duration::from_secs(3);
+            while Instant::now() < deadline && process_alive(pid) {
+                std::thread::sleep(Duration::from_millis(50));
+            }
+            if process_alive(pid) {
+                warn!(id = %id.service_name(), pid, "region did not exit after unload, killing");
+                let _ = kill_process(pid);
+            }
         }
         server.world.lock().expect("world lock").regions.remove(&id);
         // 通知在线玩家移除该区域的实体（客户端不感知 region 卸载，需显式 REMOVE_ENTITIES）
@@ -629,13 +711,16 @@ fn handle_core_message(server: &Server, message: &icbm_region::protocol::IpcMess
                     if !matches {
                         continue;
                     }
-                    // 屏障检测优先：路由到 pending_barrier_state
+                    // 屏障检测优先：路由到 pending_barrier_state；其次传送门检测
                     if player
                         .barrier_query_pending
                         .swap(false, std::sync::atomic::Ordering::Relaxed)
                     {
                         player.pending_barrier_state.store(state, std::sync::atomic::Ordering::Relaxed);
-                    } else {
+                    } else if player
+                        .portal_query_pending
+                        .swap(false, std::sync::atomic::Ordering::Relaxed)
+                    {
                         player.pending_portal_block.store(state, std::sync::atomic::Ordering::Relaxed);
                     }
                     break;
@@ -684,6 +769,23 @@ fn handle_core_message(server: &Server, message: &icbm_region::protocol::IpcMess
                         .swap(false, std::sync::atomic::Ordering::Relaxed)
                     {
                         *player.pending_raycast.lock().expect("raycast") = Some((hit, x, y, z));
+                        break;
+                    }
+                }
+            }
+        }
+        kind::SURFACE_RESP => {
+            if let Ok(y) = decode_surface_resp(&message.body) {
+                let players: Vec<Arc<crate::client::Client>> = {
+                    let world = server.world.lock().expect("world lock");
+                    world.players.values().cloned().collect()
+                };
+                for player in players {
+                    if player
+                        .surface_query_pending
+                        .swap(false, std::sync::atomic::Ordering::Relaxed)
+                    {
+                        *player.pending_surface.lock().expect("surface") = Some(y);
                         break;
                     }
                 }
@@ -806,6 +908,13 @@ fn kill_process(pid: u32) -> std::io::Result<()> {
     } else {
         Err(std::io::Error::last_os_error())
     }
+}
+
+/// 进程是否仍存活（`kill(pid, 0)`；权限错误视为存活）。
+fn process_alive(pid: u32) -> bool {
+    // SAFETY: 仅查询信号 0（不发送）；pid 为已知子进程。
+    let result = unsafe { libc::kill(i32::try_from(pid).unwrap_or(-1), 0) };
+    result == 0 || std::io::Error::last_os_error().kind() == std::io::ErrorKind::PermissionDenied
 }
 
 #[cfg(test)]

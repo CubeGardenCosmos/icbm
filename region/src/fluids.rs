@@ -24,6 +24,12 @@ pub enum FluidKind {
     Lava,
 }
 
+/// 状态 ID 是否为流体（水或岩浆）。
+#[must_use]
+pub const fn is_fluid(state_id: i32) -> bool {
+    FluidKind::from_state_id(state_id).is_some()
+}
+
 impl FluidKind {
     /// 状态 ID → 流体类型（非流体返回 `None`）。
     #[must_use]

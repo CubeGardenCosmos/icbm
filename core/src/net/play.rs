@@ -32,6 +32,12 @@ pub const VIRTUAL_ZONE_MIN_Y: f64 = 400.0;
 /// Y 低于此值视为坠入虚空（无死亡/重生系统，直接拉回出生点）。
 pub const OVERWORLD_MIN_Y: f64 = -64.0;
 
+/// 主世界超平坦地表站立 Y（地表顶 -61 上方；superflat 自 Y=-64 铺设）。
+pub const OVERWORLD_SURFACE_FEET_Y: f64 = -60.0;
+
+/// 地狱地表站立 Y（flat：bedrock 0、netherrack 1..126、bedrock 127 → 站 128）。
+pub const NETHER_SURFACE_FEET_Y: f64 = 128.0;
+
 /// 服务端视角的区块半径（客户端可视距离只影响其渲染，不扩大服务端发送半径；
 /// 对照 vanilla `PlayerManager.viewDistance` 与 `ServerChunkLoadingManager`）。
 ///
@@ -563,9 +569,11 @@ fn check_barrier_blocked(
         }
         std::thread::sleep(Duration::from_millis(5));
     };
+    // 清标志与残留响应（含超时未消费的情况——否则迟到响应会路由错目标）
     client
         .pending_barrier_state
         .store(-1, std::sync::atomic::Ordering::Relaxed);
+    client.barrier_query_pending.store(false, std::sync::atomic::Ordering::Relaxed);
     if state != icbm_mc_767::packets::play::block_state_ids::BARRIER {
         // 位置合法：记录为回退基准
         *client.last_valid_position.lock().expect("last valid") =
@@ -604,6 +612,44 @@ fn check_barrier_blocked(
     Ok(())
 }
 
+/// 新玩家出生点适配：查询世界出生点上方的真实地表高度并调整玩家 Y。
+///
+/// 超平坦自 Y=-64 铺设（地表 -61），但旧世界/被修改区块的地表可能不同——
+/// 固定 -60 会“埋在地里”。经 `SURFACE_QUERY` 拿实际地表，站在其上。
+pub fn adjust_spawn_to_surface(server: &Server, client: &Arc<Client>) -> Result<(), NetError> {
+    let (sx, sz) = {
+        let spawn = server.world.lock().expect("world lock").spawn;
+        (spawn.x, spawn.z)
+    };
+    let region = icbm_region::RegionId::from_overworld_block(sx, sz);
+    server.ensure_region(region)?;
+    client.surface_query_pending.store(true, std::sync::atomic::Ordering::Relaxed);
+    server.ipc.send(
+        &region.service_name(),
+        icbm_region::protocol::kind::SURFACE_QUERY,
+        &icbm_region::protocol::encode_surface_query(icbm_region::protocol::DIM_OVERWORLD, sx, sz),
+    )?;
+    let deadline = Instant::now() + Duration::from_secs(3);
+    let surface = loop {
+        let value = client.pending_surface.lock().expect("surface").take();
+        if let Some(value) = value {
+            break value;
+        }
+        if Instant::now() > deadline {
+            break -60; // 超时回退：新超平坦地表
+        }
+        std::thread::sleep(Duration::from_millis(5));
+    };
+    client.pending_surface.lock().expect("surface").take();
+    client.surface_query_pending.store(false, std::sync::atomic::Ordering::Relaxed);
+    let mut position = client.position.lock().expect("position");
+    position.x = f64::from(sx) + 0.5;
+    position.y = f64::from(surface);
+    position.z = f64::from(sz) + 0.5;
+    debug!(surface, "new player spawn adjusted to surface");
+    Ok(())
+}
+
 /// 检测玩家是否站在下界传送门方块上；是则执行维度切换。
 ///
 /// 查询玩家脚下方块（经 IPC 到所在 region）；传送门方块触发 1:8 缩放传送。
@@ -629,6 +675,9 @@ fn check_portal_entry(server: &Server, client: &Arc<Client>) -> Result<(), NetEr
         (position.x.floor() as i32, position.y.floor() as i32, position.z.floor() as i32)
     };
     let region_id = RegionId::from_overworld_chunk(bx.div_euclid(16), bz.div_euclid(16));
+    // 置传送门查询标志（receiver 据此把响应路由到 pending_portal_block，
+    // 不与屏障检测的 pending_barrier_state 混淆）
+    client.portal_query_pending.store(true, std::sync::atomic::Ordering::Relaxed);
     // 查询脚下与脚下-1 方块
     for probe_y in [by, by - 1] {
         server.ipc.send(
@@ -728,6 +777,13 @@ pub fn switch_dimension(
     if current == dimension {
         return Ok(()); // 已在目标维度
     }
+    // 目标 Y 钳制到目标维度地表：主世界 → 超平坦地表；地狱 → 顶部基岩之上。
+    // 否则传送门在 -63 触发时会把玩家丢进地狱虚空（地狱 min_y=0）。
+    let (x, y, z) = if dimension == 1 {
+        (x, NETHER_SURFACE_FEET_Y.max(y), z)
+    } else {
+        (x, OVERWORLD_SURFACE_FEET_Y.max(y), z)
+    };
     // 更新服务端位置（先处理跨 region 迁移）
     update_position(server, client, |pos| {
         pos.x = x;
@@ -1065,6 +1121,10 @@ fn handle_player_command(server: &Server, client: &Arc<Client>, command: &str) {
             if let Some(feedback) = crate::console::apply_time(server, set, add) {
                 let _ = client.send_system_chat(&feedback, false);
             }
+        }
+        Some(Command::Weather { kind, duration }) => {
+            let feedback = crate::console::apply_weather(server, kind, duration);
+            let _ = client.send_system_chat(&feedback, false);
         }
         Some(Command::Data {
             action,

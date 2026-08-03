@@ -124,6 +124,8 @@ pub enum Command {
     },
     /// `/time set <day|night|noon|midnight|<tick>>` 或 `/time add <tick>`。
     Time { set: Option<i64>, add: Option<i64> },
+    /// `/weather clear|rain|thunder [时长秒]`。
+    Weather { kind: WeatherKind, duration: Option<i64> },
     /// `/data get block <x> <y> <z> [路径]` / `/data merge block <x> <y> <z> <nbt>`
     /// / `/data remove block <x> <y> <z> <路径>`（NBT 编辑；方块实体/命令方块）。
     Data {
@@ -145,6 +147,17 @@ pub enum DataAction {
     Merge,
     /// `remove`：移除指定路径。
     Remove,
+}
+
+/// `/weather` 类型。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum WeatherKind {
+    /// 晴朗。
+    Clear,
+    /// 下雨。
+    Rain,
+    /// 雷暴。
+    Thunder,
 }
 
 /// 解析命令行的第一段（`/gamemode ...` / `/gamerule ...` / `/help`）。
@@ -193,6 +206,18 @@ pub fn parse_command(line: &str) -> Option<Command> {
             })
         }
         "time" => Some(parse_time(parts)),
+        "weather" => {
+            let kind = match parts.next()? {
+                "clear" => WeatherKind::Clear,
+                "rain" | "rainy" => WeatherKind::Rain,
+                "thunder" | "thundering" => WeatherKind::Thunder,
+                _ => return None,
+            };
+            Some(Command::Weather {
+                kind,
+                duration: parts.next().and_then(|v| v.parse::<i64>().ok()),
+            })
+        }
         "data" => parse_data(parts),
         _ => None,
     }

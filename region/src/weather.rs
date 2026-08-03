@@ -65,6 +65,29 @@ impl WeatherState {
         self.raining
     }
 
+    /// 直接设置晴雨/雷暴目标（core 全局同步用；`/weather` 命令）。
+    pub const fn set(&mut self, raining: bool, thundering: bool) {
+        self.raining = raining;
+        self.thundering = thundering;
+    }
+
+    /// 应用 core 同步的完整天气状态（含梯度）；返回晴雨是否切换。
+    pub const fn apply_from_core(&mut self, raining: bool, thundering: bool, rain: f32, thunder: f32) -> bool {
+        let toggled = raining != self.raining;
+        self.raining = raining;
+        self.thundering = thundering;
+        // clamp 手动实现（保持 const fn 兼容）
+        self.rain_gradient = if rain < 0.0 { 0.0 } else if rain > 1.0 { 1.0 } else { rain };
+        self.thunder_gradient = if thunder < 0.0 {
+            0.0
+        } else if thunder > 1.0 {
+            1.0
+        } else {
+            thunder
+        };
+        toggled
+    }
+
     /// 当前是否雷暴。
     #[must_use]
     pub const fn is_thundering(&self) -> bool {

@@ -142,7 +142,7 @@ pub fn name_to_state_id(name: &str) -> Option<i32> {
         names::COBBLESTONE => Some(ids::COBBLESTONE),
         names::NETHER_PORTAL => Some(ids::NETHER_PORTAL),
         names::REDSTONE_WIRE => Some(ids::REDSTONE_WIRE),
-        names::REDSTONE_TORCH => Some(ids::REDSTONE_TORCH_OFF),
+        names::REDSTONE_TORCH => Some(ids::REDSTONE_TORCH_ON),
         names::REDSTONE_LAMP => Some(ids::REDSTONE_LAMP),
         names::REDSTONE_BLOCK => Some(ids::REDSTONE_BLOCK),
         names::FARMLAND => Some(ids::FARMLAND),

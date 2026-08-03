@@ -67,7 +67,10 @@ pub struct ChunkStore {
     nether: HashMap<(i32, i32), ChunkColumn>,
     loaded: u32,
     /// 被 `set_block` 修改的主世界区块（流体 tick 用，处理后清空）。
+    /// 被修改的主世界区块（原流体 tick 全量扫描用；已改为仅含流体的区块）。
     dirty: std::collections::HashSet<(i32, i32)>,
+    /// 含流体的主世界区块（流体 tick 用，避免全量 384 高度扫描）。
+    fluid_dirty: std::collections::HashSet<(i32, i32)>,
     /// 含红石方块的主世界区块（红石 tick 用）。
     redstone_dirty: std::collections::HashSet<(i32, i32)>,
     /// 方块实体 NBT（世界坐标 → NBT；命令方块命令等 `/data` 操作目标）。
@@ -76,6 +79,8 @@ pub struct ChunkStore {
     command_blocks: std::collections::HashSet<(i32, i32, i32)>,
     /// 活塞位置（`set_block` 维护；`tick_pistons` 遍历用）。
     pistons: std::collections::HashSet<(i32, i32, i32)>,
+    /// 作物位置（`set_block` 维护；`tick_crops` 遍历用，避免全量 heightmap 扫描）。
+    crops: std::collections::HashSet<(i32, i32, i32)>,
 }
 
 impl ChunkStore {
@@ -92,10 +97,12 @@ impl ChunkStore {
             nether: HashMap::new(),
             loaded: 0,
             dirty: std::collections::HashSet::new(),
+            fluid_dirty: std::collections::HashSet::new(),
             redstone_dirty: std::collections::HashSet::new(),
             block_entities: std::collections::HashMap::new(),
             command_blocks: std::collections::HashSet::new(),
             pistons: std::collections::HashSet::new(),
+            crops: std::collections::HashSet::new(),
         })
     }
 
@@ -236,8 +243,13 @@ impl ChunkStore {
         let cx = x.div_euclid(16);
         let cz = z.div_euclid(16);
         self.check_owned(face, cx, cz)?;
-        let column = self.get_chunk_mut(face, cx, cz)?;
-        let ok = column.set_block(
+        let chunk = self.get_chunk_mut(face, cx, cz)?;
+        let old_state = chunk.block_at(
+            icbm_terrain_gen::ChunkColumn::local_coord(x),
+            y,
+            icbm_terrain_gen::ChunkColumn::local_coord(z),
+        );
+        let ok = chunk.set_block(
             icbm_terrain_gen::ChunkColumn::local_coord(x),
             y,
             icbm_terrain_gen::ChunkColumn::local_coord(z),
@@ -248,6 +260,11 @@ impl ChunkStore {
         }
         if face == Face::Overworld {
             self.dirty.insert((cx, cz));
+            // 仅含流体的区块进入流体 tick（旧/新状态任一为水/岩浆）——避免
+            // 每次普通放置都全量扫描 384 高度拖慢 region tick（IPC 响应延迟）
+            if crate::fluids::is_fluid(state_id) || crate::fluids::is_fluid(old_state) {
+                self.fluid_dirty.insert((cx, cz));
+            }
             if crate::redstone::is_redstone_block(state_id) {
                 self.redstone_dirty.insert((cx, cz));
             }
@@ -286,11 +303,16 @@ impl ChunkStore {
         self.overworld.keys().copied().collect()
     }
 
-    /// 被 `set_block` 修改的主世界区块（流体 tick 用），并清空脏标记。
-    pub fn dirty_overworld_chunks(&mut self) -> Vec<(i32, i32)> {
-        let chunks: Vec<(i32, i32)> = self.dirty.iter().copied().collect();
-        self.dirty.clear();
+    /// 含流体的主世界区块（流体 tick 用），并清空标记。
+    pub fn fluid_chunks(&mut self) -> Vec<(i32, i32)> {
+        let chunks: Vec<(i32, i32)> = self.fluid_dirty.iter().copied().collect();
+        self.fluid_dirty.clear();
         chunks
+    }
+
+    /// 流体更新后重新标记区块（扩散未稳定时由 `tick_fluids` 调回）。
+    pub fn mark_fluid_dirty(&mut self, cx: i32, cz: i32) {
+        self.fluid_dirty.insert((cx, cz));
     }
 
     /// 含红石方块的主世界区块（红石 tick 用），并清空标记。
@@ -298,6 +320,11 @@ impl ChunkStore {
         let chunks: Vec<(i32, i32)> = self.redstone_dirty.iter().copied().collect();
         self.redstone_dirty.clear();
         chunks
+    }
+
+    /// 重新标记区块含红石（功率传播未稳定时由 `tick_redstone` 调回）。
+    pub fn mark_redstone_dirty(&mut self, cx: i32, cz: i32) {
+        self.redstone_dirty.insert((cx, cz));
     }
 
     /// 读取方块实体 NBT（不存在返回 `None`）。
@@ -345,6 +372,12 @@ impl ChunkStore {
     #[must_use]
     pub fn piston_positions(&self) -> Vec<(i32, i32, i32)> {
         self.pistons.iter().copied().collect()
+    }
+
+    /// 作物位置列表。
+    #[must_use]
+    pub fn crop_positions(&self) -> Vec<(i32, i32, i32)> {
+        self.crops.iter().copied().collect()
     }
 }
 

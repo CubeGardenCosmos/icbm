@@ -75,6 +75,9 @@ offset 1: 载荷（按 kind 定义，全部小端）
 | 0x13  | COMMAND_EXECUTE    | R → C     | `[u8 长][命令]`（命令方块触发，core 以控制台身份执行）                      |
 | 0x14  | BLOCK_RAYCAST      | C → R     | `[f64 ox][f64 oy][f64 oz][f64 dx][f64 dy][f64 dz][f64 max]`（射线检测 → 0x94；末影珍珠落点） |
 | 0x94  | BLOCK_RAYCAST_RESP | R → C     | `[u8 hit][f64 x][f64 y][f64 z]`（命中方块坐标；未命中 hit=0）               |
+| 0x15  | WEATHER_UPDATE     | C → R     | `[u8 raining][u8 thundering][f32 rain_gradient][f32 thunder_gradient]`（core 全局天气同步） |
+| 0x16  | SURFACE_QUERY      | C → R     | `[u8 dim][i32 x][i32 z]`（地表高度查询 → 0x96；新玩家出生点适配）           |
+| 0x96  | SURFACE_RESP       | R → C     | `[i32 y]`（最高非空气方块 y+1）                                             |
 
 ## 生命周期
 
@@ -93,9 +96,13 @@ offset 1: 载荷（按 kind 定义，全部小端）
    该区域的玩家；region 卸载时 core 按实体 ID 段发 `REMOVE_ENTITIES` 清理客户端实体。
 7. 方块交互：`/setblock`/`/fill`（BLOCK_UPDATE）、方块查询（BLOCK_QUERY，传送门/屏障检测）、
    方块实体 NBT（BLOCK_NBT_GET/SET，`/data` 与命令方块 Command）、末影珍珠落点
-   （BLOCK_RAYCAST）均经 IPC 到 region；命令方块被红石供电后经 COMMAND_EXECUTE
-   交回 core 以控制台身份执行。
-8. switch 异常退出/扩容重启时，既有 Frontend 在下一次 touch/send 时自动重注册；region 侧由 `send_retry` 对 BUSY/FULL/AGAIN 短退避重试。
+   （BLOCK_RAYCAST）、地表高度（SURFACE_QUERY，新玩家出生点适配）均经 IPC 到 region；
+   命令方块被红石供电后经 COMMAND_EXECUTE 交回 core 以控制台身份执行。
+8. **全局时间/天气由 core 管理**：receiver 线程每秒推进 core 全局时间（`doDaylightCycle`）
+   与天气（`doWeatherCycle`）并广播 `TIME_UPDATE`/`WEATHER_UPDATE` 给所有 region；
+   region 不再各自推进，只把收到的状态广播给各自玩家（跨区域一致）。`/time`、
+   `/weather` 指令直接改 core 全局状态后广播。
+9. switch 异常退出/扩容重启时，既有 Frontend 在下一次 touch/send 时自动重注册；region 侧由 `send_retry` 对 BUSY/FULL/AGAIN 短退避重试。
 
 ## 错误处理
 

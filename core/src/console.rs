@@ -443,6 +443,10 @@ impl Server {
                         info!("{feedback}");
                     }
                 }
+                Command::Weather { kind, duration } => {
+                    let feedback = apply_weather(self, kind, duration);
+                    info!("{feedback}");
+                }
                 Command::Data {
                     action,
                     x,
@@ -877,28 +881,76 @@ pub fn apply_enchant(server: &Server, target: &str, enchantment: &str, level: i3
 /// 返回反馈字符串；`None` 表示参数非法。
 #[must_use]
 pub fn apply_time(server: &Server, set: Option<i64>, add: Option<i64>) -> Option<String> {
-    let regions: Vec<icbm_region::RegionId> = {
-        let world = server.world.lock().expect("world lock");
-        world.regions.ids()
-    };
     let tick = match (set, add) {
         (Some(tick), None) => tick,
-        (None, Some(add)) => add, // region 侧累加
+        (None, Some(add)) => add,
         _ => return None,
     };
-    for region in regions {
-        let body = icbm_region::protocol::encode_time_update(tick, add.is_some());
-        let _ = server.ipc.send(
-            &region.service_name(),
-            icbm_region::protocol::kind::TIME_UPDATE,
-            &body,
-        );
+    // 更新 core 全局时间（region 不再各自推进；随后广播给所有 region）
+    if add.is_some() {
+        let mut time = server.world_time.lock().expect("world time");
+        *time = time.wrapping_add(tick);
+    } else {
+        *server.world_time.lock().expect("world time") = tick;
     }
+    broadcast_time(server);
     Some(if add.is_some() {
         format!("已推进时间 {tick} tick")
     } else {
         format!("已将时间设置为 {tick}")
     })
+}
+
+/// 把 core 全局时间广播给所有 region（`/time` 命令与每秒同步共用）。
+fn broadcast_time(server: &Server) {
+    let regions: Vec<icbm_region::RegionId> = {
+        let world = server.world.lock().expect("world lock");
+        world.regions.ids()
+    };
+    let tick = *server.world_time.lock().expect("world time");
+    for region in regions {
+        let _ = server.ipc.send(
+            &region.service_name(),
+            icbm_region::protocol::kind::TIME_UPDATE,
+            &icbm_region::protocol::encode_time_update(tick, false),
+        );
+    }
+}
+
+/// 执行 `/weather clear|rain|thunder [时长秒]`：设置 core 全局天气并广播。
+#[must_use]
+pub fn apply_weather(
+    server: &Server,
+    kind: icbm_gameplay_minecraft::commands::WeatherKind,
+    _duration: Option<i64>,
+) -> String {
+    let (raining, thundering) = match kind {
+        icbm_gameplay_minecraft::commands::WeatherKind::Clear => (false, false),
+        icbm_gameplay_minecraft::commands::WeatherKind::Rain => (true, false),
+        icbm_gameplay_minecraft::commands::WeatherKind::Thunder => (true, true),
+    };
+    // 直接设目标态，并把梯度拉满/归零（立即生效，无需等待插值）
+    let (rain, thunder) = {
+        let mut weather = server.weather.lock().expect("weather");
+        weather.apply_from_core(raining, thundering, f32::from(raining), f32::from(thundering));
+        (weather.rain_gradient(), weather.thunder_gradient())
+    };
+    let regions: Vec<icbm_region::RegionId> = {
+        let world = server.world.lock().expect("world lock");
+        world.regions.ids()
+    };
+    for region in regions {
+        let _ = server.ipc.send(
+            &region.service_name(),
+            icbm_region::protocol::kind::WEATHER_UPDATE,
+            &icbm_region::protocol::encode_weather_update(raining, thundering, rain, thunder),
+        );
+    }
+    match kind {
+        icbm_gameplay_minecraft::commands::WeatherKind::Clear => "天气已设为晴朗".to_owned(),
+        icbm_gameplay_minecraft::commands::WeatherKind::Rain => "天气已设为下雨".to_owned(),
+        icbm_gameplay_minecraft::commands::WeatherKind::Thunder => "天气已设为雷暴".to_owned(),
+    }
 }
 
 /// 执行 `/data get|merge|remove block <x> <y> <z> [...]`（方块实体 NBT）。
