@@ -13,9 +13,10 @@
 ## 开发环境
 
 - 所有开发人员统一使用仓库内固定路径 `build/workspace/minecraft-assets` 下的反编译源码；**禁止再依赖家目录中的反编译资产**（旧资产已由 init 迁移至该目录下的 `legacy/`）。
-- 运行 `python3 build/main.py init`（推荐 `uv run build/main.py init`）完成环境就绪：同步 Git 子模块、克隆参考仓库（Pumpkin/NeoForge，非子模块）、部署 JDK 21（Adoptium 官方源失败自动降级清华 TUNA 镜像）、Fabric Loom 反编译（`build/loom/`，官方 mojmap）。init 末尾询问是否安装基础软件（Rust 工具链、Node、pi AI 工具），并执行一次 `cargo build --release` 预热编译缓存（成败不阻断）。下载与各步骤有 cargo 风格进度显示。
+- 运行 `python3 build/main.py init`（推荐 `uv run build/main.py init`）完成环境就绪：同步 Git 子模块、克隆参考仓库（Pumpkin `master` / NeoForge `1.21.1` 分支，非子模块）、部署 JDK 21（Adoptium 官方源失败自动降级清华 TUNA 镜像）、Fabric Loom 反编译（`build/loom/`，官方 mojmap）。init 末尾询问是否安装基础软件（Rust 工具链、Node、pi AI 工具），并执行一次 `cargo build --release` 预热编译缓存（成败不阻断）。下载与各步骤有 cargo 风格进度显示。
 - Python 工具由 uv 管理（`build/pyproject.toml`、`build/uv.lock`）；功能按分层拆分在 `build/icbm_dev_env/` 包内（入口 → 编排 → 领域功能 → 基础设施），`build/main.py` 只做 uv 自举与 CLI 分发，禁止向 `main.py` 堆逻辑。
 - 所有联网操作（git/urllib/Gradle/curl/rustup）遵循 `HTTPS_PROXY`/`HTTP_PROXY` 环境变量；Gradle 步骤由脚本翻译为 JVM 代理参数。
+- 环境重置与清理：`reinit`（删除 `build/workspace` 与 Loom 本地产物后重新完整部署，适合反编译结果被污染时）与 `cleanup`（`cargo clean` 清理 `target/` 腾出硬盘空间）均为破坏性操作，脚本会先请求确认。
 - `build/workspace/`、`build/.venv/`、`build/loom/{.gradle,build,run}/` 整体被 Git 忽略；`build/workspace/pumpkin` 与 `build/workspace/neoforge` 是外部参考实现，只读使用，不作为子模块。
 - 开发环境改动（如升级 Loom/Gradle 版本）需同步更新 `build/loom/` 与本文档。
 

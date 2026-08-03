@@ -136,12 +136,15 @@ uv run build/main.py init        # 推荐（uv 缺失时脚本自动安装并改
 ```
 
 - 反编译源码固定位于 `build/workspace/minecraft-assets`；Pumpkin/NeoForge 参考实现位于
-  `build/workspace/pumpkin`、`build/workspace/neoforge`（非子模块）。整个 `build/workspace/` 被 Git 忽略。
+  `build/workspace/pumpkin`、`build/workspace/neoforge`（非子模块；NeoForge 固定 `1.21.1` 分支）。
+  整个 `build/workspace/` 被 Git 忽略。
 - init 末尾会询问是否安装基础软件（Rust 工具链 cargo/rustc/rustfmt、Node、pi）；非交互环境可用 `--with-tools` 跳过询问。
 - init 最后会执行一次 `cargo build --release` 预热编译缓存（无论成败都会继续，日志提示结果）；下载/分步显示为 cargo 风格进度条。
 - 代理：所有联网操作遵循 `HTTPS_PROXY`/`HTTP_PROXY` 环境变量（Gradle 步骤自动翻译为 JVM 代理参数）；JDK 下载在官方源失败时自动降级清华 TUNA 镜像。
 - Python 工具由 uv 管理，逻辑分层在 `build/icbm_dev_env/` 包内。
-- 子命令：`submodules` / `clones` / `jdk` / `decompile` / `migrate-legacy` / `tools` / `rustfmt` / `status` / `clean`。
+- 子命令：`init` / `reinit` / `submodules` / `clones` / `jdk` / `decompile` / `migrate-legacy` / `tools` / `rustfmt` / `status` / `clean` / `cleanup`。
+  - `reinit`：移除 `build/workspace` 与 Loom 本地产物后重新完整部署（适合反编译结果被改动污染时）；
+  - `cleanup`：`cargo clean` 清理 `target/` 编译产物，腾出硬盘空间。
 
 > **正版验证默认开启**：服务端默认按正版模式登录（RSA 加密 + Mojang session
 > server 校验，获取真实 UUID 以加载皮肤）。离线/内网环境可设

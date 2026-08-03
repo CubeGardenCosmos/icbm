@@ -1,6 +1,9 @@
 """子命令编排层：把 CLI 子命令映射为对领域模块（decompile/vcs/toolchains）的调用。
 
 本层不做具体实现，只负责流程编排与用户交互（询问/确认）。
+
+子命令：init / reinit / submodules / clones / jdk / decompile / migrate-legacy /
+         tools / rustfmt / status / clean / cleanup
 """
 
 from __future__ import annotations
@@ -14,10 +17,27 @@ from pathlib import Path
 from . import config, decompile, net, toolchains, util, vcs
 
 
-# --- init ---------------------------------------------------------------------
+# --- 通用工具 -------------------------------------------------------------------
 
-def cmd_init(args: argparse.Namespace) -> None:
-    util.log(f"初始化 ICBM 开发环境（MC {config.MC_VERSION} / 协议 767）")
+def _wipe(paths: list[Path]) -> None:
+    """删除给定目录（存在才删）。"""
+    for p in paths:
+        if p.exists():
+            shutil.rmtree(p)
+            util.log(f"已删除 {p}")
+
+
+def _dir_size(p: Path) -> int:
+    """目录总字节数（不存在返回 0）。"""
+    if not p.exists():
+        return 0
+    return sum(f.stat().st_size for f in p.rglob("*") if f.is_file())
+
+
+# --- init / reinit --------------------------------------------------------------
+
+def _init_flow(args: argparse.Namespace) -> None:
+    """完整部署流程（init 与 reinit 共用，共 8 步）。"""
     config.WORKSPACE.mkdir(parents=True, exist_ok=True)
     steps = util.Steps(8)
 
@@ -58,7 +78,9 @@ def cmd_init(args: argparse.Namespace) -> None:
         else:
             steps.ok("已跳过")
     else:
+        steps.next("基础软件安装（已跳过）")
         util.log("非交互环境，跳过基础软件安装（可用 --with-tools 显式安装）")
+        steps.ok()
 
     steps.next("预热 cargo release 编译缓存")
     toolchains.warm_release_cache()
@@ -66,6 +88,25 @@ def cmd_init(args: argparse.Namespace) -> None:
 
     util.log("开发环境初始化完成。反编译源码位于 build/workspace/minecraft-assets，"
              "Pumpkin/NeoForge 参考位于 build/workspace/。均已被 Git 忽略。")
+
+
+def cmd_init(args: argparse.Namespace) -> None:
+    util.log(f"初始化 ICBM 开发环境（MC {config.MC_VERSION} / 协议 767）")
+    _init_flow(args)
+
+
+def cmd_reinit(args: argparse.Namespace) -> None:
+    """移除部署环境（workspace + Loom 本地产物）并重新执行完整部署。"""
+    if not args.yes:
+        answer = input("reinit 将删除 build/workspace 与 Loom 本地构建产物，"
+                       "并重新下载/反编译全部内容。继续？[y/N] ")
+        if answer.strip().lower() not in ("y", "yes"):
+            util.log("已取消")
+            return
+    util.log("移除部署环境…")
+    _wipe([config.WORKSPACE, config.LOOM_DIR / ".gradle", config.LOOM_DIR / "build"])
+    util.log(f"重新部署 ICBM 开发环境（MC {config.MC_VERSION} / 协议 767）")
+    _init_flow(args)
 
 
 # --- 单步子命令 ----------------------------------------------------------------
@@ -115,9 +156,11 @@ def cmd_status(_: argparse.Namespace) -> None:
         head = ""
         if (dest / ".git").exists():
             try:
-                out = subprocess.run(["git", "-C", str(dest), "rev-parse", "--short", "HEAD"],
+                out = subprocess.run(["git", "-C", str(dest), "rev-parse", "--abbrev-ref", "HEAD"],
                                      capture_output=True, text=True, timeout=15).stdout.strip()
-                head = f" @ {out}"
+                short = subprocess.run(["git", "-C", str(dest), "rev-parse", "--short", "HEAD"],
+                                       capture_output=True, text=True, timeout=15).stdout.strip()
+                head = f" @ {out} {short}"
             except Exception:  # noqa: BLE001
                 pass
         print(f"{name}: {fmt_dir(dest)}{head}")
@@ -143,10 +186,23 @@ def cmd_clean(args: argparse.Namespace) -> None:
         if answer.strip().lower() not in ("y", "yes"):
             util.log("已取消")
             return
-    for p in targets:
-        if p.exists():
-            shutil.rmtree(p)
-            util.log(f"已删除 {p}")
+    _wipe(targets)
+
+
+def cmd_cleanup(args: argparse.Namespace) -> None:
+    """cargo clean 清理 target/ 编译产物（腾出硬盘空间）。"""
+    if not shutil.which("cargo"):
+        util.err("未找到 cargo，无法清理 target/")
+    if not args.yes:
+        answer = input("cleanup 将执行 cargo clean，删除 target/ 全部编译产物（腾出硬盘空间）。继续？[y/N] ")
+        if answer.strip().lower() not in ("y", "yes"):
+            util.log("已取消")
+            return
+    target_dir = config.REPO_ROOT / "target"
+    before = _dir_size(target_dir)
+    toolchains.clean_cargo_target()
+    freed = _dir_size(target_dir) - before
+    util.log(f"target/ 剩余 {_dir_size(target_dir) / 1e9:.2f} GiB，释放 {abs(freed) / 1e9:.2f} GiB")
 
 
 # --- CLI 构建 -------------------------------------------------------------------
@@ -158,12 +214,18 @@ def build_parser() -> argparse.ArgumentParser:
     )
     sub = parser.add_subparsers(dest="command", required=True)
 
-    p_init = sub.add_parser("init", help="完整初始化开发环境")
+    p_init = sub.add_parser("init", help="完整初始化开发环境（MC 1.21.1）")
     p_init.add_argument("--workspace-jdk", action="store_true",
                         help="强制使用 workspace 内部署的 JDK，忽略系统 JDK")
     p_init.add_argument("--with-tools", action="store_true",
                         help="跳过询问，直接安装基础软件（Node/Rust/pi）")
     p_init.set_defaults(func=cmd_init)
+
+    p_reinit = sub.add_parser("reinit", help="移除部署环境（workspace+Loom 产物）并重新完整部署")
+    p_reinit.add_argument("--workspace-jdk", action="store_true")
+    p_reinit.add_argument("--with-tools", action="store_true")
+    p_reinit.add_argument("-y", "--yes", action="store_true", help="跳过确认")
+    p_reinit.set_defaults(func=cmd_reinit)
 
     sub.add_parser("submodules", help="仅同步 Git 子模块").set_defaults(func=cmd_submodules)
     sub.add_parser("clones", help="仅克隆 Pumpkin / NeoForge 参考仓库").set_defaults(func=cmd_clones)
@@ -185,5 +247,9 @@ def build_parser() -> argparse.ArgumentParser:
     p_clean = sub.add_parser("clean", help="删除 build/workspace 与 Loom 构建产物")
     p_clean.add_argument("-y", "--yes", action="store_true", help="跳过确认")
     p_clean.set_defaults(func=cmd_clean)
+
+    p_cleanup = sub.add_parser("cleanup", help="cargo clean 清理 target/ 编译产物（腾出硬盘空间）")
+    p_cleanup.add_argument("-y", "--yes", action="store_true", help="跳过确认")
+    p_cleanup.set_defaults(func=cmd_cleanup)
 
     return parser

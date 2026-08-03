@@ -199,6 +199,16 @@ def warm_release_cache() -> None:
         util.log(f"cargo build --release 未成功（exit={proc.returncode}），缓存部分就绪")
 
 
+def clean_cargo_target() -> None:
+    """cargo clean 删除 target/ 全部编译产物；失败不阻断（可能有构建进程占用）。"""
+    util.log("执行 cargo clean（删除 target/ 编译产物）…")
+    proc = util.run(["cargo", "clean"], cwd=config.REPO_ROOT, check=False)
+    if proc.returncode == 0:
+        util.log("cargo clean 完成，target/ 已清空")
+    else:
+        util.log(f"cargo clean 未成功（exit={proc.returncode}），可能有构建进程占用 target/")
+
+
 # --- 内部工具 -------------------------------------------------------------------
 
 def _deploy_from_archive(archive: Path, target: Path) -> None:

@@ -7,6 +7,8 @@
 
 用法：
     uv run build/main.py init
+    uv run build/main.py reinit     # 移除部署环境并重新完整部署
+    uv run build/main.py cleanup -y # cargo clean 清理 target/
     python3 build/main.py init      # 无 uv 时亦可直接运行（当前仅依赖标准库）
 
 代理：所有联网操作遵循 HTTPS_PROXY/HTTP_PROXY 环境变量（见 icbm_dev_env/net.py）。

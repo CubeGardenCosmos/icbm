@@ -32,7 +32,9 @@ MC_VERSION = "1.21.1"
 # --- 外部 URL ----------------------------------------------------------------
 
 PUMPKIN_URL = "https://github.com/Pumpkin-MC/Pumpkin"
+PUMPKIN_BRANCH = "master"                 # Pumpkin 默认分支
 NEOFORGE_URL = "https://github.com/neoforged/neoforge"
+NEOFORGE_BRANCH = "1.21.1"                # 固定到与项目一致的 MC 1.21.1 维护分支
 VERSION_MANIFEST_URL = "https://piston-meta.mojang.com/mc/game/version_manifest_v2.json"
 ADOPTIUM_API = "https://api.adoptium.net/v3/binary/latest/21/ga/{os}/{arch}/jdk/hotspot/normal/eclipse"
 NODE_INDEX_URL = "https://nodejs.org/dist/index.json"

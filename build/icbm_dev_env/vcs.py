@@ -17,12 +17,14 @@ def sync_submodules() -> None:
 
 
 def clone_repos() -> None:
-    """克隆外部参考仓库（普通克隆，非子模块）。"""
-    clone_if_missing(config.PUMPKIN_URL, config.PUMPKIN_DIR, "Pumpkin 参考实现")
-    clone_if_missing(config.NEOFORGE_URL, config.NEOFORGE_DIR, "NeoForge 参考实现")
+    """克隆外部参考仓库（普通克隆，非子模块；固定到与项目一致的分支）。"""
+    clone_if_missing(config.PUMPKIN_URL, config.PUMPKIN_DIR, "Pumpkin 参考实现",
+                     branch=config.PUMPKIN_BRANCH)
+    clone_if_missing(config.NEOFORGE_URL, config.NEOFORGE_DIR, "NeoForge 参考实现",
+                     branch=config.NEOFORGE_BRANCH)
 
 
-def clone_if_missing(url: str, dest: Path, desc: str) -> None:
+def clone_if_missing(url: str, dest: Path, desc: str, *, branch: str | None = None) -> None:
     if (dest / ".git").exists():
         util.log(f"{desc} 已存在: {dest}")
         return
@@ -30,7 +32,11 @@ def clone_if_missing(url: str, dest: Path, desc: str) -> None:
         util.err(f"{dest} 已存在但不是 Git 仓库，请手动处理后重试")
     dest.parent.mkdir(parents=True, exist_ok=True)
     # git 原生读取 HTTP(S)_PROXY 环境变量，环境透传即可
-    util.run(["git", "clone", "--depth", "1", url, str(dest)], env=dict(os.environ))
+    cmd = ["git", "clone", "--depth", "1"]
+    if branch:
+        cmd += ["--branch", branch]
+    cmd += [url, str(dest)]
+    util.run(cmd, env=dict(os.environ))
 
 
 def migrate_legacy_assets() -> None:
