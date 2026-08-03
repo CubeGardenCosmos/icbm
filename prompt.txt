@@ -1,0 +1,180 @@
+切记：
+如果需要访问Minecraft的源代码，请参考：家目录的minecraft-server-1.21.1-src
+
+如果需要参考成熟的tokio Minecraft协议实现，请查看 master 分支
+
+我们来使用rust cleanroom复刻一个Minecraft服务器。严格参考minecraft-server源码，实现等效功能。但按照我们的需求，保留自己的想法。我们有且仅有1.21.1 Java版的兼容需求。
+
+让我们理清概念：
+
+core 服务器运行的主进程。他负责初始化datarouter，读取服务器配置，启动第一个Region。core还管理了配方注册、Y大于400时的虚拟区域。它处理玩家以及玩家绑定的实体（驯服的动物），也处理服务器的权限、聊天问题。
+lib/datarouter 是子模块，git@github.com:Creeper23456/datarouter.git 负责进程间通讯
+lib/i18n 存放格式化的国际化文本。作为预留。
+lib/mc-767 存放服务器网络协议的Rust实现，包括NBT结构。
+lib/terrain-gen 存放Minecraft或后续追加的地形生成器
+region 是服务器的子进程。它处理了32*32区块内的主要事件。服务器按照32*32区块进行region拆分。末地是特殊的：它是传统的Minecraft服务器，在没有玩家时卸载，并且不拆分region。对于地狱，按照4*4的区块。一个region负责该区域内的地狱与主世界事件。
+gameplay 存放游玩主要内容。按照命名空间拆分。
+ gameplay/minecraft 存放了Minecraft的主要游戏内容。包括方块、合成配方、成就注册表、生物、指令
+ gameplay/icbm 存放了服务器特定的协议，包括部分指令，以及后续的其他内容更新。现阶段
+ gameplay/... 后续其他内容的存放地点
+
+core和region是同一个二进制的两种功能。region作为子进程加入到shm池中负责它注册的存档文件。core管理region注册。
+
+让我们理清region与core的核心概念。这是我们与普通Minecraft服务器不同之处：
+让我们将一个Minecraft世界拆分成多个区块。我们是这样拆分的：在主世界，每个服务器实例持有32*32个区块，并锁住一个存档区块文件。服务器实例内，tick行为与传统的Minecraft服务器保持一致。我们称之为region。
+它持有一个存档的Y<400、固定存档文件的主世界32*32区域，以及地狱的4*4区域。
+当玩家试图跨越region时，他的速度不能超过2个方块每秒。如果玩家试图使用船穿过，则会被减速。
+如果玩家试图使用鞘翅，则会直接“感受到动能”后死亡。当玩家装备鞘翅在空中高速靠近边境且还剩余50方块时，服务器会在Action Bar提醒：你当前正在边境，请爬升高度。
+当玩家处于某个region时，围绕玩家所在region为中心的9*9范围内，如果存在没有生成地图的region，则拉起子进程进行多线程生成。
+当玩家处于region时，默认的模拟距离为8，最大可视距离为64。允许玩家读取所在region外的地形。当玩家离开region且该region没有玩家时，传送处于跟随状态的伴侣动物，并标记该region处于沉睡状态（停止tick更新）。
+当region沉睡超过30秒后，卸载该region（停止region的进程）。沉睡的region允许破坏方块，但除锁定了玩家的boos、掉落物之外的实体停止更新。
+玩家在Y400以上活动时，不加载任何region。被卸载的region无法进行任何交互。是只读的。
+
+-- version 1 --
+
+第一阶段实现内容 ok
+- 地形生成器：始终为flat 超平坦。包括末地、地狱和主世界。
+- 实现上述core-region分型的基本功能
+- 实现gameplay/minecraft 的方块、生物、声音注册和gamerule与gamemode指令
+- 实现/bmtool 工具。当前只实现/bmtool tps，用于打印：CPU负载、CPU核心数量、活跃Region数量、沉睡Region数量、当前region tps值，平均region tps值
+- 实现控制台，参考master分支。
+- 实现默认icon和MOTD，参考master分支
+- 实现lib/mc-767
+- datarouter接入，并约定无上下文开销的二进制作为通讯协议
+
+第二阶段实现内容 debuging
+- 红石 （不包括活塞）
+- Minecraft原版指令：tp、ban、whitelist、fill、setblock、give
+- 原版gamerule
+- master分支/about 实现。品牌名改为大写ICBM
+- 友好生物生成与AI，包括声音。暂时不移除随机移动的苦力怕，但让他们的寻路看上去更合理、更符合友好生物的样子
+- 地狱功能。包括下界传送门
+- 附魔系统与铁砧系统（仅创造模式 玩家经验暂不实现）
+- 流体，例如水、岩浆，含水方块
+- TNT、掉落物实体
+- 正版验证系统（参考master实现）
+
+第三阶段实现内容：
+- 玩家进入游戏后，打印所在坐标、IP地址、UUID和维度，而不仅仅是打印ID。Client Information locate读取，获取玩家所在语言。语言也会被打印出来。
+  提示：如果玩家在游戏中变更语言，也应该作为DEBUG信息输出，但服务器默认不输出变更，仅在玩家加入时输出一次。
+- 红石高级特性。包括BUD与活塞，以及珊瑚与TNT刷取在内的故障特性也需要被实现
+- 部分命令方块与Minecraft原版指令：fill、setblock以及具备NBT编辑能力的指令子项。包括游戏内的指令补全。
+- 天气系统与农作物生长系统，友好生物随机生成系统
+- 敌对生物，以及敌对生物AI。苦力怕开始使用原版的生成机制和AI。不包括boss。幻翼也不在其中（本服务器实现没有幻翼）。鞘翅将使用皮革修补。
+- 功能性实体与方块。例如亮度方块、屏障、命令方块。
+- 鞘翅。现在创造模式玩家也不能飞行状态下快速通过屏障了。但乘坐船并且处在水面上的玩家可以。
+- 末影珍珠改为计算落点后直接传送，而不是原版的加载区块计算后传送。
+- 超平坦开始从洞穴更新后的最低建筑点开始生成
+
+第四阶段实现内容：
+- 引入原版的物理系统，沙子、沙砾会掉落。部分方块需要其他方块支撑的也会因为支撑方块被破坏掉落，脚手架开始可用
+- 使用toml配置文件配置服务器参数，而不是直接在启动参数配置
+- 引入FML握手协议。并可检查并列出客户端安装模组
+- 战斗系统。包括盾牌、重锤、三叉戟等特性。
+- 矿车、船、坐骑、驯化系统、育种系统
+
+第五阶段实现内容：
+- 村民与村民职业系统。村民开始可以被治疗。猪灵交易系统可用。
+- 末影箱与潜影盒系统 玩家可以直接右手持并对着空白区域（例如天空）右键，即可直接打开GUI。玩家无法在手持打开GUI的同时将右手手持的被打开的容器进行移动。
+- 敌对boss，包括AI。
+- 成就与进度系统
+- 经验系统。附魔系统正式可用。
+- 完善README
+- 集成shiroitori推理核心。shiroritori占用gameplay/下的单独命名空间。shiroitori直接作为游戏内特性工作。
+  但本阶段仅复制shiroitori文件，不做任何实际集成。 git@github.com:Creeper23456/shiroitori.git
+
+第六阶段实现内容：
+- 信标、药水与酿造和酿造配方的实现。
+- 优化铁砧合成：前两次合成不在物品计算合成点数惩罚（过于昂贵），改为让当前合成铁砧损失4倍耐久（相当于一次铁砧合成了附魔书或附魔物品，会消耗四次制作次数以抵免过于昂贵）
+- 分解任务：core负责游戏服务器。新建master，master进程接管core的启动流程，接管datarouter的管理，并处理shiroitori和权限管理，以及http监听和数据库连接池。master不涉及也不应该涉及游戏逻辑本身。core将更注重游戏流程本身。
+- master处理shiroitori的推理事件。由core发送游戏内事件进行处理。master原生是单进程多线程设计的。这点和core不同。（core和region都是单线程多进程设计）。master还将处理mysql连接池
+- 权限管理。参考   https://github.com/LuckPerms/LuckPerms 并允许直接在服务器监听一个配置文件预设的HTTP端口，在管理员激活后自动引导管理员访问本地HTTP服务器进行编辑
+- 玩家行为记录： 参考 https://github.com/QuiltServerTools/Ledger
+
+-- version 2 --
+
+主题：更好的世界 A better World
+
+提示：对于模组引用，我们只复制其服务器逻辑部分。并借用其中的协议实现。作为开发约束，该情景适用于任何后续的模组移植。
+
+第一阶段：
+- 使用下列地图生成算法的中间值——我的意思是，二者混合得到的风味Minecraft地形生成系统。
+    参考：https://github.com/VolmitSoftware/Iris https://github.com/Apollounknowndev/tectonic
+  由二者混合得到的地形生成器，分两种：
+    - 普通的、正常的生成器：landscape
+    - 水下版本。在该生成器下，水淹没了所有的海平面。玩家只能在水中生存。海底下不再生成自然木头，水直接顶到世界生成上限：lanthanum
+  地形生成在本阶段不带有矿石。矿脉的生成逻辑暂时为空。
+- 原版Minecraft结构（主世界）开始生成。包括末地传送门、村庄、远古遗迹、藏宝箱等诸多原版结构。
+    - 注意 结构应该接受两种形式：当前接受nbt与json格式两种。json是出于对老版本Minecraft结构兼容导致的。就我所知，这部分老建筑，例如海底神殿、地牢、末地要塞，都是非结构方块的。
+
+第二阶段：
+- 史莱姆区块
+- 生态群系特性完整实现
+- 可调整的矿脉生成系统
+- 原版Minecraft结构（末地）开始生成
+- 完整的合成系统。包括熔炉烧制、合成台、合成配方等。
+  修改部分原版配方，例如：熔炉可烧制腐肉，得到皮革。
+
+第三阶段：
+- 下界合金、下界要塞、下界堡垒等下界结构开始生成
+- 末地结构开始生成
+- 引入PhysX，用于计算TNT、沙子和沙砾、铁砧、弹射物轨迹。参考：https://github.com/NVIDIA-Omniverse/PhysX
+
+第四阶段：
+- https://github.com/Fodoth-jinzi89/NeoGuanNiao 引入“观鸟”中生成的鸟类实体，并给与他们AI。
+- https://github.com/TelepathicGrunt/RepurposedStructures 引入“结构变体”，生成更多结构
+- https://github.com/FunctionHookTJU/old_wu_java-template-26.2 引入“老吴”猫模组
+- https://github.com/Aureljz/WhenDungeonsArise--Forge 引入更多结构生成
+- https://github.com/Aureljz/WhenDungeonsArise-SevenSeas-Forge 包括海洋结构生成
+- 在gameplay/alexmobs 实现 https://github.com/AlexModGuy/AlexsMobs 并整合 https://github.com/CrimsonCrips/AlexsMobsInteraction
+- 在gameplay/hamsterpets 引入 https://github.com/DawsonBodenhamer/AdorableHamsterPets-Source
+ 
+第五阶段：
+- 引入“农夫乐事”在gameplay/farmersdelight/vanllia 参考 https://github.com/vectorwing/FarmersDelight
+- 引入“下界乐事”在gameplay/farmersdelight/nether 参考https://github.com/Chefs-Delight/NethersDelight_Forge
+- 引入“末地乐事”在gameplay/farmersdelight/end 参考 https://github.com/FoggyHillside/End-s-Delight
+- 引入“果园乐事”在gameplay/farmersdelight/fruits 参考 https://github.com/Minecraft-LightLand/FruitsDelight
+- 引入“Alex乐事”在gameplay/farmersdelight/alex 参考 https://github.com/Baisylia/Alexs-Delight
+
+第六阶段：
+（请在icbm-client工作）
+将以下模组作为嵌入的模组依赖，修改部分功能实现后打包进入icbm-client：
+- “老吴”猫模组：仅包括猫的动作渲染，不包括本地AI逻辑。AI将被服务器接管
+- “观鸟”模组：移除大部分交互，玩家可用种子驯服鸣禽，并用原版鱼类驯服涉禽。驯服后，鸟类的AI与鹦鹉类似
+
+-- version 3  --
+主题： 声音，翻译与i18n
+
+第一阶段：
+- 实现所有游戏内指令文本返回时，返回文本支持i18n
+- 实现基础文本支持：简体中文、繁体中文、英文、日文、俄罗斯文、泰文、阿拉伯文、法文、德文、意大利文
+- 实现文本劫持（即 简易的语言识别。能够简单识别出当前游戏内聊天发言人的语言）
+
+第二阶段：
+- https://github.com/henkelmax/simple-voice-chat 实现协议。但：
+  不允许玩家之间语音通话
+  预留，用于自定义音频推流
+- 实现大模型翻译游戏内文本。模式为Overlay，即覆盖传输给玩家的信息，而不是修改存档内容。翻译文本包括：
+  - 告示牌
+  - 书本
+  - 聊天内容
+当传输的文本不属于玩家的locate所属语言时，将自动翻译为玩家的语言
+玩家可用/bmtool chat-translate false 禁用它
+
+第三阶段：
+- /prefix 可以为玩家 赋予头衔 格式为/prefix grant PlayerName ADMIN red
+或 /grant PlayerName ADMIN 0xffffff
+赋予后，玩家发言时将会变为 [（赋予内容）]PlayerName，其中，方括号包裹内部为对应颜色。玩家ID颜色不变。该头衔同样适用于Tab玩家栏
+/prefix revoke即可取消玩家的头衔
+- 玩家在聊天内发送的链接，可直接被服务器识别为可访问内容，并可直接点击
+- 玩家可以被@ 提到。输入@时 可Tab补全所有在线玩家
+
+-- version 4  --
+主题： 通用机械
+
+第一阶段：
+- 添加Mek的方块和物品 不包括机器
+- 协议兼容Mek 不包括对讲机 明确向客户端报告禁用对讲机 同样不包括纸箱
+
+第二阶段：
+ 等待后续补充...
