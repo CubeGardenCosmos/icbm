@@ -121,11 +121,27 @@ world/
 
 ## 参考基线
 
-- Minecraft 1.21.1 反编译源码（Yarn `1.21.1+build.3:v2`）：`~/minecraft-server-1.21.1-src`，共 4,064 个 Java 文件，仅作行为分析参考。
+- Minecraft 1.21.1 反编译源码（Fabric Loom 生成，客户端+服务端合并、官方 mojmap 命名）：`build/workspace/minecraft-assets`（由 `python3 build/main.py init` 生成，Git 忽略），仅作行为分析参考。
 - 成熟 tokio Minecraft 协议实现：本仓库 `master` 分支，作为控制台、默认 icon/MOTD、协议行为等实现的参考。
 - 协议与版本常量（1.21.1 / 767 / DataVersion 3955 等）以 `net.minecraft.SharedConstants` 与 master 分支 `util/src/version.rs` 为准。
 
 ## 构建与运行
+
+### 开发环境准备
+
+```bash
+# 一键就绪：同步子模块 + 克隆 Pumpkin/NeoForge 参考 + 部署 JDK 21 + Loom 反编译
+uv run build/main.py init        # 推荐（uv 缺失时脚本自动安装并改用 uv 运行）
+# 或：python3 build/main.py init
+```
+
+- 反编译源码固定位于 `build/workspace/minecraft-assets`；Pumpkin/NeoForge 参考实现位于
+  `build/workspace/pumpkin`、`build/workspace/neoforge`（非子模块）。整个 `build/workspace/` 被 Git 忽略。
+- init 末尾会询问是否安装基础软件（Rust 工具链 cargo/rustc/rustfmt、Node、pi）；非交互环境可用 `--with-tools` 跳过询问。
+- init 最后会执行一次 `cargo build --release` 预热编译缓存（无论成败都会继续，日志提示结果）；下载/分步显示为 cargo 风格进度条。
+- 代理：所有联网操作遵循 `HTTPS_PROXY`/`HTTP_PROXY` 环境变量（Gradle 步骤自动翻译为 JVM 代理参数）；JDK 下载在官方源失败时自动降级清华 TUNA 镜像。
+- Python 工具由 uv 管理，逻辑分层在 `build/icbm_dev_env/` 包内。
+- 子命令：`submodules` / `clones` / `jdk` / `decompile` / `migrate-legacy` / `tools` / `rustfmt` / `status` / `clean`。
 
 > **正版验证默认开启**：服务端默认按正版模式登录（RSA 加密 + Mojang session
 > server 校验，获取真实 UUID 以加载皮肤）。离线/内网环境可设

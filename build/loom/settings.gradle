@@ -1,0 +1,16 @@
+// ICBM 反编译工程：仅用于把 Minecraft 1.21.1（协议 767）合并客户端/服务端 jar
+// 反编译为官方 mojmap 命名源码，供行为分析参考。产物不入库（见 build/main.py）。
+pluginManagement {
+    repositories {
+        maven { url = 'https://maven.fabricmc.net/' }
+        mavenCentral()
+        gradlePluginPortal()
+    }
+}
+
+plugins {
+    // 自动为缺失的 Java 21 toolchain 下载 JDK（Gradle toolchain 解析）。
+    id 'org.gradle.toolchains.foojay-resolver-convention' version '1.0.0'
+}
+
+rootProject.name = 'icbm-mc-decompile'

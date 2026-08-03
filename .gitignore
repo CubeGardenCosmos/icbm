@@ -25,3 +25,14 @@ usercache.json
 .vscode/settings.json
 .idea
 .DS_Store
+
+# === Python（build/main.py 及其包） ===
+__pycache__/
+*.py[cod]
+
+# === 开发环境工作区（build/main.py 自动生成，不入库） ===
+build/workspace/
+build/.venv/
+build/loom/.gradle/
+build/loom/build/
+build/loom/run/

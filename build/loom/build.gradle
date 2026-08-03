@@ -1,0 +1,53 @@
+// ICBM 反编译工程：Fabric Loom 将 Minecraft 1.21.1 合并 jar 反编译为官方
+// mojmap 源码。固定版本：MC 1.21.1 / 协议 767 / DataVersion 3955。
+plugins {
+    id 'java'
+    id 'fabric-loom' version '1.17.17'
+}
+
+group = 'cn.cubegarden.icbm'
+version = '1.21.1'
+
+java {
+    toolchain {
+        languageVersion = JavaLanguageVersion.of(21)
+    }
+}
+
+repositories {
+    maven { url = 'https://maven.fabricmc.net/' }
+    mavenCentral()
+}
+
+dependencies {
+    minecraft "com.mojang:minecraft:1.21.1"
+    mappings loom.officialMojangMappings()
+}
+
+// 本工程只产出反编译源码 jar，不需要编译/打包自己的代码。
+tasks.named('jar') {
+    enabled = false
+}
+
+// Loom 1.9+ 把反编译产物发布到 Gradle 用户目录的 loom 缓存（minecraftMaven），
+// 这里复制到工程内固定位置 build/libs/，供 build/main.py 取用。
+tasks.register('exportSources') {
+    group = 'icbm'
+    description = '将 Loom 反编译的 minecraft-merged sources jar 复制到 build/libs/'
+    dependsOn tasks.named('genSources')
+    def minecraftMaven = file("${gradle.gradleUserHomeDir}/caches/fabric-loom/minecraftMaven/net/minecraft/minecraft-merged")
+    def outDir = layout.buildDirectory.dir('libs')
+    outputs.dir(outDir)
+    doLast {
+        def jars = fileTree(minecraftMaven) { include '**/*-sources.jar' }.files
+        if (jars.isEmpty()) {
+            throw new GradleException("未在 Loom 缓存中找到 sources jar: ${minecraftMaven}")
+        }
+        def latest = jars.sort { it.lastModified() }.last()
+        copy {
+            from latest
+            into outDir
+            rename { 'minecraft-merged-1.21.1-sources.jar' }
+        }
+    }
+}

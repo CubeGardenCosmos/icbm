@@ -8,11 +8,20 @@
 - 唯一目标协议为 767（Java 1.21 与 1.21.1 共用，实现与数据一律以 1.21.1 为准）。
 - 服务器采用 core + region 区域化模型（同一二进制两种模式）；区域边界隔离是有意的玩法差异，必须在文档中记录，不得在 region 内部放松原版一致性。
 - [README.md](README.md) 是架构、阶段顺序与验收条件的当前来源；[docs/ipc.md](docs/ipc.md) 是 core/region 通讯协议的唯一来源。
-- Loom 反编译源码位于仓库外（`~/minecraft-server-1.21.1-src`），只作行为分析参考；不得把 Mojang 源码、注释或资源复制进本仓库。
+- 反编译源码由 `build/main.py init` 生成于仓库内固定路径 `build/workspace/minecraft-assets`（客户端+服务端合并、官方 mojmap 命名；Git 忽略），只作行为分析参考；不得把 Mojang 源码、注释或资源复制进本仓库。
+
+## 开发环境
+
+- 所有开发人员统一使用仓库内固定路径 `build/workspace/minecraft-assets` 下的反编译源码；**禁止再依赖家目录中的反编译资产**（旧资产已由 init 迁移至该目录下的 `legacy/`）。
+- 运行 `python3 build/main.py init`（推荐 `uv run build/main.py init`）完成环境就绪：同步 Git 子模块、克隆参考仓库（Pumpkin/NeoForge，非子模块）、部署 JDK 21（Adoptium 官方源失败自动降级清华 TUNA 镜像）、Fabric Loom 反编译（`build/loom/`，官方 mojmap）。init 末尾询问是否安装基础软件（Rust 工具链、Node、pi AI 工具），并执行一次 `cargo build --release` 预热编译缓存（成败不阻断）。下载与各步骤有 cargo 风格进度显示。
+- Python 工具由 uv 管理（`build/pyproject.toml`、`build/uv.lock`）；功能按分层拆分在 `build/icbm_dev_env/` 包内（入口 → 编排 → 领域功能 → 基础设施），`build/main.py` 只做 uv 自举与 CLI 分发，禁止向 `main.py` 堆逻辑。
+- 所有联网操作（git/urllib/Gradle/curl/rustup）遵循 `HTTPS_PROXY`/`HTTP_PROXY` 环境变量；Gradle 步骤由脚本翻译为 JVM 代理参数。
+- `build/workspace/`、`build/.venv/`、`build/loom/{.gradle,build,run}/` 整体被 Git 忽略；`build/workspace/pumpkin` 与 `build/workspace/neoforge` 是外部参考实现，只读使用，不作为子模块。
+- 开发环境改动（如升级 Loom/Gradle 版本）需同步更新 `build/loom/` 与本文档。
 
 ## 参考基线（最高权重）
 
-- **Minecraft 1.21.1 反编译源码（`~/minecraft-server-1.21.1-src`）是行为一致性的最高权重参考**：协议包字段与编码、NBT 结构、Anvil/ChunkSerializer 格式、PalettedContainer 规则、注册表数据、登录/配置/Play 流转等一切可观察行为，实现时必须以源码为准频繁对照，不得凭记忆或二手资料臆测。
+- **Minecraft 1.21.1 反编译源码（`build/workspace/minecraft-assets`，由 `build/main.py init` 生成）是行为一致性的最高权重参考**：协议包字段与编码、NBT 结构、Anvil/ChunkSerializer 格式、PalettedContainer 规则、注册表数据、登录/配置/Play 流转等一切可观察行为，实现时必须以源码为准频繁对照，不得凭记忆或二手资料臆测。
 - 源码与本文档冲突时以源码为准，并同步修订本文档；源码与 master 分支实现冲突时，以源码为准并记录差异。
 - 每个依赖源码结论的实现点应在代码注释中标注对应的源码类/方法（如 `ChunkSerializer.java`、`PalettedContainer.java`）。
 
@@ -53,7 +62,7 @@
 
 ## 原版一致性与运行时约束
 
-- 以可观察行为为移植目标：状态变化、数据包、事件顺序、存档结果、命令反馈与 1.21.1 对齐；参考 Yarn 源码分析行为，但用 Rust 独立实现并以测试证明。
+- 以可观察行为为移植目标：状态变化、数据包、事件顺序、存档结果、命令反馈与 1.21.1 对齐；参考反编译源码（官方 mojmap 命名）分析行为，但用 Rust 独立实现并以测试证明。
 - **安全聊天（secure chat）永不支持**：所有场景下 `enforcesSecureChat` 必须为 false；不实现签名聊天、消息头部、会话 UUID（chat session）、`minecraft:chat` 通道签名路径。未来任何涉及聊天/命令的改动不得引入安全聊天假设。
 - 每项“原版一致”结论关联单元测试、golden test、快照或可复现实验；有意差异（区域边界截断、迁移、Y > 400 虚拟区域）记录到 parity matrix。
 - 游戏状态只可在模拟/tick 所有权边界内变更；网络、认证、文件 I/O、压缩、哈希不得阻塞 tick 热路径。

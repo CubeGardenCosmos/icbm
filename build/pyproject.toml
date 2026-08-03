@@ -1,0 +1,9 @@
+[project]
+name = "icbm-dev-env"
+version = "0.1.0"
+description = "ICBM 开发环境就绪脚本（反编译 MC 1.21.1、参考仓库、工具链部署）"
+requires-python = ">=3.12"
+dependencies = []
+
+[tool.uv]
+package = false
