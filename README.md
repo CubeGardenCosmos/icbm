@@ -62,7 +62,7 @@ region 是服务器的子进程，作为 datarouter 中的独立服务（`icbm.r
 - **Creeper 敌对生物（region 存活信号）**：夜晚（世界时间 13000..23000）以概率在
   区域内生成 Creeper（上限 12 只，`doMobSpawning` 关闭时禁止），使用原版 AI：
   追踪最近玩家（16 格内）、3 格内点燃引信（30 tick 后爆炸，半径 3）；其存在本身
-  也是验证 region 是否仍在运行/已卸载的视觉信号——region 卸载后 Creeper 随之消失。
+  也是验证 region 是否仍在运行/已卸载的视觉信号——region 卸载后 Creeper 随之静止。
 - Y > 400 活动时不加载任何 region；被卸载的 region 是只读的，无法进行任何交互。
 
 ## 目录结构
@@ -92,7 +92,7 @@ world/
 ├── level.dat_old
 ├── region/                    # 主世界 region 文件 r.<rx>.<rz>.mca
 ├── DIM-1/region/              # 地狱
-├── DIM1/region/               # 末地（不拆分，全局单文件）
+├── DIM1/region/               # 末地
 └── playerdata/<uuid>.dat      # 玩家数据
 ```
 
