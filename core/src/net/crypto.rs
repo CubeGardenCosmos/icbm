@@ -302,18 +302,26 @@ pub fn verify_session(
         Some(ip) => format!("{url}&ip={ip}"),
         None => url,
     };
-    let agent = ureq::Agent::new_with_config(
-        ureq::Agent::config_builder()
-            .timeout_global(Some(auth_timeout()))
-            .build(),
-    );
-    let mut response = agent.get(&url).call().map_err(|err| match err {
+    let mut config = ureq::Agent::config_builder().timeout_global(Some(auth_timeout()));
+    // 尊重 `http_proxy`/`https_proxy`/`all_proxy` 环境变量（用户经本地代理访问
+    // Mojang 时必需；ureq 默认不读代理环境变量）
+    if let Some(proxy) = ureq::Proxy::try_from_env() {
+        tracing::debug!(proxy = %proxy.uri(), "using auth proxy from env");
+        config = config.proxy(Some(proxy));
+    }
+    let agent = ureq::Agent::new_with_config(config.build());
+    tracing::debug!(%url, "auth request");
+    let mut response = agent.get(&url).call().map_err(|err| match &err {
         ureq::Error::StatusCode(code) => match code {
             204 => CryptoError::UnverifiedUsername,
             403 => CryptoError::Banned,
-            other => CryptoError::AuthStatus(other),
+            other => CryptoError::AuthStatus(*other),
         },
-        _ => CryptoError::AuthRequest,
+        other => {
+            // 记录底层传输错误（DNS/连接/代理/TLS/超时），便于排查
+            tracing::warn!(%url, %other, "auth request transport error");
+            CryptoError::AuthRequest
+        }
     })?;
     let profile: GameProfile = response
         .body_mut()
