@@ -268,6 +268,24 @@ impl GameProfile {
 const MOJANG_SESSION_URL: &str =
     "https://sessionserver.mojang.com/session/minecraft/hasJoined?username={username}&serverId={server_hash}";
 
+/// 认证服务器地址（`ICBM_AUTH_URL` 可覆盖，支持 Drasl/Blessing Skin 等第三方；
+/// 占位符 `{username}`/`{server_hash}` 会被替换）。
+fn auth_url() -> String {
+    std::env::var("ICBM_AUTH_URL").unwrap_or_else(|_| MOJANG_SESSION_URL.to_owned())
+}
+
+/// 认证请求超时（毫秒，`ICBM_AUTH_TIMEOUT_MS` 可覆盖；默认 8 秒）。
+fn auth_timeout() -> std::time::Duration {
+    std::env::var("ICBM_AUTH_TIMEOUT_MS")
+        .ok()
+        .and_then(|v| v.parse::<u64>().ok())
+        .map_or(8_000, |ms| ms)
+        .max(500)
+        .min(30_000)
+        .checked_div(1_000)
+        .map_or(std::time::Duration::from_secs(8), std::time::Duration::from_secs)
+}
+
 /// 调用 Mojang session server 验证玩家（正版模式）。
 ///
 /// 客户端 `LoginKeyC2SPacket` 后，服务器已把玩家加入会话；此处查询
@@ -277,14 +295,19 @@ pub fn verify_session(
     server_hash: &str,
     ip: Option<&str>,
 ) -> Result<GameProfile, CryptoError> {
-    let url = MOJANG_SESSION_URL
+    let url = auth_url()
         .replace("{username}", username)
         .replace("{server_hash}", server_hash);
     let url = match ip {
         Some(ip) => format!("{url}&ip={ip}"),
         None => url,
     };
-    let mut response = ureq::get(&url).call().map_err(|err| match err {
+    let agent = ureq::Agent::new_with_config(
+        ureq::Agent::config_builder()
+            .timeout_global(Some(auth_timeout()))
+            .build(),
+    );
+    let mut response = agent.get(&url).call().map_err(|err| match err {
         ureq::Error::StatusCode(code) => match code {
             204 => CryptoError::UnverifiedUsername,
             403 => CryptoError::Banned,

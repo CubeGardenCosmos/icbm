@@ -129,7 +129,10 @@ world/
 
 > **正版验证默认开启**：服务端默认按正版模式登录（RSA 加密 + Mojang session
 > server 校验，获取真实 UUID 以加载皮肤）。离线/内网环境可设
-> `ICBM_ONLINE_MODE=offline` 关闭。玩家游戏模式与离线位置保存在
+> `ICBM_ONLINE_MODE=offline` 关闭；认证服务器地址可用 `ICBM_AUTH_URL` 覆盖
+> （占位符 `{username}`/`{server_hash}`，支持 Drasl/Blessing Skin 等第三方），
+> 超时用 `ICBM_AUTH_TIMEOUT_MS`（默认 8000）。认证失败时客户端显示 vanilla
+> 翻译文案（authservers down 等）。玩家游戏模式与离线位置保存在
 > `world/playerdata/<uuid>.dat`，重新进入自动恢复；新玩家出生在真实地表之上。
 > 全局时间与天气由 core 统一管理（`/time`、`/weather` 指令），各 region 一致。
 

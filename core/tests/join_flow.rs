@@ -12,6 +12,7 @@ use std::os::unix::process::CommandExt;
 use std::process::{Child, Command, Stdio};
 use std::time::{Duration, Instant};
 
+use aes::Aes128;
 use icbm_mc_767::codec::{Reader, Writer};
 use icbm_mc_767::packets::login_ids;
 use icbm_mc_767::packets::play::clientbound::CGameEvent;
@@ -91,6 +92,11 @@ struct TestServer {
 impl TestServer {
     /// `name` 用于区分并行测试实例（世界目录与 datarouter shm 名需唯一）。
     fn start(name: &str) -> Self {
+        Self::start_with_mode(name, false)
+    }
+
+    /// 以指定在线模式启动（`online=true` 为正版验证）。
+    fn start_with_mode(name: &str, online: bool) -> Self {
         let world_dir =
             std::env::temp_dir().join(format!("icbm-join-test-{}-{}", std::process::id(), name));
         let _ = std::fs::remove_dir_all(&world_dir);
@@ -114,7 +120,7 @@ impl TestServer {
                 "--shm",
                 &shm_name,
             ])
-            .env("ICBM_ONLINE_MODE", "offline") // 测试用离线登录（默认已开正版验证）
+            .env("ICBM_ONLINE_MODE", if online { "online" } else { "offline" })
             .process_group(0) // 独立进程组：Drop 时整组清理 region 子进程
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
@@ -392,4 +398,121 @@ fn full_join_flow_status_login_config_play() {
     let mut resp = Writer::new();
     resp.write_i64_be(ka_id);
     client.send(play_ids::SERVERBOUND_KEEP_ALIVE, &resp.into_bytes());
+}
+
+/// 正版登录（RSA 加密 + AES-CFB8）失败时：客户端收到的踢包必须能正确解密
+/// 且是 Login 状态的有效包（0x00 DISCONNECT）。回归：曾出现客户端报
+/// "Internal Exception: Received unknown packet id 84"——加密流错位/包 ID 错误。
+///
+/// 服务器以默认正版模式启动（本测试环境无 Mojang 会话 → 认证必然失败），
+/// 验证失败后的加密 DISCONNECT 可被客户端正常解密解析。
+#[test]
+fn online_auth_failure_sends_valid_encrypted_disconnect() {
+    use aes::cipher::KeyInit;
+    use rsa::Pkcs1v15Encrypt;
+    use rsa::RsaPublicKey;
+    use rsa::pkcs8::DecodePublicKey;
+
+    // 本测试验证正版登录踢包（与其它测试的离线模式隔离）
+    let server = TestServer::start_with_mode("online-kick", true);
+    let mut client = FakeClient::connect(&server.addr);
+
+    // 握手 → 登录
+    let mut intent = Writer::new();
+    intent.write_var_int(PROTOCOL_VERSION);
+    intent.write_string("127.0.0.1");
+    intent.write_u16_be(25565);
+    intent.write_var_int(2);
+    client.send(0x00, &intent.into_bytes());
+    let mut start = Writer::new();
+    start.write_string("authfailplayer");
+    start.write_uuid(&Uuid::nil());
+    client.send(login_ids::SERVERBOUND_START, &start.into_bytes());
+
+    // 服务器应发 CEncryptionRequest（0x01）
+    let (cid, payload) = client.recv();
+    assert_eq!(cid, login_ids::CLIENTBOUND_HELLO, "encryption request");
+    let mut r = Reader::new(&payload);
+    let _server_id = r.read_string().unwrap();
+    let public_key = r.read_byte_array().unwrap().to_vec();
+    let verify_token = r.read_byte_array().unwrap().to_vec();
+    let _needs_auth = r.read_bool().unwrap();
+
+    // 客户端：生成 16 字节共享密钥，用服务器公钥加密密钥与 token
+    let secret: [u8; 16] = [0x42; 16];
+    let pubkey = RsaPublicKey::from_public_key_der(&public_key).expect("parse pubkey");
+    let enc_secret = pubkey
+        .encrypt(&mut rand::rngs::OsRng, Pkcs1v15Encrypt, &secret)
+        .expect("encrypt secret");
+    let enc_token = pubkey
+        .encrypt(&mut rand::rngs::OsRng, Pkcs1v15Encrypt, &verify_token)
+        .expect("encrypt token");
+    let mut key_packet = Writer::new();
+    key_packet.write_byte_array(&enc_secret);
+    key_packet.write_byte_array(&enc_token);
+    client.send(login_ids::SERVERBOUND_KEY, &key_packet.into_bytes());
+
+    // 客户端启用解密（AES-CFB8，key=secret；与服务器相同）
+    let mut cipher = crate_net_crypto_like_cfb8(&secret);
+
+    // 读取响应：登录阶段（无压缩），解密后应为 0x00 DISCONNECT
+    let deadline = Instant::now() + Duration::from_secs(10);
+    let (id, payload) = loop {
+        assert!(Instant::now() < deadline, "no encrypted response");
+        let mut chunk = [0u8; 8192];
+        let n = client.stream.read(&mut chunk).expect("read");
+        assert!(n > 0);
+        cipher.decrypt(&mut chunk[..n]);
+        client.buffer.extend_from_slice(&chunk[..n]);
+        match decode_frame(&client.buffer, None) {
+            Ok(Some((id, payload, consumed))) => {
+                client.buffer.drain(..consumed);
+                break (id, payload);
+            }
+            Ok(None) => continue,
+            Err(err) => panic!("malformed encrypted frame: {err}"),
+        }
+    };
+    assert_eq!(
+        id,
+        login_ids::CLIENTBOUND_DISCONNECT,
+        "encrypted login disconnect (auth failure)"
+    );
+    // 1.21.1 登录断开理由为 JSON 字符串（`Text.Serialization.toJsonString`），
+    // 不是 NBT——回归：曾写 NBT 导致客户端报 "unknown packet id"。
+    let mut r = Reader::new(&payload);
+    let json = r.read_string().expect("reason json string");
+    assert!(json.contains("translate") || json.contains("text"), "reason JSON: {json}");
+    assert!(!json.is_empty());
+    eprintln!("[online-kick] encrypted disconnect reason json: {json}");
+}
+
+/// 与 `core::net::crypto::AesCfb8` 相同的 AES-128-CFB8（key = IV = secret）。
+fn crate_net_crypto_like_cfb8(key: &[u8; 16]) -> TestCfb8 {
+    use aes::cipher::{KeyInit, generic_array::GenericArray};
+    TestCfb8 {
+        cipher: <Aes128 as KeyInit>::new(GenericArray::from_slice(key)),
+        iv: *key,
+    }
+}
+
+/// 测试用 AES-CFB8（与服务器实现逐字节一致）。
+struct TestCfb8 {
+    cipher: aes::Aes128,
+    iv: [u8; 16],
+}
+
+impl TestCfb8 {
+    fn decrypt(&mut self, buf: &mut [u8]) {
+        use aes::cipher::BlockEncrypt;
+        for byte in buf {
+            let mut block = aes::Block::default();
+            block.copy_from_slice(&self.iv);
+            self.cipher.encrypt_block(&mut block);
+            let out = *byte ^ block[0];
+            self.iv.rotate_left(8);
+            self.iv[15] = *byte;
+            *byte = out;
+        }
+    }
 }

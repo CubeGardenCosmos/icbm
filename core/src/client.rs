@@ -36,6 +36,23 @@ use crate::net::play::handle_play_packet;
 use crate::net::status::status_response;
 use crate::server::Server;
 
+/// 转义 JSON 字符串字面量（登录断开理由用）。
+#[must_use]
+pub fn escape_json_text(text: &str) -> String {
+    let mut out = String::with_capacity(text.len() + 2);
+    for ch in text.chars() {
+        match ch {
+            '"' => out.push_str("\\\""),
+            '\\' => out.push_str("\\\\"),
+            '\n' => out.push_str("\\n"),
+            '\r' => out.push_str("\\r"),
+            '\t' => out.push_str("\\t"),
+            c => out.push(c),
+        }
+    }
+    out
+}
+
 /// 网络错误。
 #[derive(Debug)]
 pub enum NetError {
@@ -361,12 +378,33 @@ impl Client {
     /// （客户端 `FriendlyByteBuf.readNbt` 解析），非裸 JSON 字符串。
     pub fn kick(&self, reason: &str) {
         // 各阶段 disconnect 包 ID 不同（Mojang：login=0x00/config=0x02/play=0x1D）
-        let id = match self.connection_state() {
+        let state = self.connection_state();
+        let id = match state {
             ConnectionState::Login => icbm_mc_767::packets::login_ids::CLIENTBOUND_DISCONNECT,
             ConnectionState::Config => icbm_mc_767::packets::config_ids::CLIENTBOUND_DISCONNECT,
             _ => icbm_mc_767::packets::play_ids::CLIENTBOUND_DISCONNECT,
         };
-        let _ = self.send_encoded(id, |w| w.write_text_component(reason));
+        if state == ConnectionState::Login {
+            // 1.21.1 `LoginDisconnectS2CPacket` 的理由是 **JSON 字符串**
+            // （`Text.Serialization.toJsonString`），不是 NBT——写 NBT 会让客户端
+            // 登录解码器读错字节（把 CompoundTag id 当字符串长度），报
+            // "Internal Exception: Received unknown packet id ..."。
+            let json = format!("{{\"text\":\"{}\"}}", escape_json_text(reason));
+            let _ = self.send_encoded(id, |w| w.write_string(&json));
+        } else {
+            // Config/Play 的 disconnect 理由为 NBT 文本组件（`TextCodecs.MAX_NBT_TEXT`）
+            let _ = self.send_encoded(id, |w| w.write_text_component(reason));
+        }
+        self.alive.store(false, Ordering::Relaxed);
+    }
+
+    /// 登录态踢出：理由直接给 JSON 文本组件字符串（认证失败用 vanilla 翻译键，
+    /// 客户端本地翻译显示；对照 master `ClientLoginNetworkHandler` 的 kick）。
+    pub fn kick_login_component(&self, component_json: &str) {
+        let _ = self.send_encoded(
+            icbm_mc_767::packets::login_ids::CLIENTBOUND_DISCONNECT,
+            |w| w.write_string(component_json),
+        );
         self.alive.store(false, Ordering::Relaxed);
     }
 
@@ -824,14 +862,26 @@ fn handle_login_key(
                     finish_login(server, client, uuid)?;
                 }
                 Err(err) => {
-                    let reason = match &err {
-                        CE::UnverifiedUsername => "正版验证失败：用户名未验证".to_owned(),
-                        CE::Banned => "正版验证失败：账号已被封禁".to_owned(),
-                        CE::AuthRequest => "正版验证失败：认证服务器不可用".to_owned(),
-                        other => format!("正版验证失败：{other}"),
+                    // 用 vanilla 翻译键作为 JSON 文本组件（客户端本地翻译显示，
+                    // 对照 master `AuthError` → `MULTIPLAYER_DISCONNECT_*`）。
+                    let reason_json: String = match &err {
+                        CE::UnverifiedUsername => {
+                            "{\"translate\":\"multiplayer.disconnect.unverified_username\"}"
+                                .to_owned()
+                        }
+                        CE::Banned => "{\"translate\":\"multiplayer.disconnect.banned\"}"
+                            .to_owned(),
+                        CE::AuthRequest => {
+                            "{\"translate\":\"multiplayer.disconnect.authservers_down\"}"
+                                .to_owned()
+                        }
+                        other => format!(
+                            "{{\"text\":\"{}\"}}",
+                            crate::client::escape_json_text(&format!("正版验证失败：{other}"))
+                        ),
                     };
                     tracing::warn!(name = %client.name.lock().expect("name"), %err, "online auth failed");
-                    client.kick(&reason);
+                    client.kick_login_component(&reason_json);
                 }
             }
         }
