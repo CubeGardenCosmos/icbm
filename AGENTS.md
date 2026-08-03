@@ -35,6 +35,16 @@
 - 提交后检查工作树；若存在他人改动，必须保留、避开并在交付说明中指出。
 - 不执行破坏性 Git 操作，不重写他人提交，不自动推送远端。
 
+## 新功能草稿流程（硬约束）
+
+**在增加任何新功能之前，必须在 `build/workspace/draft` 完成草稿**，草稿顺序固定为：
+
+1. **先直接原样获取 Pumpkin 的做法**（`build/workspace/pumpkin`，只读参考，原样照搬对应功能/协议/状态机的实现思路与结构，不擅自改动）。
+2. **再对照官方 Minecraft 服务器的做法**（`build/workspace/minecraft-assets` 反编译源码，以 1.21.1 行为为准）。
+3. **对比二者不同**，用 Pumpkin 的做法修改为**兼容原版特性**的做法——即以 Pumpkin 的实现为骨架，将其与官方行为有出入的地方修正为符合原版可观察行为；**不得采用 Pumpkin 的多线程 worker 做法**（其多线程调度/分区 tick 架构不属于 icbm 的单线程 tick 所有权边界模型）。
+
+该流程适用于所有智能体（AI 与人类开发者），是硬约束：未在 `build/workspace/draft` 完成三步草稿不得进入实现阶段；草稿结论（Pumpkin 做法、官方做法、差异与取舍）须记录在 `build/workspace/draft/<功能名>/README.md`。
+
 ## 命名与目录归属
 
 - 第一方 Cargo package/crate 使用 `icbm-` 前缀，Rust 模块导入使用 `icbm_` 前缀。
