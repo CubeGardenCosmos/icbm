@@ -302,13 +302,14 @@ pub fn verify_session(
 /// 登录配置。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum OnlineMode {
-    /// 离线模式（默认；不校验 Mojang 会话）。
+    /// 离线模式（不校验 Mojang 会话；离线 UUID 匹配不到 Mojang 账号，皮肤缺失）。
     Offline,
-    /// 正版模式（RSA 加密 + session server 校验）。
+    /// 正版模式（RSA 加密 + session server 校验；获取真实 UUID 以加载皮肤）。
     Online,
 }
 
-/// 解析正版模式开关（环境变量 `ICBM_ONLINE_MODE`：`true`/`1`/`online` 启用）。
+/// 解析正版模式开关（环境变量 `ICBM_ONLINE_MODE`：**默认正版验证**；
+/// 设置 `false`/`0`/`offline` 可显式关闭）。
 #[must_use]
 pub fn online_mode_from_env() -> OnlineMode {
     match std::env::var("ICBM_ONLINE_MODE").as_deref() {

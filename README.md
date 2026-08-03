@@ -127,6 +127,12 @@ world/
 
 ## 构建与运行
 
+> **正版验证默认开启**：服务端默认按正版模式登录（RSA 加密 + Mojang session
+> server 校验，获取真实 UUID 以加载皮肤）。离线/内网环境可设
+> `ICBM_ONLINE_MODE=offline` 关闭。玩家游戏模式与离线位置保存在
+> `world/playerdata/<uuid>.dat`，重新进入自动恢复；新玩家出生在真实地表之上。
+> 全局时间与天气由 core 统一管理（`/time`、`/weather` 指令），各 region 一致。
+
 ```bash
 # 检出子模块
 git submodule update --init
