@@ -33,8 +33,10 @@ sha2 = { version = "0.10", default-features = false }
 time = { version = "0.3", default-features = false, features = ["std", "formatting", "macros", "local-offset"] }
 tracing = { version = "0.1", default-features = false }
 tracing-subscriber = { version = "0.3", default-features = false, features = ["fmt", "env-filter", "ansi", "time", "registry", "local-time", "std"] }
-ureq = { version = "3", default-features = false, features = ["json"] }
+ureq = { version = "3", default-features = false, features = ["json", "rustls", "socks-proxy"] }
 uuid = { version = "1", features = ["v4", "serde"] }
 
 [lints]
 workspace = true
+
+[dev-dependencies]

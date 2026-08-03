@@ -510,7 +510,7 @@ impl TestCfb8 {
             block.copy_from_slice(&self.iv);
             self.cipher.encrypt_block(&mut block);
             let out = *byte ^ block[0];
-            self.iv.rotate_left(8);
+            self.iv.rotate_left(1);
             self.iv[15] = *byte;
             *byte = out;
         }

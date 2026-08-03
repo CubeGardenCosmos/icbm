@@ -150,7 +150,7 @@ impl AesCfb8 {
         block.copy_from_slice(&self.iv);
         self.cipher.encrypt_block(&mut block);
         let out = plain ^ block[0];
-        self.iv.rotate_left(8);
+        self.iv.rotate_left(1); // CFB8: iv = (iv << 8bits) | c —— rotate_left(n) 按元素旋转，必须为 1 字节
         self.iv[15] = out;
         out
     }
@@ -161,7 +161,7 @@ impl AesCfb8 {
         block.copy_from_slice(&self.iv);
         self.cipher.encrypt_block(&mut block);
         let out = ciphertext ^ block[0];
-        self.iv.rotate_left(8);
+        self.iv.rotate_left(1); // CFB8: iv = (iv << 8bits) | c —— rotate_left(n) 按元素旋转，必须为 1 字节
         self.iv[15] = ciphertext;
         out
     }
@@ -286,6 +286,16 @@ fn auth_timeout() -> std::time::Duration {
         .map_or(std::time::Duration::from_secs(8), std::time::Duration::from_secs)
 }
 
+/// 是否在 hasJoined 请求中附带客户端 IP（对应 vanilla `prevent-proxy-connections`，
+/// 默认 false **不带** ip）。带 ip 时 Mojang 会校验会话建立 IP == 连接 IP：
+/// 本机/内网/代理连接必然不匹配 → 204 拒绝（"failed to verify username"）。
+fn auth_send_client_ip() -> bool {
+    matches!(
+        std::env::var("ICBM_AUTH_SEND_IP").as_deref(),
+        Ok("1") | Ok("true")
+    )
+}
+
 /// 调用 Mojang session server 验证玩家（正版模式）。
 ///
 /// 客户端 `LoginKeyC2SPacket` 后，服务器已把玩家加入会话；此处查询
@@ -298,9 +308,11 @@ pub fn verify_session(
     let url = auth_url()
         .replace("{username}", username)
         .replace("{server_hash}", server_hash);
-    let url = match ip {
-        Some(ip) => format!("{url}&ip={ip}"),
-        None => url,
+    // 仅在显式开启（`ICBM_AUTH_SEND_IP=1`，对应 prevent-proxy-connections）时
+    // 附带 ip；默认不带，否则本机/内网连接被 Mojang 204 拒绝。
+    let url = match (ip, auth_send_client_ip()) {
+        (Some(ip), true) => format!("{url}&ip={ip}"),
+        _ => url,
     };
     let mut config = ureq::Agent::config_builder().timeout_global(Some(auth_timeout()));
     // 尊重 `http_proxy`/`https_proxy`/`all_proxy` 环境变量（用户经本地代理访问
@@ -323,6 +335,11 @@ pub fn verify_session(
             CryptoError::AuthRequest
         }
     })?;
+    // 204 No Content = 用户名未加入会话（未验证）；ureq 对 2xx 视为成功，
+    // 空响应体会在 read_json 报解析错——先显式处理。
+    if response.status() == 204 {
+        return Err(CryptoError::UnverifiedUsername);
+    }
     let profile: GameProfile = response
         .body_mut()
         .read_json()
