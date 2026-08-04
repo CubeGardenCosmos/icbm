@@ -755,16 +755,30 @@ pub fn apply_give(server: &Server, target: &str, item: &str, count: i32) -> Stri
     let Some(client) = client else {
         return format!("找不到玩家 {target}");
     };
-    // 主手槽（0）放入物品并记录手持物品（放置方块用）
+    // 放入当前选中热栏槽（或槽 36），并同步回客户端（CSetSlot，sync_id=0）
     let _ = server;
     let _ = item_name;
+    let hotbar_index = usize::try_from(
+        client
+            .carried_slot
+            .load(std::sync::atomic::Ordering::Relaxed),
+    )
+    .unwrap_or(0)
+    .clamp(0, 8);
+    let slot = i16::try_from(hotbar_index + 36).unwrap_or(36);
+    {
+        let mut inventory = client.inventory.lock().expect("inventory");
+        if let Some(cell) = inventory.get_mut(hotbar_index + 36) {
+            *cell = Some(item.to_owned());
+        }
+    }
     *client.held_item.lock().expect("held item") = Some(item.to_owned());
     let stack = CItemStack::of(item, count);
     let _ = client.send_encoded(CSetSlot::packet_id(), |w| {
         CSetSlot {
-            sync_id: -2,
+            sync_id: 0,
             revision: 0,
-            slot: 0,
+            slot,
             stack,
         }
         .encode(w);

@@ -355,7 +355,7 @@ checksum = "6dbf3de79e51f3d586ab4cb9d5c3e2c14aa28ed23d180cf89b4df0454a69cc87"
 
 [[package]]
 name = "icbm-anvil"
-version = "1.2.28+1.21.1"
+version = "1.2.29+1.21.1"
 dependencies = [
  "flate2",
  "icbm-mc-767",
@@ -366,7 +366,7 @@ dependencies = [
 
 [[package]]
 name = "icbm-core"
-version = "1.2.28+1.21.1"
+version = "1.2.29+1.21.1"
 dependencies = [
  "aes",
  "base64",
@@ -397,14 +397,14 @@ dependencies = [
 
 [[package]]
 name = "icbm-gameplay-icbm"
-version = "1.2.28+1.21.1"
+version = "1.2.29+1.21.1"
 dependencies = [
  "icbm-mc-767",
 ]
 
 [[package]]
 name = "icbm-gameplay-minecraft"
-version = "1.2.28+1.21.1"
+version = "1.2.29+1.21.1"
 dependencies = [
  "icbm-mc-767",
  "uuid",
@@ -412,11 +412,11 @@ dependencies = [
 
 [[package]]
 name = "icbm-i18n"
-version = "1.2.28+1.21.1"
+version = "1.2.29+1.21.1"
 
 [[package]]
 name = "icbm-mc-767"
-version = "1.2.28+1.21.1"
+version = "1.2.29+1.21.1"
 dependencies = [
  "base64",
  "flate2",
@@ -427,7 +427,7 @@ dependencies = [
 
 [[package]]
 name = "icbm-region"
-version = "1.2.28+1.21.1"
+version = "1.2.29+1.21.1"
 dependencies = [
  "blinkcms-datarouter",
  "icbm-anvil",
@@ -441,7 +441,7 @@ dependencies = [
 
 [[package]]
 name = "icbm-terrain-gen"
-version = "1.2.28+1.21.1"
+version = "1.2.29+1.21.1"
 dependencies = [
  "icbm-mc-767",
 ]

@@ -323,8 +323,18 @@ impl Server {
         // 选负载最低 worker 分配（记录 worker_id 到 region 映射）
         let worker_id = {
             let mut world = self.world.lock().expect("world lock");
+            // worker 池未就绪（启动竞态：`Server::new` spawn worker 是异步的，
+            // `WORKER_REGISTER` 尚未到达）时，等待 worker 注册而不是立即回退到
+            // 直接 spawn——否则出生点 region 走兼容进程路径，卸载时又被 kill。
+            let deadline = Instant::now() + Duration::from_secs(5);
+            while world.workers.is_empty() && Instant::now() < deadline {
+                drop(world);
+                std::thread::sleep(Duration::from_millis(50));
+                world = self.world.lock().expect("world lock");
+            }
             let Some((worker_id, _)) = world.workers.assign_region() else {
-                // 无可用 worker：回退到直接 spawn region 进程（兼容）
+                // 仍无可用 worker（worker 全部启动失败）：回退到直接 spawn region
+                // 进程（兼容；正常环境 worker 池应在启动后数秒内注册完毕）
                 debug!(id = %id.service_name(), "no worker available, direct spawn");
                 let world_dir = world.world_dir.clone();
                 world.regions.spawn(

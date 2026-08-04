@@ -438,10 +438,9 @@ pub fn handle_play_packet(
             let packet = icbm_mc_767::packets::play::serverbound::SSetCarriedItem::decode(reader)?;
             client.carried_slot.store(packet.slot, Ordering::Relaxed);
             let item = {
-                let hotbar = client.hotbar.lock().expect("hotbar");
-                hotbar
-                    .get(usize::try_from(packet.slot).unwrap_or(usize::MAX))
-                    .and_then(Clone::clone)
+                let inventory = client.inventory.lock().expect("inventory");
+                let index = usize::try_from(packet.slot).unwrap_or(usize::MAX);
+                inventory.get(index + 36).and_then(Clone::clone)
             };
             *client.held_item.lock().expect("held item") = item;
         }
@@ -1242,36 +1241,60 @@ fn handle_use_item_ender_pearl(server: &Server, client: &Arc<Client>) -> Result<
 /// 旧实现按槽 1..9 当热栏——真实客户端发送 36..44，热栏永不记录、`held_item`
 /// 恒 None，**任何方块/桶都无法放置**（红石/黑曜石框架/水桶的共同根因）。
 /// 热栏物品在 `SET_CARRIED_ITEM` 选中后作为手持物品。
+#[allow(clippy::too_many_lines)] // 槽位映射 + 服务端/客户端双向同步的事件流水
 fn handle_set_creative_slot(
     client: &Arc<Client>,
     packet: &icbm_mc_767::packets::play::serverbound::SSetCreativeModeSlot,
 ) {
-    // 热栏：vanilla 槽 36..44（hotbar index 0..8）。槽 < 0 = 丢弃（光标，无槽位）。
-    let hotbar_slot = match packet.slot {
-        36..=44 => Some(packet.slot - 36),
-        // 兼容旧客户端/直接写槽号（1..9）的记录
-        1..=9 => Some(packet.slot - 1),
-        _ => None,
-    };
-    if let Some(index) = hotbar_slot {
-        let index = usize::try_from(index).unwrap_or(0);
-        let item = packet.stack.item.clone();
+    use icbm_mc_767::packets::play::clientbound::{CItemStack, CSetSlot};
+    // 槽位是 `InventoryMenu` 槽号（vanilla）：热栏 36..44、主栏 9..35、装备
+    // 5..8、副手 45；-1 = 光标丢弃。写入完整物品栏并同步回客户端。
+    let slot = packet.slot;
+    if (5..=45).contains(&slot) && slot != 45 - 1 {
+        let index = usize::try_from(slot).unwrap_or(0);
+        if let Some(target) = client.inventory.lock().expect("inventory").get_mut(index) {
+            target.clone_from(&packet.stack.item);
+        }
+        // 同步回客户端（CSetSlot，sync_id=0 玩家物品栏；保持客户端与服务端一致）
+        let stack = packet
+            .stack
+            .item
+            .as_deref()
+            .map_or_else(CItemStack::empty, |item| {
+                CItemStack::of(item, packet.stack.count.max(1))
+            });
+        let slot_i16 = i16::try_from(slot).unwrap_or(0);
+        let _ = client.send_encoded(CSetSlot::packet_id(), |w| {
+            CSetSlot {
+                sync_id: 0,
+                revision: 0,
+                slot: slot_i16,
+                stack,
+            }
+            .encode(w);
+        });
+    } else if slot < 0 {
+        // 光标丢弃：无需服务端处理
+        return;
+    }
+    // 热栏快捷视图同步（held_item 由 carried_slot 派生）
+    if (36..=44).contains(&slot) {
+        let index = usize::try_from(slot - 36).unwrap_or(0);
+        let item = client
+            .inventory
+            .lock()
+            .expect("inventory")
+            .get(index + 36)
+            .and_then(Clone::clone);
         {
             let mut hotbar = client.hotbar.lock().expect("hotbar");
-            if let Some(slot) = hotbar.get_mut(index) {
-                *slot = item;
+            if let Some(cell) = hotbar.get_mut(index) {
+                cell.clone_from(&item);
             }
         }
         if i32::from(index as i16) == client.carried_slot.load(Ordering::Relaxed) {
-            let hotbar = client.hotbar.lock().expect("hotbar");
-            (*client.held_item.lock().expect("held item"))
-                .clone_from(&hotbar.get(index).and_then(Clone::clone));
+            (*client.held_item.lock().expect("held item")) = item;
         }
-        return;
-    }
-    // 槽 0：兼容旧客户端/直接写槽 0 的记录（保留原行为）
-    if packet.slot == 0 {
-        (*client.held_item.lock().expect("held item")).clone_from(&packet.stack.item);
     }
 }
 

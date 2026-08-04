@@ -174,6 +174,10 @@ pub struct Client {
     /// 热栏物品（槽 0..8；`SET_CREATIVE_MODE_SLOT` 槽 1..9 写入，`SET_CARRIED_ITEM`
     /// 选中后作为手持物品）。
     pub hotbar: Mutex<Vec<Option<String>>>,
+    /// 完整物品栏（46 槽，`InventoryMenu` 槽号：热栏 36..44、主栏 9..35、装备
+    /// 5..8、副手 45；`SET_CREATIVE_MODE_SLOT` 写入，进服时全量下发
+    /// `CSetContainerContent`）。`hotbar` 为其热栏段的便捷视图。
+    pub inventory: Mutex<Vec<Option<String>>>,
     /// 选中热栏槽（0..8；`SET_CARRIED_ITEM` 更新）。
     pub carried_slot: AtomicI32,
     /// 正版 profile 属性（`textures` 皮肤/披风；登录时从 Mojang 获取，
@@ -274,6 +278,7 @@ impl Client {
             locale: Mutex::new(String::new()),
             held_item: Mutex::new(None),
             hotbar: Mutex::new(vec![None; 9]),
+            inventory: Mutex::new(vec![None; 46]),
             carried_slot: AtomicI32::new(0),
             profile_properties: Mutex::new(Vec::new()),
             last_portal_switch: Mutex::new(Instant::now()),
@@ -384,6 +389,33 @@ impl Client {
         let mut writer = Writer::new();
         encode(&mut writer);
         self.send_packet(packet_id, &writer.into_bytes())
+    }
+
+    /// 下发完整物品栏（vanilla `syncInventory` → `CSetContainerContent`）。
+    ///
+    /// 初始加入与失步恢复时调用：一次性下发玩家物品栏全部 46 槽（热栏 36..44 +
+    /// 主栏 9..35 + 装备 5..8 + 副手 45）与光标物品，对照
+    /// `ClientboundContainerSetContentPacket`（`sync_id`=0 玩家物品栏）。
+    pub fn send_inventory_sync(&self) -> Result<(), NetError> {
+        use icbm_mc_767::packets::play::clientbound::{CItemStack, CSetContainerContent};
+        let inventory = self.inventory.lock().expect("inventory");
+        let slots: Vec<CItemStack> = inventory
+            .iter()
+            .map(|item| {
+                item.as_deref()
+                    .map_or_else(CItemStack::empty, |item| CItemStack::of(item, 1))
+            })
+            .collect();
+        let content = CSetContainerContent {
+            sync_id: 0,
+            revision: 0,
+            slots,
+            carried: CItemStack::empty(),
+        };
+        drop(inventory);
+        self.send_encoded(CSetContainerContent::packet_id(), |w| {
+            content.encode(w);
+        })
     }
 
     /// 断开连接（发送原因并关闭）。
@@ -1039,6 +1071,9 @@ pub fn enter_play(server: &Server, client: &Arc<Client>) -> Result<(), NetError>
         crate::net::play::adjust_spawn_to_surface(server, client)?;
     }
     send_join_sequence(server, client)?;
+    // 初始物品栏同步（vanilla `syncInventory`）：客户端物品栏为空时，创造模式
+    // 快捷栏只显示手动放置的物品（“只有黑曜石与打火石”）。
+    client.send_inventory_sync()?;
 
     // 服务器声明可接收 `icbm_client:state_subscription`（C2S 通道）。
     // 对照 ICBM Client 协议：服务端进入 Play 后用原版 `minecraft:register` 声明。

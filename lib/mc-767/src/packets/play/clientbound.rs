@@ -12,17 +12,18 @@ use crate::packets::play_ids::{
     CLIENTBOUND_ADD_ENTITY, CLIENTBOUND_ADD_EXPERIENCE_ORB, CLIENTBOUND_ANIMATE,
     CLIENTBOUND_BLOCK_UPDATE, CLIENTBOUND_BUNDLE_DELIMITER, CLIENTBOUND_CHANGE_DIFFICULTY,
     CLIENTBOUND_CHUNK_BATCH_FINISHED, CLIENTBOUND_CHUNK_BATCH_START,
-    CLIENTBOUND_COMMAND_SUGGESTIONS, CLIENTBOUND_COMMANDS, CLIENTBOUND_CONTAINER_SET_SLOT,
-    CLIENTBOUND_DISCONNECT, CLIENTBOUND_ENTITY_EVENT, CLIENTBOUND_EXPLOSION,
-    CLIENTBOUND_FORGET_LEVEL_CHUNK, CLIENTBOUND_GAME_EVENT, CLIENTBOUND_KEEP_ALIVE,
-    CLIENTBOUND_LEVEL_CHUNK_WITH_LIGHT, CLIENTBOUND_LOGIN, CLIENTBOUND_MOVE_ENTITY_POS,
-    CLIENTBOUND_MOVE_ENTITY_POS_ROT, CLIENTBOUND_PING, CLIENTBOUND_PLAYER_ABILITIES,
-    CLIENTBOUND_PLAYER_INFO_REMOVE, CLIENTBOUND_PLAYER_INFO_UPDATE, CLIENTBOUND_PLAYER_POSITION,
-    CLIENTBOUND_REMOVE_ENTITIES, CLIENTBOUND_RESPAWN, CLIENTBOUND_SECTION_BLOCKS_UPDATE,
-    CLIENTBOUND_SET_CHUNK_CACHE_CENTER, CLIENTBOUND_SET_CHUNK_CACHE_RADIUS,
-    CLIENTBOUND_SET_DEFAULT_SPAWN_POSITION, CLIENTBOUND_SET_ENTITY_MOTION,
-    CLIENTBOUND_SET_EXPERIENCE, CLIENTBOUND_SET_HEALTH, CLIENTBOUND_SET_TIME, CLIENTBOUND_SOUND,
-    CLIENTBOUND_SOUND_ENTITY, CLIENTBOUND_SYSTEM_CHAT, CLIENTBOUND_UPDATE_TAGS,
+    CLIENTBOUND_COMMAND_SUGGESTIONS, CLIENTBOUND_COMMANDS, CLIENTBOUND_CONTAINER_SET_CONTENT,
+    CLIENTBOUND_CONTAINER_SET_SLOT, CLIENTBOUND_DISCONNECT, CLIENTBOUND_ENTITY_EVENT,
+    CLIENTBOUND_EXPLOSION, CLIENTBOUND_FORGET_LEVEL_CHUNK, CLIENTBOUND_GAME_EVENT,
+    CLIENTBOUND_KEEP_ALIVE, CLIENTBOUND_LEVEL_CHUNK_WITH_LIGHT, CLIENTBOUND_LOGIN,
+    CLIENTBOUND_MOVE_ENTITY_POS, CLIENTBOUND_MOVE_ENTITY_POS_ROT, CLIENTBOUND_PING,
+    CLIENTBOUND_PLAYER_ABILITIES, CLIENTBOUND_PLAYER_INFO_REMOVE, CLIENTBOUND_PLAYER_INFO_UPDATE,
+    CLIENTBOUND_PLAYER_POSITION, CLIENTBOUND_REMOVE_ENTITIES, CLIENTBOUND_RESPAWN,
+    CLIENTBOUND_SECTION_BLOCKS_UPDATE, CLIENTBOUND_SET_CHUNK_CACHE_CENTER,
+    CLIENTBOUND_SET_CHUNK_CACHE_RADIUS, CLIENTBOUND_SET_DEFAULT_SPAWN_POSITION,
+    CLIENTBOUND_SET_ENTITY_MOTION, CLIENTBOUND_SET_EXPERIENCE, CLIENTBOUND_SET_HEALTH,
+    CLIENTBOUND_SET_TIME, CLIENTBOUND_SOUND, CLIENTBOUND_SOUND_ENTITY, CLIENTBOUND_SYSTEM_CHAT,
+    CLIENTBOUND_UPDATE_TAGS,
 };
 
 /// 区块 section 的网络数据（4096 个方块状态 ID + 64 个生物群系 ID）。
@@ -1332,6 +1333,42 @@ impl CSetSlot {
     }
 }
 
+/// Clientbound：容器内容全量同步（0x13 `ClientboundContainerSetContentPacket`）。
+///
+/// 用于初始同步与失步恢复：一次性下发容器全部槽 + 光标物品 + revision
+/// （对照 vanilla `syncInventory` / Pumpkin `sync_handler::update_state`）。
+#[derive(Debug, Clone)]
+pub struct CSetContainerContent {
+    /// 容器窗口 ID（0 = 玩家物品栏）。
+    pub sync_id: u8,
+    /// 修订号（每次内容变化 +1）。
+    pub revision: i32,
+    /// 全部槽（长度固定；玩家物品栏 = 46：热栏 0..9 + 主栏 9..36 + 装备 36..41 +
+    /// 副手 45；null = 空槽）。
+    pub slots: Vec<CItemStack>,
+    /// 光标物品（null = 空）。
+    pub carried: CItemStack,
+}
+
+impl CSetContainerContent {
+    /// 编码载荷（`ItemStack.OPTIONAL_LIST_STREAM_CODEC`：`VarInt` 槽数 + 每槽）。
+    pub fn encode(&self, writer: &mut Writer) {
+        writer.write_u8(self.sync_id);
+        writer.write_var_int(self.revision);
+        writer.write_var_int(self.slots.len() as i32);
+        for stack in &self.slots {
+            stack.encode(writer);
+        }
+        self.carried.encode(writer);
+    }
+
+    /// 包 ID。
+    #[must_use]
+    pub const fn packet_id() -> i32 {
+        CLIENTBOUND_CONTAINER_SET_CONTENT
+    }
+}
+
 /// Clientbound：实体动画（0x03 `EntityAnimationS2CPacket`）。
 #[derive(Debug, Clone, Copy)]
 pub struct CEntityAnimation {
@@ -1924,6 +1961,42 @@ mod tests {
         assert_eq!(r.read_var_int().unwrap(), 0); // game_mode
         assert!(r.read_bool().unwrap()); // listed
         assert_eq!(r.read_var_int().unwrap(), 12); // latency
+        assert!(r.is_empty());
+    }
+
+    #[test]
+    fn container_set_content_encodes_slots_and_carried() {
+        // 对照 `ClientboundContainerSetContentPacket`：sync_id(u8) + revision(VarInt)
+        // + items(OPTIONAL_LIST：VarInt 槽数 + 每槽) + carriedItem。
+        let packet = CSetContainerContent {
+            sync_id: 0,
+            revision: 3,
+            slots: vec![
+                CItemStack::empty(),
+                CItemStack::of("obsidian", 1),
+                CItemStack::empty(),
+            ],
+            carried: CItemStack::empty(),
+        };
+        let mut w = Writer::new();
+        packet.encode(&mut w);
+        let bytes = w.into_bytes();
+        let mut r = Reader::new(&bytes);
+        assert_eq!(r.read_u8().unwrap(), 0); // sync_id
+        assert_eq!(r.read_var_int().unwrap(), 3); // revision
+        assert_eq!(r.read_var_int().unwrap(), 3); // 槽数
+        // 空栈
+        assert_eq!(r.read_var_int().unwrap(), 0);
+        // obsidian：count=1, item_id=obsidian+1, 无组件(0,0)
+        assert_eq!(r.read_var_int().unwrap(), 1);
+        let obsidian_id = crate::item_ids::item_id("obsidian").unwrap();
+        assert_eq!(r.read_var_int().unwrap(), obsidian_id + 1);
+        assert_eq!(r.read_var_int().unwrap(), 0);
+        assert_eq!(r.read_var_int().unwrap(), 0);
+        // 空栈
+        assert_eq!(r.read_var_int().unwrap(), 0);
+        // carriedItem 空栈
+        assert_eq!(r.read_var_int().unwrap(), 0);
         assert!(r.is_empty());
     }
 }

@@ -348,6 +348,22 @@ fn full_join_flow_status_login_config_play() {
     );
     client.recv_until(play_ids::CLIENTBOUND_COMMANDS, "commands");
 
+    // 初始物品栏同步（`CSetContainerContent`）：46 槽 + 光标，全部为空栈
+    // （新玩家无存档）。
+    let content = client.recv_until(
+        play_ids::CLIENTBOUND_CONTAINER_SET_CONTENT,
+        "inventory content",
+    );
+    let mut r = Reader::new(&content);
+    assert_eq!(r.read_u8().unwrap(), 0); // sync_id = 玩家物品栏
+    assert_eq!(r.read_var_int().unwrap(), 0); // revision
+    assert_eq!(r.read_var_int().unwrap(), 46); // 46 槽
+    for _ in 0..46 {
+        assert_eq!(r.read_var_int().unwrap(), 0, "空槽");
+    }
+    assert_eq!(r.read_var_int().unwrap(), 0); // 光标空栈
+    assert!(r.is_empty());
+
     // ICBM 通道注册（minecraft:register）
     let reg = client.recv_until(play_ids::CLIENTBOUND_CUSTOM_PAYLOAD, "minecraft:register");
     let mut r = Reader::new(&reg);
