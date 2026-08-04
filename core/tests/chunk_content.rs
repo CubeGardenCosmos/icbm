@@ -132,6 +132,7 @@ impl TestServer {
                 &shm_name,
             ])
             .env("ICBM_ONLINE_MODE", "offline") // 测试用离线登录（默认已开正版验证）
+            .env("ICBM_WORKERS", "1") // 测试环境单 worker，控制进程数
             .process_group(0) // 独立进程组：Drop 时整组清理 region 子进程
             .stdout(Stdio::inherit())
             .stderr(Stdio::inherit())

@@ -37,7 +37,14 @@ core 是服务器运行的主进程，负责：
 
 ### region（区域模拟服务）
 
-region 是服务器的子进程，作为 datarouter 中的独立服务（`icbm.region.<id>`）加入共享内存池，负责其注册存档文件所覆盖区域内的主要事件：
+region 是服务器的**模拟单元**（`icbm.region.<id>`），运行在 **worker 进程池**内：
+core 启动时拉起 `cpu_count - 2` 个常驻 worker 进程（`icbm.worker.<id>`，
+各绑定一个除 core 外的 CPU 核心），region 经 `WORKER_ASSIGN` 分配给负载
+最低的 worker（region 合并：活跃 region 数 > worker 数时多个 region 共享
+一个 worker 进程），worker 内每 region 一个独立线程（单线程 tick 所有权
+边界不变）。region 卸载 = `WORKER_RELEASE`（worker 内停止线程并 flush，
+进程存活，不再 kill 进程）。每个 region 负责其注册存档文件所覆盖区域内的
+主要事件：
 
 - 主世界：持有 **32 × 32 区块**（Y < 400），并锁住对应存档区块文件；
 - 地狱：持有对应主世界区域按 1:8 缩放的 **4 × 4 区块**；
@@ -48,9 +55,9 @@ region 是服务器的子进程，作为 datarouter 中的独立服务（`icbm.r
 
 - 玩家跨越 region 边界时速度不得超过 2 方块/秒；乘船跨越会被减速。
 - 装备鞘翅高速接近边境时"感受到动能"并死亡；空中高速靠近且剩余 50 方块时，Action Bar 提示："你当前正在边境，请爬升高度。"
-- 玩家所在 region 为中心，其 **3 × 3** 范围内未生成地图的 region 会拉起子进程进行
+- 玩家所在 region 为中心，其 **3 × 3** 范围内未生成地图的 region 会分配到 worker 进程池进行
   地形生成（README 原计划 9 × 9，但 datarouter 端口上限 `DATAROUTER_MAX_PORTS`=64，
-  9×9=81 超出；更远处由移动触发的区块请求按需拉起）。
+  9×9=81 超出；更远处由移动触发的区块请求按需分配）。
 - 默认模拟距离 8，最大可视距离 64；允许读取所在 region 外的地形。
 - 玩家移动时，core 按 vanilla 规则在玩家走出已发区块缓存中心 `view/2` 时重新请求
   视野区块并更新 `SetChunkCacheCenter`，跨 region 时先拉起/复用新 region 再请求，

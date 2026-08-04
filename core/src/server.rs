@@ -15,8 +15,8 @@ use icbm_region::RegionId;
 use icbm_region::protocol::{
     DIM_OVERWORLD, Ipc, IpcError, decode_block_nbt_resp, decode_block_query_resp,
     decode_block_raycast_resp, decode_chunk_data, decode_command_execute, decode_entity_data,
-    decode_heartbeat, decode_register, decode_surface_resp, encode_register_ack, encode_unload,
-    kind,
+    decode_heartbeat, decode_register, decode_surface_resp, decode_worker_register,
+    encode_register_ack, encode_unload, encode_worker_region, kind,
 };
 use tracing::{debug, info, trace, warn};
 
@@ -134,6 +134,9 @@ impl Server {
         let switch = start_switch(&config, auth_token.clone())?;
         let ipc = Ipc::connect(&config.shm_name, "icbm.core", auth_token)?;
         info!("connected to datarouter {}", config.shm_name);
+        // worker 进程池：`cpu_count - 2` 个常驻 worker（core 除外），平均绑核
+        // （`build/workspace/draft/worker_pool/README.md`）。
+        spawn_worker_pool(&config);
         let world = Mutex::new(WorldState::new(config.world_dir.clone()));
         let world_dir_for_lists = config.world_dir.clone();
         // 从 level.dat 恢复游戏规则（`GameRules` 复合，对照 `LevelSave` 启动路径）
@@ -259,21 +262,14 @@ impl Server {
         Ok(())
     }
 
-    /// 保存并卸载所有 region：逐个发 `REGION_UNLOAD`，等待 region flush 存档并退出。
+    /// 保存并卸载所有 region：逐个发 `REGION_UNLOAD`（region 线程 flush 后退出；
+    /// worker 进程是容器，region 全部退出后由 kill 清理）。
     fn shutdown_regions(&self) {
-        let regions: Vec<(RegionId, Option<u32>)> = {
+        let regions: Vec<RegionId> = {
             let world = self.world.lock().expect("world lock");
-            world
-                .regions
-                .ids()
-                .into_iter()
-                .map(|id| {
-                    let pid = world.regions.get(&id).map(|entry| entry.pid);
-                    (id, pid)
-                })
-                .collect()
+            world.regions.ids()
         };
-        for (id, _) in &regions {
+        for id in &regions {
             info!(id = %id.service_name(), "shutting down region");
             let _ = self.ipc.send(
                 &id.service_name(),
@@ -290,36 +286,73 @@ impl Server {
             }
             std::thread::sleep(Duration::from_millis(100));
         }
-        // 仍未退出的 region：强制 kill（最后 drop SwitchHandle 清理 shm）
-        let stuck: Vec<(RegionId, u32)> = {
+        // 清理 worker 进程池（region 已退出；worker 是常驻容器，关停时 kill）
+        let worker_pids: Vec<u32> = {
             let world = self.world.lock().expect("world lock");
             world
-                .regions
+                .workers
                 .ids()
                 .into_iter()
-                .filter_map(|id| world.regions.get(&id).map(|entry| (id, entry.pid)))
+                .filter_map(|id| world.workers.get(id).map(|entry| entry.pid))
                 .collect()
         };
-        for (id, pid) in stuck {
-            warn!(id = %id.service_name(), "region did not flush in time, killing");
+        for pid in worker_pids {
+            debug!(pid, "stopping worker process");
             let _ = kill_process(pid);
         }
         self.world.lock().expect("world lock").regions.clear_all();
     }
 
-    /// 确保 region 已拉起并注册（无则等待最多 10 秒）。
+    /// 确保 region 已分配到 worker 并注册（无则等待最多 10 秒）。
+    ///
+    /// 分配：选负载最低的 worker 发 `WORKER_ASSIGN`（region 合并）；worker
+    /// 宿主内启动 region 模拟线程（注册 `icbm.region.<id>`）。不再每 region
+    /// spawn 一个进程，卸载也不杀进程。
     pub fn ensure_region(&self, id: RegionId) -> Result<(), NetError> {
-        let world_dir = self.world.lock().expect("world lock").world_dir.clone();
-        let spawn_result = {
+        // 已注册：直接返回
+        if self
+            .world
+            .lock()
+            .expect("world lock")
+            .regions
+            .get(&id)
+            .is_some_and(|entry| entry.alive)
+        {
+            return Ok(());
+        }
+        // 选负载最低 worker 分配（记录 worker_id 到 region 映射）
+        let worker_id = {
             let mut world = self.world.lock().expect("world lock");
-            world.regions.spawn(
-                &id,
-                &world_dir,
-                &self.config.shm_name,
-                self.config.log_level,
-            )
+            let Some((worker_id, _)) = world.workers.assign_region() else {
+                // 无可用 worker：回退到直接 spawn region 进程（兼容）
+                debug!(id = %id.service_name(), "no worker available, direct spawn");
+                let world_dir = world.world_dir.clone();
+                world.regions.spawn(
+                    &id,
+                    &world_dir,
+                    &self.config.shm_name,
+                    self.config.log_level,
+                )?;
+                return self.wait_region_registered(id);
+            };
+            worker_id
         };
-        spawn_result.map_err(NetError::Io)?;
+        // 记录 region → worker 归属（region 条目先占位，注册后置 alive）
+        self.world
+            .lock()
+            .expect("world lock")
+            .regions
+            .mark_assigned(&id, worker_id);
+        let body = encode_worker_region(id.rx, id.rz);
+        let worker_service = format!("icbm.worker.{worker_id}");
+        if let Err(err) = self.ipc.send(&worker_service, kind::WORKER_ASSIGN, &body) {
+            warn!(%err, worker_id, id = %id.service_name(), "worker assign failed");
+        }
+        self.wait_region_registered(id)
+    }
+
+    /// 等待 region 完成注册（最多 10 秒）。
+    fn wait_region_registered(&self, id: RegionId) -> Result<(), NetError> {
         let deadline = Instant::now() + Duration::from_secs(10);
         while Instant::now() < deadline {
             let alive = self
@@ -425,6 +458,50 @@ fn shm_object_exists(name: &str) -> bool {
     std::path::Path::new("/dev/shm")
         .join(name.trim_start_matches('/'))
         .exists()
+}
+
+/// 拉起 worker 进程池：`cpu_count - 2` 个常驻 worker（至少 1 个），
+/// 平均绑定到除 core 自身之外的 CPU 核心（core 占用核心 0，worker i 绑核 i+1）。
+///
+/// worker 进程（`icbm --worker <id> --cpu <core>`）注册 `icbm.worker.<id>`，
+/// 经 `WORKER_REGISTER` 由 core 记入 `WorkerRegistry`；region 由 `ensure_region`
+/// 分配给负载最低的 worker（region 合并）。
+fn spawn_worker_pool(config: &ServerConfig) {
+    use crate::region_registry::level_filter_str;
+    // core 自身占 1 核，其余给 worker；至少 1 个 worker（`ICBM_WORKERS` 可覆盖）
+    let worker_count = crate::config::effective_worker_count(config);
+    let cpu_count = std::thread::available_parallelism().map_or(1, usize::from);
+    let exe = match std::env::current_exe() {
+        Ok(exe) => exe,
+        Err(err) => {
+            warn!(%err, "cannot locate self executable, skipping worker pool");
+            return;
+        }
+    };
+    for id in 0..worker_count {
+        let cpu = (id + 1) % cpu_count; // 核心 0 留给 core
+        let mut command = std::process::Command::new(&exe);
+        command
+            .arg("--worker")
+            .arg(id.to_string())
+            .arg("--cpu")
+            .arg(cpu.to_string())
+            .arg("--world")
+            .arg(&config.world_dir)
+            .arg("--shm")
+            .arg(&config.shm_name)
+            .arg("--log-level")
+            .arg(level_filter_str(config.log_level));
+        match command.spawn() {
+            Ok(child) => {
+                debug!(id, pid = child.id(), cpu, "spawned worker process");
+            }
+            Err(err) => {
+                warn!(%err, id, "failed to spawn worker");
+            }
+        }
+    }
+    info!(worker_count, cpu_count, "worker pool spawned");
 }
 
 /// datarouter receiver 线程：region 消息 + 生命周期维护。
@@ -567,28 +644,39 @@ fn maintain_regions(server: &Server) {
         world.regions.remove(&id);
     }
     for id in sleep_unloads {
-        let pid = server
-            .world
-            .lock()
-            .expect("world lock")
-            .regions
-            .get(&id)
-            .map(|entry| entry.pid);
+        let (pid, worker_id) = {
+            let world = server.world.lock().expect("world lock");
+            let entry = world.regions.get(&id);
+            (entry.map(|e| e.pid), entry.and_then(|e| e.worker_id))
+        };
         let entity_base = server
             .world
             .lock()
             .expect("world lock")
             .regions
             .entity_base(&id);
-        let _ = server.ipc.send(
-            &id.service_name(),
-            kind::REGION_UNLOAD,
-            &encode_unload(DIM_OVERWORLD, id.rx, id.rz),
-        );
-        // 等 region 完成 flush 并自然退出（不得立即 kill——SIGTERM 会在
-        // region 处理 UNLOAD/写 .mca 前打断它，导致方块变更丢失）。
-        // 给 3 秒宽限，仍未退出才强制终止。
-        if let Some(pid) = pid {
+        // worker 模型：向所属 worker 发 `WORKER_RELEASE`（worker 内停止 region
+        // 线程并 flush，进程存活）；不 kill 进程，消除"flush 超时被杀"竞态。
+        if let Some(worker_id) = worker_id {
+            let worker_service = format!("icbm.worker.{worker_id}");
+            let body = encode_worker_region(id.rx, id.rz);
+            let _ = server
+                .ipc
+                .send(&worker_service, kind::WORKER_RELEASE, &body);
+            // 释放 worker 负载计数
+            server
+                .world
+                .lock()
+                .expect("world lock")
+                .workers
+                .release_region(worker_id);
+        } else if let Some(pid) = pid {
+            // 兼容回退：直接 spawn 的 region（无 worker），旧流程发 UNLOAD + 等退出
+            let _ = server.ipc.send(
+                &id.service_name(),
+                kind::REGION_UNLOAD,
+                &encode_unload(DIM_OVERWORLD, id.rx, id.rz),
+            );
             let deadline = Instant::now() + Duration::from_secs(3);
             while Instant::now() < deadline && process_alive(pid) {
                 std::thread::sleep(Duration::from_millis(50));
@@ -603,7 +691,7 @@ fn maintain_regions(server: &Server) {
         if let Some(base) = entity_base {
             remove_region_entities(server, base);
         }
-        info!(id = %id.service_name(), "region unloaded after sleep");
+        info!(id = %id.service_name(), worker_id, "region unloaded after sleep");
     }
 }
 
@@ -627,6 +715,25 @@ fn remove_region_entities(server: &Server, entity_base: i32) {
 #[allow(clippy::too_many_lines)] // IPC 消息分发 match 逐条对应协议
 fn handle_core_message(server: &Server, message: &icbm_region::protocol::IpcMessage) {
     match message.kind {
+        kind::WORKER_REGISTER => {
+            let Ok((pid, cpu)) = decode_worker_register(&message.body) else {
+                warn!("malformed worker register");
+                return;
+            };
+            // worker 服务名 `icbm.worker.<id>`
+            let Some(id) = parse_worker_service_id(&message.source) else {
+                warn!(source = %message.source, "worker register from unknown source");
+                return;
+            };
+            let first =
+                server
+                    .world
+                    .lock()
+                    .expect("world lock")
+                    .workers
+                    .register(id, pid, u32::from(cpu));
+            debug!(id, pid, cpu, first, "worker registered");
+        }
         kind::REGION_REGISTER => {
             let Ok((dim, rx, rz, pid)) = decode_register(&message.body) else {
                 warn!("malformed register message");
@@ -912,6 +1019,11 @@ fn parse_region_service_name(name: &str) -> Option<RegionId> {
         rx: rx.parse().ok()?,
         rz: rz.parse().ok()?,
     })
+}
+
+/// 从服务名解析 worker ID（`icbm.worker.<id>`）。
+fn parse_worker_service_id(name: &str) -> Option<u32> {
+    name.strip_prefix("icbm.worker.")?.parse().ok()
 }
 
 /// 终止 region 子进程（直接发 SIGTERM 信号，不依赖外部 `kill` 命令——

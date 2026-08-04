@@ -11,6 +11,7 @@ icbm-anvil = { path = "../lib/anvil" }
 icbm-gameplay-minecraft = { path = "../gameplay/minecraft" }
 icbm-mc-767 = { path = "../lib/mc-767" }
 icbm-terrain-gen = { path = "../lib/terrain-gen" }
+libc = "0.2"
 tracing = { version = "0.1", default-features = false }
 uuid = { version = "1", features = ["v4"] }
 

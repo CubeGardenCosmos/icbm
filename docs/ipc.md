@@ -79,18 +79,41 @@ offset 1: 载荷（按 kind 定义，全部小端）
 | 0x16  | SURFACE_QUERY      | C → R     | `[u8 dim][i32 x][i32 z]`（地表高度查询 → 0x96；新玩家出生点适配）           |
 | 0x96  | SURFACE_RESP       | R → C     | `[i32 y]`（最高非空气方块 y+1）                                             |
 | 0x17  | PORTAL_CREATE      | C → R     | `[u8 dim][i32 x][i32 y][i32 z]`（维度切换目的端生成返回传送门；以玩家落点周边建 4×5 黑曜石框架并填充传送门方块，广播 `CBlockUpdate`） |
+| 0x18  | WORKER_REGISTER    | W → C     | `[u32 pid][u8 cpu]`（worker 进程注册；core 记入 WorkerRegistry）             |
+| 0x19  | WORKER_ASSIGN      | C → W     | `[i32 rx][i32 rz]`（core 分配 region 给 worker；worker 内启动 region 模拟线程） |
+| 0x1A  | WORKER_RELEASE     | C → W     | `[i32 rx][i32 rz]`（core 释放 region；worker 内停止 region 线程并 flush，进程存活） |
+
+## worker 进程池
+
+- core 启动时拉起 **`cpu_count - 2` 个常驻 worker 进程**（`icbm --worker <id>
+  --cpu <core>`，至少 1 个；`ICBM_WORKERS` 环境变量可覆盖），每个 worker
+  注册 `icbm.worker.<id>` 并 `sched_setaffinity` 绑定到除 core 之外的一个
+  CPU 核心（core 占核心 0，worker i 绑核心 i+1）。
+- region 由 core 经 `WORKER_ASSIGN` 分配给**负载最低**的 worker（region
+  合并：活跃 region 数 > worker 数时多个 region 共享一个 worker 进程）；
+  worker 内每 region 一个独立线程运行 `RegionService`（复用单 region 主循环：
+  注册 `icbm.region.<id>`、20 TPS tick、IPC 处理），region 之间互不干扰，
+  各自持有独立 datarouter 连接与 `ChunkStore`——符合“每 region 单线程 tick
+  所有权边界”（进程只是容器 + CPU 绑核单位，不引入进程内并行模拟）。
+- region 卸载 = core 发 `WORKER_RELEASE` → worker 内停止 region 线程并
+  flush（进程存活），**不再 kill 进程**，消除“flush 超时被杀”与
+  “spawn/remove 竞态注册被拒”故障。
+- core 关停：向各 region 发 `REGION_UNLOAD`（region 线程 flush 后退出），
+  随后 kill 全部 worker 进程（容器）。
 
 ## 生命周期
 
 1. core 启动 → `SwitchHandle` 拉起嵌入式 switch（`--allow-any --ttl-ms 5000
-   --max-ports 8 [--token …]`）→ 连接并注册 `icbm.core`；读取配置，为出生点
-   区域拉起第一个 region 子进程（同一二进制 `--region` 模式，继承环境变量
-   `ICBM_DATAROUTER_TOKEN`）。
-2. region 启动 → 连接 datarouter → 注册 `icbm.region.<id>` → 发送 `REGION_REGISTER`。
+   --max-ports 8 [--token …]`）→ 连接并注册 `icbm.core`；读取配置，拉起
+   **worker 进程池**（`cpu_count - 2` 个常驻 worker，各绑一个 CPU 核心），
+   为出生点区域经 `WORKER_ASSIGN` 分配第一个 region。
+2. worker 启动 → 连接 datarouter → 注册 `icbm.worker.<id>` → 发送
+   `WORKER_REGISTER`（含 PID 与绑核）。core 收到 `WORKER_ASSIGN` 后在其
+   进程内启动 region 模拟线程（注册 `icbm.region.<id>`、发 `REGION_REGISTER`）。
 3. core 回复 `REGISTER_ACK`（含分配的实体 ID 基址，区域内实体 ID ∈
    `[base, base+999]`）后，region 进入正常模拟；每 1 秒发送一次
    `REGION_HEARTBEAT`（含 TPS 与沉睡状态）。
-4. 玩家进出：core 发送 `PLAYER_ENTER` / `PLAYER_LEAVE`；region 在无玩家时进入沉睡（停止 tick），持续 30 秒后由 core 发送 `REGION_UNLOAD` 卸载。
+4. 玩家进出：core 发送 `PLAYER_ENTER` / `PLAYER_LEAVE`；region 在无玩家时进入沉睡（停止 tick），持续 30 秒后由 core 发送 `WORKER_RELEASE`（worker 内停止 region 线程并 flush，进程存活）卸载。
 5. 区块数据：core 收到客户端进入/跨区时，向视野覆盖的**全部** region 发
    `CHUNK_REQUEST`（视野方块 [cx±r, cz±r] 最多覆盖 4 个主世界 region）；region
    只回其拥有的区块（主世界 32×32 裁剪，不再把邻区区块以 flat 生成覆盖），

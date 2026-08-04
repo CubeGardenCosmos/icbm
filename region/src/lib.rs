@@ -8,6 +8,7 @@ pub mod protocol;
 pub mod service;
 pub mod store;
 pub mod ticks;
+pub mod worker;
 
 pub use service::{RegionConfig, RegionError, RegionService, run_region};
 

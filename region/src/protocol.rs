@@ -78,6 +78,12 @@ pub mod kind {
     /// C→R：维度切换目的端生成传送门（`[u8 dim][i32 x][i32 y][i32 z]`；
     /// 玩家落点，region 在其周边建 4×5 框架并填充传送门方块）。
     pub const PORTAL_CREATE: u8 = 0x17;
+    /// W→C：worker 注册（`[u32 pid][u8 cpu]`；core 记录 worker 入池）。
+    pub const WORKER_REGISTER: u8 = 0x18;
+    /// C→W：分配 region（`[i32 rx][i32 rz]`；worker 内启动该 region 模拟线程）。
+    pub const WORKER_ASSIGN: u8 = 0x19;
+    /// C→W：释放 region（`[i32 rx][i32 rz]`；worker 内停止并移除该 region）。
+    pub const WORKER_RELEASE: u8 = 0x1A;
 }
 
 /// IPC 错误。
@@ -836,6 +842,46 @@ pub fn decode_surface_resp(body: &[u8]) -> Result<i32, IpcError> {
     Ok(i32::from_le_bytes(body[0..4].try_into().expect("slice")))
 }
 
+/// `WORKER_REGISTER` 载荷：`[u32 pid][u8 cpu]`。
+#[must_use]
+pub fn encode_worker_register(pid: u32, cpu: u8) -> Vec<u8> {
+    let mut out = Vec::with_capacity(5);
+    out.extend_from_slice(&pid.to_le_bytes());
+    out.push(cpu);
+    out
+}
+
+/// 解析 `WORKER_REGISTER` 载荷。
+pub fn decode_worker_register(body: &[u8]) -> Result<(u32, u8), IpcError> {
+    if body.len() < 5 {
+        return Err(IpcError::Length("worker register", body.len()));
+    }
+    Ok((
+        u32::from_le_bytes(body[0..4].try_into().expect("slice")),
+        body[4],
+    ))
+}
+
+/// `WORKER_ASSIGN` / `WORKER_RELEASE` 载荷：`[i32 rx][i32 rz]`。
+#[must_use]
+pub fn encode_worker_region(rx: i32, rz: i32) -> Vec<u8> {
+    let mut out = Vec::with_capacity(8);
+    out.extend_from_slice(&rx.to_le_bytes());
+    out.extend_from_slice(&rz.to_le_bytes());
+    out
+}
+
+/// 解析 `WORKER_ASSIGN` / `WORKER_RELEASE` 载荷。
+pub fn decode_worker_region(body: &[u8]) -> Result<(i32, i32), IpcError> {
+    if body.len() < 8 {
+        return Err(IpcError::Length("worker region", body.len()));
+    }
+    Ok((
+        i32::from_le_bytes(body[0..4].try_into().expect("slice")),
+        i32::from_le_bytes(body[4..8].try_into().expect("slice")),
+    ))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -959,5 +1005,14 @@ mod tests {
         assert_eq!(id.service_name(), "icbm.region.o_3_-2");
         let nether = RegionId::from_nether_chunk(25, 7);
         assert_eq!((nether.rx, nether.rz), (6, 1));
+    }
+
+    #[test]
+    fn worker_messages_round_trip() {
+        let reg = encode_worker_register(12345, 2);
+        assert_eq!(decode_worker_register(&reg).unwrap(), (12345, 2));
+        let assign = encode_worker_region(-3, 5);
+        assert_eq!(decode_worker_region(&assign).unwrap(), (-3, 5));
+        assert!(decode_worker_region(&assign[..4]).is_err());
     }
 }

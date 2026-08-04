@@ -124,6 +124,7 @@ impl TestServer {
                 "ICBM_ONLINE_MODE",
                 if online { "online" } else { "offline" },
             )
+            .env("ICBM_WORKERS", "1") // 测试环境单 worker，控制进程数
             .process_group(0) // 独立进程组：Drop 时整组清理 region 子进程
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())

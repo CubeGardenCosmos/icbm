@@ -24,10 +24,29 @@ fn parse_args() -> Result<Launch, String> {
     let mut shm: Option<String> = None;
     let mut port: Option<u16> = None;
     let mut region: Option<(i32, i32)> = None;
+    let mut worker: Option<(u32, Option<u32>)> = None;
     let mut log_level = DEFAULT_LOG_LEVEL;
 
     while let Some(arg) = args.next() {
         match arg.as_str() {
+            "--worker" => {
+                let id = args
+                    .next()
+                    .ok_or_else(|| "--worker 需要 <id>".to_owned())?
+                    .parse::<u32>()
+                    .map_err(|e| format!("worker id 非法: {e}"))?;
+                // 可选 `--cpu <core>`：绑定的 CPU 核心（core 之外的核）
+                let mut cpu = None;
+                if args.next().as_deref() == Some("--cpu") {
+                    cpu = Some(
+                        args.next()
+                            .ok_or_else(|| "--cpu 需要核心号".to_owned())?
+                            .parse::<u32>()
+                            .map_err(|e| format!("cpu 非法: {e}"))?,
+                    );
+                }
+                worker = Some((id, cpu));
+            }
             "--region" => {
                 let rx = args
                     .next()
@@ -74,6 +93,14 @@ fn parse_args() -> Result<Launch, String> {
             shm_name: shm.unwrap_or_else(|| DEFAULT_SHM_NAME.to_owned()),
             log_level,
         })
+    } else if let Some((id, cpu)) = worker {
+        Launch::Worker(WorkerLaunchArgs {
+            id,
+            cpu,
+            world_dir: world.ok_or_else(|| "worker 模式需要 --world".to_owned())?,
+            shm_name: shm.unwrap_or_else(|| DEFAULT_SHM_NAME.to_owned()),
+            log_level,
+        })
     } else {
         Launch::Core(ServerLaunchArgs {
             address: port.map_or_else(
@@ -94,6 +121,8 @@ enum Launch {
     Core(ServerLaunchArgs),
     /// region 模式。
     Region(RegionLaunchArgs),
+    /// worker 模式（常驻进程池，host 多个 region）。
+    Worker(WorkerLaunchArgs),
 }
 
 /// core 模式参数。
@@ -123,11 +152,23 @@ struct RegionLaunchArgs {
     log_level: LevelFilter,
 }
 
+/// worker 模式参数。
+struct WorkerLaunchArgs {
+    id: u32,
+    cpu: Option<u32>,
+    world_dir: PathBuf,
+    shm_name: String,
+    log_level: LevelFilter,
+}
+
 #[allow(clippy::print_stderr)] // 参数错误写入 stderr 是控制台惯例
 fn usage_error(message: &str) -> ! {
     eprintln!("参数错误: {message}");
     eprintln!("用法: icbm [--world <目录>] [--port <端口>] [--shm <名称>] [--log-level <级别>]");
     eprintln!("      icbm --region <rx> <rz> --world <目录> [--shm <名称>] [--log-level <级别>]");
+    eprintln!(
+        "      icbm --worker <id> [--cpu <核心>] --world <目录> [--shm <名称>] [--log-level <级别>]"
+    );
     eprintln!("级别: off | error | warn | info | debug | trace（默认 info）");
     std::process::exit(2);
 }
@@ -140,11 +181,29 @@ fn main() {
     let (log_level, use_stderr) = match &args {
         Launch::Core(args) => (args.log_level, false),
         Launch::Region(args) => (args.log_level, true),
+        Launch::Worker(args) => (args.log_level, true),
     };
-    // region 子进程：日志走 stderr、不启动交互控制台（stdout 留给 core 控制台）。
+    // region/worker 子进程：日志走 stderr、不启动交互控制台（stdout 留给 core 控制台）。
     init_logging(log_level, use_stderr);
 
     match args {
+        Launch::Worker(args) => {
+            debug!(id = args.id, cpu = ?args.cpu, "starting worker host mode");
+            let auth_token = std::env::var("ICBM_DATAROUTER_TOKEN")
+                .ok()
+                .filter(|token| !token.is_empty());
+            let config = icbm_region::worker::WorkerConfig {
+                id: args.id,
+                cpu: args.cpu,
+                world_dir: args.world_dir,
+                shm_name: args.shm_name,
+                auth_token,
+            };
+            if let Err(err) = icbm_region::worker::WorkerHost::run(config) {
+                error!(%err, "worker host exited with error");
+                std::process::exit(1);
+            }
+        }
         Launch::Region(args) => {
             debug!(
                 id = %args.id.service_name(),

@@ -503,8 +503,16 @@ impl RegionService {
 
     /// 运行主循环直至卸载。
     pub fn run(&mut self) -> Result<(), RegionError> {
+        self.run_until(&std::sync::Arc::new(std::sync::atomic::AtomicBool::new(
+            false,
+        )))
+    }
+
+    /// 运行主循环直至 `stop` 置位（worker 宿主用：`WORKER_RELEASE` 时置位，
+    /// region 在当前 tick 边界 flush 后正常退出，进程存活）。
+    pub fn run_until(&mut self, stop: &std::sync::atomic::AtomicBool) -> Result<(), RegionError> {
         self.register()?;
-        while self.running {
+        while self.running && !stop.load(std::sync::atomic::Ordering::Relaxed) {
             match self.state {
                 RegionState::Registering => return Err(RegionError::RegistrationRejected),
                 RegionState::Simulating => self.tick_simulate()?,

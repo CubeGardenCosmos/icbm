@@ -34,6 +34,8 @@ pub struct ServerConfig {
     pub region_timeout_secs: u64,
     /// 沉睡后卸载延迟（秒）。
     pub sleep_unload_secs: u64,
+    /// worker 进程数（进程池；`ICBM_WORKERS` 可覆盖，默认 cpu-2 至少 1）。
+    pub worker_count: usize,
 }
 
 impl Default for ServerConfig {
@@ -52,6 +54,23 @@ impl Default for ServerConfig {
             default_gamemode: 0,
             region_timeout_secs: 5,
             sleep_unload_secs: 30,
+            worker_count: 0, // 0 = 按 cpu-2 自动
         }
     }
+}
+
+/// 实际 worker 进程数（`ICBM_WORKERS` 环境变量覆盖；默认 cpu-2 至少 1）。
+#[must_use]
+pub fn effective_worker_count(config: &ServerConfig) -> usize {
+    if config.worker_count > 0 {
+        return config.worker_count;
+    }
+    std::env::var("ICBM_WORKERS")
+        .ok()
+        .and_then(|value| value.parse::<usize>().ok())
+        .filter(|n| *n > 0)
+        .unwrap_or_else(|| {
+            let cpu = std::thread::available_parallelism().map_or(1, usize::from);
+            cpu.saturating_sub(2).max(1)
+        })
 }

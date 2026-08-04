@@ -46,6 +46,8 @@ pub struct WorldState {
     pub gamerules: GameRuleStore,
     /// region 注册表。
     pub regions: RegionRegistry,
+    /// worker 进程池（常驻；region 分配给池中 worker）。
+    pub workers: crate::region_registry::WorkerRegistry,
     /// 全局串行的区块请求。
     pub chunk_pending: Option<ChunkPending>,
     /// 玩家当前所在 region（UUID → region；实体/区块转发用）。
@@ -64,6 +66,7 @@ impl WorldState {
             players: HashMap::new(),
             gamerules: GameRuleStore::new(),
             regions: RegionRegistry::new(),
+            workers: crate::region_registry::WorkerRegistry::new(),
             chunk_pending: None,
             player_regions: HashMap::new(),
             world_dir,
