@@ -14,9 +14,9 @@ use icbm_mc_767::packets::play_ids;
 use icbm_region::RegionId;
 use icbm_region::protocol::{
     DIM_OVERWORLD, Ipc, IpcError, decode_block_nbt_resp, decode_block_query_resp,
-    decode_block_raycast_resp, decode_chunk_data, decode_command_execute,
-    decode_entity_data, decode_heartbeat, decode_register, decode_surface_resp,
-    encode_register_ack, encode_unload, kind,
+    decode_block_raycast_resp, decode_chunk_data, decode_command_execute, decode_entity_data,
+    decode_heartbeat, decode_register, decode_surface_resp, encode_register_ack, encode_unload,
+    kind,
 };
 use tracing::{debug, info, trace, warn};
 
@@ -153,11 +153,8 @@ impl Server {
                 world,
                 running: AtomicBool::new(true),
                 online_mode: crate::net::crypto::online_mode_from_env(),
-                key_store: crate::net::crypto::KeyStore::new()
-                    .map_err(ServerError::Crypto)?,
-                lists: std::sync::Mutex::new(crate::lists::LoginLists::load(
-                    world_dir_for_lists,
-                )),
+                key_store: crate::net::crypto::KeyStore::new().map_err(ServerError::Crypto)?,
+                lists: std::sync::Mutex::new(crate::lists::LoginLists::load(world_dir_for_lists)),
                 chunk_diag: std::sync::atomic::AtomicU64::new(0),
                 world_time: Mutex::new(0),
                 weather: Mutex::new(icbm_region::weather::WeatherState::new()),
@@ -716,12 +713,16 @@ fn handle_core_message(server: &Server, message: &icbm_region::protocol::IpcMess
                         .barrier_query_pending
                         .swap(false, std::sync::atomic::Ordering::Relaxed)
                     {
-                        player.pending_barrier_state.store(state, std::sync::atomic::Ordering::Relaxed);
+                        player
+                            .pending_barrier_state
+                            .store(state, std::sync::atomic::Ordering::Relaxed);
                     } else if player
                         .portal_query_pending
                         .swap(false, std::sync::atomic::Ordering::Relaxed)
                     {
-                        player.pending_portal_block.store(state, std::sync::atomic::Ordering::Relaxed);
+                        player
+                            .pending_portal_block
+                            .store(state, std::sync::atomic::Ordering::Relaxed);
                     }
                     break;
                 }
@@ -808,16 +809,6 @@ fn forward_chunk_data(server: &Server, body: &[u8]) {
         world.chunk_pending.as_ref().map(|pending| pending.player)
     };
     let Some(player) = player else { return };
-    // 预生成/预加载区块不在当前请求区域内：不转发、不计数（丢弃）
-    {
-        let world = server.world.lock().expect("world lock");
-        if let Some(pending) = world.chunk_pending.as_ref()
-            && pending.player == player
-            && !pending.contains(cx, cz)
-        {
-            return;
-        }
-    }
     let client = {
         let world = server.world.lock().expect("world lock");
         world.players.get(&player).cloned()
@@ -826,6 +817,31 @@ fn forward_chunk_data(server: &Server, body: &[u8]) {
         server.world.lock().expect("world lock").chunk_pending = None;
         return;
     };
+    forward_chunk_to_pending(server, &client, cx, cz, data);
+}
+
+/// 转发单个区块载荷给等待中的玩家（批次开始 → 区块 → 批次完成）。
+///
+/// 供 region 返回的 `CHUNK_DATA`（receiver 线程）与 core 直读已卸载 region
+/// `.mca` 的区块（请求线程）共用：pending 计数、请求区域过滤与批次包装统一
+/// 在这里完成。
+pub(crate) fn forward_chunk_to_pending(
+    server: &Server,
+    client: &crate::client::Client,
+    cx: i32,
+    cz: i32,
+    data: &[u8],
+) {
+    // 预生成/预加载区块不在当前请求区域内：不转发、不计数（丢弃）
+    {
+        let world = server.world.lock().expect("world lock");
+        if let Some(pending) = world.chunk_pending.as_ref()
+            && pending.player == *client.uuid.lock().expect("uuid")
+            && !pending.contains(cx, cz)
+        {
+            return;
+        }
+    }
 
     // 更新 pending 状态（短锁）
     let (needs_start, finish, total) = {

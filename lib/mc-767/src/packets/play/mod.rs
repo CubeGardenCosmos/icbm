@@ -449,7 +449,11 @@ mod tests {
         let longs = encode_heightmap(&heights, -64);
         let unpacked = unpack_indices(&longs, 9, 256);
         for (column, &h) in heights.iter().enumerate() {
-            assert_eq!(unpacked[column], u32::try_from(h + 64).unwrap(), "column {column}");
+            assert_eq!(
+                unpacked[column],
+                u32::try_from(h + 64).unwrap(),
+                "column {column}"
+            );
         }
     }
 

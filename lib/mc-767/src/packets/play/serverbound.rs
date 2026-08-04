@@ -608,7 +608,6 @@ impl SSwing {
     }
 }
 
-
 /// Serverbound：右键方块（0x38 `PlayerInteractBlockC2SPacket`；放置方块/使用方块）。
 ///
 /// 字段（对照 `PlayerInteractBlockC2SPacket.java`）：`VarInt hand`（0=主手 1=副手）→
@@ -616,7 +615,6 @@ impl SSwing {
 /// `f32 ×3` 命中偏移 → `bool` 是否在方块内）→ `VarInt sequence`。
 #[derive(Debug, Clone, Copy)]
 pub struct SUseItemOn {
-
     /// 手（0=主手，1=副手）。
     pub hand: i32,
 
@@ -640,18 +638,12 @@ pub struct SUseItemOn {
 
     /// 序列号。
     pub sequence: i32,
-
 }
 
-
-
 impl SUseItemOn {
-
     /// 解码。
     pub fn decode(reader: &mut Reader<'_>) -> Result<Self, CodecError> {
-
         Ok(Self {
-
             hand: reader.read_var_int()?,
 
             location: BlockPos::from_long(reader.read_i64_be()?),
@@ -667,145 +659,91 @@ impl SUseItemOn {
             inside: reader.read_bool()?,
 
             sequence: reader.read_var_int()?,
-
         })
-
     }
-
-
 
     /// 包 ID。
     #[must_use]
     pub const fn packet_id() -> i32 {
-
         SERVERBOUND_USE_ITEM_ON
-
     }
-
 }
-
-
 
 /// Serverbound：右键使用物品（0x39 `PlayerInteractItemC2SPacket`）。
 #[derive(Debug, Clone, Copy)]
 pub struct SUseItem {
-
     /// 手（0=主手，1=副手）。
     pub hand: i32,
 
     /// 序列号。
     pub sequence: i32,
-
 }
 
-
-
 impl SUseItem {
-
     /// 解码（对照 `PlayerInteractItemC2SPacket.java`）。
     pub fn decode(reader: &mut Reader<'_>) -> Result<Self, CodecError> {
-
         Ok(Self {
-
             hand: reader.read_var_int()?,
 
             sequence: reader.read_var_int()?,
-
         })
-
     }
-
-
 
     /// 包 ID。
     #[must_use]
     pub const fn packet_id() -> i32 {
-
         SERVERBOUND_USE_ITEM
-
     }
-
 }
-
-
 
 /// Serverbound：切换选中槽（0x2F `UpdateSelectedSlotC2SPacket`）。
 #[derive(Debug, Clone, Copy)]
 pub struct SSetCarriedItem {
-
     /// 选中槽（0..8）。
     pub slot: i32,
-
 }
 
-
-
 impl SSetCarriedItem {
-
-    /// 解码（对照 `UpdateSelectedSlotC2SPacket.java`）。
+    /// 解码（对照 `ServerboundSetCarriedItemPacket.java`：槽位是
+    /// `readShort()`——2 字节有符号大端，不是 `VarInt`。旧实现按 `VarInt` 读会把
+    /// short 的高字节（0x00）当成槽位 → 选中槽永远解码为 0，手持物品永远
+    /// 是热栏第 1 格）。
     pub fn decode(reader: &mut Reader<'_>) -> Result<Self, CodecError> {
-
         Ok(Self {
-
-            slot: reader.read_var_int()?,
-
+            slot: i32::from(reader.read_i16_be()?),
         })
-
     }
-
-
 
     /// 包 ID。
     #[must_use]
     pub const fn packet_id() -> i32 {
-
         SERVERBOUND_SET_CARRIED_ITEM
-
     }
-
 }
-
-
 
 /// Serverbound：客户端命令（0x25 `ClientCommandC2SPacket`；如起身）。
 ///
 /// 字段：`VarInt action`（0=按下开始潜行 1=释放 2=离开床 3=开始精灵飞行）。
 #[derive(Debug, Clone, Copy)]
 pub struct SPlayerCommand {
-
     /// 动作。
     pub action: i32,
-
 }
 
-
-
 impl SPlayerCommand {
-
     /// 解码。
     pub fn decode(reader: &mut Reader<'_>) -> Result<Self, CodecError> {
-
         Ok(Self {
-
             action: reader.read_var_int()?,
-
         })
-
     }
-
-
 
     /// 包 ID。
     #[must_use]
     pub const fn packet_id() -> i32 {
-
         SERVERBOUND_PLAYER_COMMAND
-
     }
-
 }
-
-
 
 /// Serverbound：玩家输入（0x26 `PlayerInputC2SPacket`）。
 ///
@@ -861,45 +799,31 @@ impl SPlayerInput {
 /// 有符号大端，-1 = 光标/删除）→ `ItemStack`（网络编码）。
 #[derive(Debug, Clone)]
 pub struct SSetCreativeModeSlot {
-
     /// 槽位（-1 = 光标）。
     pub slot: i32,
 
     /// 物品（空栈表示清除）。
     pub stack: super::clientbound::CItemStack,
-
 }
 
-
-
 impl SSetCreativeModeSlot {
-
     /// 解码（对照 `CreativeInventoryActionC2SPacket.java`：槽位是
     /// `PacketCodecs.SHORT`，不是 `VarInt`——旧实现按 `VarInt` 读会把槽位后一字节
     /// 吞进 count，导致整包错位、带组件的栈读到 EOF 被踢）。
     pub fn decode(reader: &mut Reader<'_>) -> Result<Self, CodecError> {
-
         let slot = i32::from(reader.read_i16_be()?);
 
         let stack = decode_item_stack(reader)?;
 
         Ok(Self { slot, stack })
-
     }
-
-
 
     /// 包 ID。
     #[must_use]
     pub const fn packet_id() -> i32 {
-
         SERVERBOUND_SET_CREATIVE_MODE_SLOT
-
     }
-
 }
-
-
 
 /// 解码 `ItemStack.OPTIONAL_PACKET_CODEC`（网络物品栈；含附魔组件）。
 ///
@@ -911,14 +835,13 @@ impl SSetCreativeModeSlot {
 /// 仅 `minecraft:enchantments`（网络 ID 9）被解析；未知组件的载荷长度无法
 /// 从格式得知，停止解析并返回已解析部分即可——帧按长度前缀整体消费，
 /// 未消费字节被丢弃，不会造成流错位，也不会误踢合法客户端。
-fn decode_item_stack(reader: &mut Reader<'_>) -> Result<super::clientbound::CItemStack, CodecError> {
-
+fn decode_item_stack(
+    reader: &mut Reader<'_>,
+) -> Result<super::clientbound::CItemStack, CodecError> {
     let count = reader.read_var_int()?;
 
     if count <= 0 {
-
         return Ok(super::clientbound::CItemStack::empty());
-
     }
 
     let item_id = reader.read_var_int()? - 1; // registryEntry：raw_id + 1
@@ -936,7 +859,6 @@ fn decode_item_stack(reader: &mut Reader<'_>) -> Result<super::clientbound::CIte
     let mut show_in_tooltip = true;
 
     for _ in 0..to_add {
-
         let Ok(component) = reader.read_var_int() else {
             return Ok(super::clientbound::CItemStack {
                 item,
@@ -947,7 +869,6 @@ fn decode_item_stack(reader: &mut Reader<'_>) -> Result<super::clientbound::CIte
         };
 
         if component == 9 {
-
             // minecraft:enchantments：`ItemEnchantmentsComponent.PACKET_CODEC`
 
             let Ok(entries) = reader.read_var_int() else {
@@ -957,18 +878,15 @@ fn decode_item_stack(reader: &mut Reader<'_>) -> Result<super::clientbound::CIte
             let mut ok = true;
 
             for _ in 0..entries {
-
-                let (Ok(ench_id), Ok(level)) = (reader.read_var_int(), reader.read_var_int()) else {
+                let (Ok(ench_id), Ok(level)) = (reader.read_var_int(), reader.read_var_int())
+                else {
                     ok = false;
                     break;
                 };
 
                 if let Some(name) = crate::enchantment_ids::enchantment_name(ench_id - 1) {
-
                     enchantments.push((name.to_owned(), level));
-
                 }
-
             }
 
             if !ok {
@@ -980,27 +898,20 @@ fn decode_item_stack(reader: &mut Reader<'_>) -> Result<super::clientbound::CIte
             } else {
                 break;
             }
-
         } else {
-
             // 未知组件：载荷长度不可知，停止解析（剩余字节随帧丢弃）
 
             break;
-
         }
-
     }
 
     for _ in 0..to_remove {
-
         let Ok(_component) = reader.read_var_int() else {
             break;
         };
-
     }
 
     Ok(super::clientbound::CItemStack {
-
         item,
 
         count,
@@ -1008,11 +919,8 @@ fn decode_item_stack(reader: &mut Reader<'_>) -> Result<super::clientbound::CIte
         enchantments,
 
         show_in_tooltip,
-
     })
-
 }
-
 
 #[cfg(test)]
 mod tests {
@@ -1229,7 +1137,8 @@ mod tests {
         w.write_var_int(1); // 后续另一个组件（到不了）
         let bytes = w.into_bytes();
         let mut r = Reader::new(&bytes);
-        let packet = SSetCreativeModeSlot::decode(&mut r).expect("must not fail on unknown component");
+        let packet =
+            SSetCreativeModeSlot::decode(&mut r).expect("must not fail on unknown component");
         assert_eq!(packet.slot, 3);
         assert_eq!(packet.stack.item.as_deref(), Some("diamond_sword"));
         assert!(packet.stack.enchantments.is_empty());
@@ -1248,5 +1157,23 @@ mod tests {
         let bytes = w.into_bytes();
         let packet = decode_round_trip(&bytes, SPlayerAbilities::decode);
         assert!(packet.flying);
+    }
+
+    /// vanilla 1.21.1 `ServerboundSetCarriedItemPacket` 的槽位是 `readShort()`
+    /// （2 字节有符号大端）：选中第 5 格（index 4）编码为 short 4 = `[0x00 0x04]`。
+    /// 回归：旧实现按 VarInt 读高字节得到 0 → 选中槽永远为 0。
+    #[test]
+    fn set_carried_item_decode_vanilla_wire_format() {
+        let mut w = Writer::new();
+        w.write_i16_be(4);
+        let bytes = w.into_bytes();
+        let packet = decode_round_trip(&bytes, SSetCarriedItem::decode);
+        assert_eq!(packet.slot, 4);
+
+        let mut w = Writer::new();
+        w.write_i16_be(0);
+        let bytes = w.into_bytes();
+        let packet = decode_round_trip(&bytes, SSetCarriedItem::decode);
+        assert_eq!(packet.slot, 0);
     }
 }

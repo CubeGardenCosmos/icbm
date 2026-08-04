@@ -846,13 +846,27 @@ impl SnbtParser {
         let body = body.trim();
         match suffix {
             'b' => body.parse::<i8>().map(Nbt::Byte).map_err(|_| NbtError::Eof),
-            's' => body.parse::<i16>().map(Nbt::Short).map_err(|_| NbtError::Eof),
-            'l' => body.parse::<i64>().map(Nbt::Long).map_err(|_| NbtError::Eof),
-            'f' => body.parse::<f32>().map(Nbt::Float).map_err(|_| NbtError::Eof),
-            'd' => body.parse::<f64>().map(Nbt::Double).map_err(|_| NbtError::Eof),
+            's' => body
+                .parse::<i16>()
+                .map(Nbt::Short)
+                .map_err(|_| NbtError::Eof),
+            'l' => body
+                .parse::<i64>()
+                .map(Nbt::Long)
+                .map_err(|_| NbtError::Eof),
+            'f' => body
+                .parse::<f32>()
+                .map(Nbt::Float)
+                .map_err(|_| NbtError::Eof),
+            'd' => body
+                .parse::<f64>()
+                .map(Nbt::Double)
+                .map_err(|_| NbtError::Eof),
             _ => {
                 if body.contains('.') {
-                    body.parse::<f64>().map(Nbt::Double).map_err(|_| NbtError::Eof)
+                    body.parse::<f64>()
+                        .map(Nbt::Double)
+                        .map_err(|_| NbtError::Eof)
                 } else {
                     body.parse::<i32>().map(Nbt::Int).map_err(|_| NbtError::Eof)
                 }
@@ -868,7 +882,9 @@ mod snbt_tests {
     #[test]
     fn snbt_compound_with_string_and_int() {
         let nbt = parse_snbt(r#"{Command:"say hi",TrackOutput:1b,Level:3}"#).unwrap();
-        let Nbt::Compound(c) = nbt else { panic!("expected compound") };
+        let Nbt::Compound(c) = nbt else {
+            panic!("expected compound")
+        };
         assert_eq!(c.get_string("Command"), Some("say hi"));
         assert_eq!(c.get("TrackOutput"), Some(&Nbt::Byte(1)));
         assert_eq!(c.get("Level"), Some(&Nbt::Int(3)));
@@ -878,8 +894,12 @@ mod snbt_tests {
     fn snbt_nested() {
         let nbt = parse_snbt(r"{outer:{inner:[1,2,3]}}").unwrap();
         let Nbt::Compound(c) = nbt else { panic!() };
-        let Nbt::Compound(inner) = c.get("outer").unwrap() else { panic!() };
-        let Nbt::List(list) = inner.get("inner").unwrap() else { panic!() };
+        let Nbt::Compound(inner) = c.get("outer").unwrap() else {
+            panic!()
+        };
+        let Nbt::List(list) = inner.get("inner").unwrap() else {
+            panic!()
+        };
         assert_eq!(list.values, vec![Nbt::Int(1), Nbt::Int(2), Nbt::Int(3)]);
     }
 
@@ -887,8 +907,14 @@ mod snbt_tests {
     fn snbt_typed_arrays_and_floats() {
         let nbt = parse_snbt(r"{a:[B;1b,2b],b:[I;3,4],c:1.5,d:2f}").unwrap();
         let Nbt::Compound(c) = nbt else { panic!() };
-        assert_eq!(c.get("a"), Some(&Nbt::ByteArray(vec![1, 2].into_boxed_slice())));
-        assert_eq!(c.get("b"), Some(&Nbt::IntArray(vec![3, 4].into_boxed_slice())));
+        assert_eq!(
+            c.get("a"),
+            Some(&Nbt::ByteArray(vec![1, 2].into_boxed_slice()))
+        );
+        assert_eq!(
+            c.get("b"),
+            Some(&Nbt::IntArray(vec![3, 4].into_boxed_slice()))
+        );
         assert_eq!(c.get("c"), Some(&Nbt::Double(1.5)));
         assert_eq!(c.get("d"), Some(&Nbt::Float(2.0)));
     }
@@ -898,7 +924,9 @@ mod snbt_tests {
         let nbt = parse_snbt(r"[{a:1},{a:2}]").unwrap();
         let Nbt::List(list) = nbt else { panic!() };
         assert_eq!(list.values.len(), 2);
-        let Nbt::Compound(first) = &list.values[0] else { panic!() };
+        let Nbt::Compound(first) = &list.values[0] else {
+            panic!()
+        };
         assert_eq!(first.get("a"), Some(&Nbt::Int(1)));
     }
 
@@ -913,7 +941,10 @@ mod snbt_tests {
         let nbt = parse_snbt(r#"["a","b"]"#).unwrap();
         let Nbt::List(list) = nbt else { panic!() };
         assert_eq!(list.tag, super::TagId::String);
-        assert_eq!(list.values, vec![Nbt::String("a".into()), Nbt::String("b".into())]);
+        assert_eq!(
+            list.values,
+            vec![Nbt::String("a".into()), Nbt::String("b".into())]
+        );
     }
 }
 
@@ -929,19 +960,35 @@ pub fn nbt_to_snbt(nbt: &Nbt) -> String {
         Nbt::String(v) => format!("\"{}\"", v.replace('\\', "\\\\").replace('"', "\\\"")),
         Nbt::ByteArray(values) => format!(
             "[B;{}]",
-            values.iter().map(|v| format!("{v}b")).collect::<Vec<_>>().join(",")
+            values
+                .iter()
+                .map(|v| format!("{v}b"))
+                .collect::<Vec<_>>()
+                .join(",")
         ),
         Nbt::IntArray(values) => format!(
             "[I;{}]",
-            values.iter().map(i32::to_string).collect::<Vec<_>>().join(",")
+            values
+                .iter()
+                .map(i32::to_string)
+                .collect::<Vec<_>>()
+                .join(",")
         ),
         Nbt::LongArray(values) => format!(
             "[L;{}]",
-            values.iter().map(|v| format!("{v}L")).collect::<Vec<_>>().join(",")
+            values
+                .iter()
+                .map(|v| format!("{v}L"))
+                .collect::<Vec<_>>()
+                .join(",")
         ),
         Nbt::List(list) => format!(
             "[{}]",
-            list.values.iter().map(nbt_to_snbt).collect::<Vec<_>>().join(",")
+            list.values
+                .iter()
+                .map(nbt_to_snbt)
+                .collect::<Vec<_>>()
+                .join(",")
         ),
         Nbt::Compound(compound) => format!(
             "{{{}}}",
@@ -968,12 +1015,15 @@ mod snbt_round_trip_tests {
         let text = nbt_to_snbt(&Nbt::Compound(Box::new(c)));
         assert_eq!(text, r#"{"Command":"say hi","Level":3,"TrackOutput":1b}"#);
         let parsed = parse_snbt(&text).unwrap();
-        assert_eq!(parsed, Nbt::Compound(Box::new({
-            let mut c2 = NbtCompound::new();
-            c2.insert("Command", Nbt::String("say hi".to_owned()));
-            c2.insert("Level", Nbt::Int(3));
-            c2.insert("TrackOutput", Nbt::Byte(1));
-            c2
-        })));
+        assert_eq!(
+            parsed,
+            Nbt::Compound(Box::new({
+                let mut c2 = NbtCompound::new();
+                c2.insert("Command", Nbt::String("say hi".to_owned()));
+                c2.insert("Level", Nbt::Int(3));
+                c2.insert("TrackOutput", Nbt::Byte(1));
+                c2
+            }))
+        );
     }
 }

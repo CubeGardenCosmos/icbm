@@ -5,8 +5,8 @@
 
 pub mod client;
 pub mod config;
-pub mod lists;
 pub mod console;
+pub mod lists;
 pub mod net;
 pub mod region_registry;
 pub mod server;

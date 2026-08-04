@@ -39,9 +39,9 @@ impl NameList {
     /// 是否包含该玩家（按 UUID 或名字，大小写不敏感）。
     #[must_use]
     pub fn contains(&self, uuid: &Uuid, name: &str) -> bool {
-        self.entries.iter().any(|entry| {
-            entry.uuid == *uuid || entry.name.eq_ignore_ascii_case(name)
-        })
+        self.entries
+            .iter()
+            .any(|entry| entry.uuid == *uuid || entry.name.eq_ignore_ascii_case(name))
     }
 
     /// 添加玩家并持久化。
@@ -58,9 +58,8 @@ impl NameList {
     /// 移除玩家（按名字或 UUID）并持久化；返回是否移除成功。
     pub fn remove(&mut self, uuid: &Uuid, name: &str) -> Result<bool, String> {
         let before = self.entries.len();
-        self.entries.retain(|entry| {
-            entry.uuid != *uuid && !entry.name.eq_ignore_ascii_case(name)
-        });
+        self.entries
+            .retain(|entry| entry.uuid != *uuid && !entry.name.eq_ignore_ascii_case(name));
         let removed = self.entries.len() < before;
         self.save()?;
         Ok(removed)

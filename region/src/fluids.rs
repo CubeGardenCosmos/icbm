@@ -1,14 +1,22 @@
-//! 流体模拟（水、岩浆）：简化扩散模型，供 region tick 调用。
+//! 流体模拟（水、岩浆）：vanilla `FlowingFluid`/`LiquidBlock` 可观察行为的分块扫描模型。
 //!
-//! 对照 vanilla `FlowingFluid` 的可观察行为简化：
-//! - 源块（level=0）向下方与水平方向流动；`getMaxFlowDistance=4`（源块向
-//!   四周扩散的路径长度上限），`getLevelDecreasePerBlock=1`；
-//! - 流动态（level>0）优先下落，无路时向四周更低处扩散，level 递增；
-//! - level ≥ 8 视为衰减（不继续扩散）；level 15 为最大。
+//! 方块 LEVEL 属性 0..15（`LiquidBlock.LEVEL`）语义与 vanilla 一致：
+//! - `0` = 源块（amount 8，永不消失）；
+//! - `1..7` = 流动态，amount = `8 - LEVEL`（离源越远越浅，LEVEL 7 = amount 1）；
+//! - `8..15` = falling 态（下落中），amount = `16 - LEVEL`（8 = amount 8 下落）。
 //!
-//! 状态 ID 布局（vanilla `Block.BLOCK_STATE_REGISTRY`，对照 master
-//! `data/src/generated/block.rs`）：water 80..95（`FluidBlock.LEVEL` 0..15），
-//! lava 96..111。`waterlogged` 属性属于各具体方块（如台阶），不在流体模块处理。
+//! 每 tick 对含流体的脏区块扫描，对每个流体方块执行 vanilla `FlowingFluid.tick`
+//! 两步：非源块先 `getNewLiquid` 更新自身（上方有流体 → falling；水平邻居最高
+//! amount - dropoff，≤ 0 → 置空气消散），再 `spread`（下方可替换 → 下落为
+//! falling；否则水平扩散：amount - dropoff，falling 以 amount 7 扩散）。
+//! `dropoff`：水 1（平地流 7 格）、岩浆 2（平地流 3 格），对照
+//! `WaterFluid.getDropOff`/`LavaFluid.getDropOff`。
+//!
+//! 与 vanilla 的差异（有意简化，记录于 parity matrix）：
+//! - 不实现 slope-distance 寻路与计划 tick（`getTickDelay` 水 5 / 岩浆 30），
+//!   每 tick 扫描全部流体脏区块，收敛到与 vanilla 相同的稳定形态；
+//! - 无无限水源（vanilla `waterSourceConversion` 默认 false，行为一致）；
+//! - 可替换方块集简化为空气/异种流体（flat 世界无植物等可替换方块）。
 //!
 //! 本模块只做纯计算（输入当前列快照 → 输出待更新的方块与状态），不持有世界
 //! 状态；region 每 tick 对已加载区块调用 [`tick_fluid`]。
@@ -43,7 +51,7 @@ impl FluidKind {
         }
     }
 
-    /// 状态 ID → 流体 level（0 源块 … 15 最大衰减）。
+    /// 状态 ID → 方块 LEVEL 属性（0 源块 … 15 最深 falling）。
     #[must_use]
     pub const fn level_from_state_id(state_id: i32) -> Option<i32> {
         match Self::from_state_id(state_id) {
@@ -53,15 +61,67 @@ impl FluidKind {
         }
     }
 
-    /// level → 状态 ID。
+    /// LEVEL → 状态 ID。
     #[must_use]
     pub const fn state_id(self, level: i32) -> i32 {
         let base = match self {
             Self::Water => block_state_ids::WATER,
             Self::Lava => block_state_ids::LAVA,
         };
-        let level = if level < 0 { 0 } else if level > 15 { 15 } else { level };
+        let level = if level < 0 {
+            0
+        } else if level > 15 {
+            15
+        } else {
+            level
+        };
         base + level
+    }
+
+    /// 每格流动衰减（vanilla `getDropOff`：水 1 / 岩浆 2）。
+    #[must_use]
+    const fn dropoff(self) -> i32 {
+        match self {
+            Self::Water => 1,
+            Self::Lava => 2,
+        }
+    }
+
+    /// LEVEL → amount（vanilla `FluidState.getAmount`：源 8、流动 8-L、falling 16-L）。
+    #[must_use]
+    const fn amount_of(level: i32) -> i32 {
+        if level == 0 {
+            8
+        } else if level < 8 {
+            8 - level
+        } else {
+            16 - level
+        }
+    }
+
+    /// amount → 方块 LEVEL（`getLegacyLevel` 反向；falling 用 8..15 段）。
+    #[must_use]
+    const fn level_of(amount: i32) -> i32 {
+        let amount = if amount < 1 {
+            1
+        } else if amount > 8 {
+            8
+        } else {
+            amount
+        };
+        8 - amount
+    }
+
+    /// 是否源块（LEVEL 0）。
+    #[must_use]
+    const fn is_source(level: i32) -> bool {
+        level == 0
+    }
+
+    /// 是否 falling 态（LEVEL 8..15）。
+    #[must_use]
+    const fn is_falling(level: i32) -> bool {
+        level >= 8
     }
 }
 
@@ -74,16 +134,16 @@ pub struct FluidUpdate {
     pub y: i32,
     /// Z。
     pub z: i32,
-    /// 新状态 ID。
+    /// 新状态 ID（`0` = 空气，表示消散）。
     pub state_id: i32,
 }
-
 /// 流体扩散：遍历指定区域内的流体方块，生成更新。
 ///
-/// `block_at(x, y, z)` 返回当前状态 ID（`0` = 空气）；`set` 在每次更新后
-/// 应用到世界（顺序即 vanilla 的 tick 顺序：先下落再水平）。
-/// 简化模型：每 tick 每个流体方块向下或向相邻更低处流一格。
-#[allow(clippy::too_many_arguments)] // 区域边界 + 两个回调，语义清晰
+/// `block_at(x, y, z)` 返回当前状态 ID（`0` = 空气）；`set` 收集更新，由调用方
+/// 在扫描结束后应用（同一 tick 内各流体方块看到的是上一 tick 的快照，顺序无关）。
+/// 区域 y 范围即世界可建造高度（-64..319），扫描按 y 从高到低（先处理高处
+/// 源块/落柱，行为与 vanilla 逐方块 tick 收敛一致）。
+#[allow(clippy::too_many_arguments, clippy::too_many_lines)] // 区域边界 + 两个回调，语义清晰
 pub fn tick_fluid(
     min_x: i32,
     min_y: i32,
@@ -94,6 +154,7 @@ pub fn tick_fluid(
     mut block_at: impl FnMut(i32, i32, i32) -> i32,
     mut apply: impl FnMut(FluidUpdate),
 ) {
+    let directions = [(1, 0), (-1, 0), (0, 1), (0, -1)];
     for y in (min_y..=max_y).rev() {
         for x in min_x..=max_x {
             for z in min_z..=max_z {
@@ -101,42 +162,203 @@ pub fn tick_fluid(
                 let Some(kind) = FluidKind::from_state_id(state) else {
                     continue;
                 };
-                let Some(level) = FluidKind::level_from_state_id(state) else {
-                    continue;
-                };
-                if level >= 8 {
-                    continue; // 衰减完成，不再扩散
+                let level = FluidKind::level_from_state_id(state).expect("fluid just matched");
+                let amount = FluidKind::amount_of(level);
+                let is_source = FluidKind::is_source(level);
+                let dropoff = kind.dropoff();
+
+                // 1. 非源块先更新自身（vanilla `FlowingFluid.tick` 的
+                //    `getNewLiquid` 段）：上方同流体 → falling（LEVEL 8）；
+                //    否则水平邻居最高 amount - dropoff，≤ 0 → 消散为空气。
+                let mut current = level;
+                let mut current_amount = amount;
+                if !is_source {
+                    let above = block_at(x, y + 1, z);
+                    let new_level = if FluidKind::from_state_id(above) == Some(kind) {
+                        8 // falling：上方有流体
+                    } else {
+                        let mut highest = 0;
+                        for (dx, dz) in directions {
+                            let nx = x + dx;
+                            let nz = z + dz;
+                            if nx < min_x || nx > max_x || nz < min_z || nz > max_z {
+                                continue;
+                            }
+                            let ns = block_at(nx, y, nz);
+                            if FluidKind::from_state_id(ns) == Some(kind) {
+                                let nl =
+                                    FluidKind::level_from_state_id(ns).expect("fluid just matched");
+                                highest = highest.max(FluidKind::amount_of(nl));
+                            }
+                        }
+                        let k = highest - dropoff;
+                        if k <= 0 {
+                            apply(FluidUpdate {
+                                x,
+                                y,
+                                z,
+                                state_id: 0, // 消散（vanilla：置空气）
+                            });
+                            continue; // 消散后不再扩散
+                        }
+                        FluidKind::level_of(k)
+                    };
+                    if new_level != current {
+                        current = new_level;
+                        current_amount = FluidKind::amount_of(current);
+                        apply(FluidUpdate {
+                            x,
+                            y,
+                            z,
+                            state_id: kind.state_id(current),
+                        });
+                    }
                 }
-                // 1. 下落：下方可替换（空气或可被流体替换的方块）
+
+                // 2. 扩散（vanilla `FlowingFluid.spread`）：下方可替换 → 下落为
+                //    falling（LEVEL 8）；下方为实体（非流体非空气）→ 水平扩散
+                //    （amount - dropoff，falling 以 amount 7 铺开）；下方为同流体
+                //    → 不扩散（vanilla `isWaterHole` 命中）。
                 let below = block_at(x, y - 1, z);
-                if below == 0 {
+                let below_kind = FluidKind::from_state_id(below);
+                let below_spreadable =
+                    below == 0 || (below_kind.is_some() && below_kind != Some(kind));
+                if below_spreadable {
                     apply(FluidUpdate {
                         x,
                         y: y - 1,
                         z,
-                        state_id: kind.state_id(level + 1),
+                        state_id: kind.state_id(8), // falling
                     });
-                    continue;
-                }
-                // 2. 水平扩散：向四个方向中低于或等于当前高度、可替换者流动
-                let directions = [(1, 0), (-1, 0), (0, 1), (0, -1)];
-                for (dx, dz) in directions {
-                    let nx = x + dx;
-                    let nz = z + dz;
-                    if nx < min_x || nx > max_x || nz < min_z || nz > max_z {
-                        continue;
-                    }
-                    let neighbor = block_at(nx, y, nz);
-                    if neighbor == 0 {
-                        apply(FluidUpdate {
-                            x: nx,
+                    // 源块 + 至少 3 个源邻居：下落的同时也向侧边扩散
+                    // （vanilla `spread` 的 sourceNeighborCount >= 3 分支）
+                    if is_source
+                        && source_neighbor_count(
+                            &mut block_at,
+                            x,
                             y,
-                            z: nz,
-                            state_id: kind.state_id(level + 1),
-                        });
+                            z,
+                            min_x,
+                            min_z,
+                            max_x,
+                            max_z,
+                            kind,
+                            directions,
+                        ) >= 3
+                    {
+                        spread_to_sides(
+                            &mut block_at,
+                            &mut apply,
+                            x,
+                            y,
+                            z,
+                            kind,
+                            current_amount,
+                            dropoff,
+                            false,
+                            min_x,
+                            min_z,
+                            max_x,
+                            max_z,
+                            directions,
+                        );
                     }
+                } else if below_kind != Some(kind) {
+                    // 下方是实体方块：源块/流动态/falling 一律向侧边扩散
+                    // （vanilla：solid below → `!isWaterHole` → spreadToSides）
+                    spread_to_sides(
+                        &mut block_at,
+                        &mut apply,
+                        x,
+                        y,
+                        z,
+                        kind,
+                        current_amount,
+                        dropoff,
+                        FluidKind::is_falling(current),
+                        min_x,
+                        min_z,
+                        max_x,
+                        max_z,
+                        directions,
+                    );
                 }
             }
+        }
+    }
+}
+
+/// 水平方向同流体源块（LEVEL 0）数量（vanilla `sourceNeighborCount`）。
+#[allow(clippy::too_many_arguments)]
+fn source_neighbor_count(
+    block_at: &mut impl FnMut(i32, i32, i32) -> i32,
+    x: i32,
+    y: i32,
+    z: i32,
+    min_x: i32,
+    min_z: i32,
+    max_x: i32,
+    max_z: i32,
+    kind: FluidKind,
+    directions: [(i32, i32); 4],
+) -> i32 {
+    let mut count = 0;
+    for (dx, dz) in directions {
+        let nx = x + dx;
+        let nz = z + dz;
+        if nx < min_x || nx > max_x || nz < min_z || nz > max_z {
+            continue;
+        }
+        let ns = block_at(nx, y, nz);
+        if FluidKind::from_state_id(ns) == Some(kind)
+            && FluidKind::level_from_state_id(ns) == Some(0)
+        {
+            count += 1;
+        }
+    }
+    count
+}
+
+/// 水平扩散（vanilla `spreadToSides`）：扩散强度 = amount - dropoff
+/// （falling 以 7 铺开），向四周可替换位置放置流动态。
+#[allow(clippy::too_many_arguments)]
+fn spread_to_sides(
+    block_at: &mut impl FnMut(i32, i32, i32) -> i32,
+    apply: &mut impl FnMut(FluidUpdate),
+    x: i32,
+    y: i32,
+    z: i32,
+    kind: FluidKind,
+    amount: i32,
+    dropoff: i32,
+    falling: bool,
+    min_x: i32,
+    min_z: i32,
+    max_x: i32,
+    max_z: i32,
+    directions: [(i32, i32); 4],
+) {
+    let side_amount = if falling { 7 } else { amount - dropoff };
+    if side_amount <= 0 {
+        return; // 边缘（amount 1 / 岩浆 amount ≤ 2）不再扩散
+    }
+    let side_level = FluidKind::level_of(side_amount);
+    let side_state = kind.state_id(side_level);
+    for (dx, dz) in directions {
+        let nx = x + dx;
+        let nz = z + dz;
+        if nx < min_x || nx > max_x || nz < min_z || nz > max_z {
+            continue;
+        }
+        let ns = block_at(nx, y, nz);
+        let neighbor_kind = FluidKind::from_state_id(ns);
+        if ns == 0 || (neighbor_kind.is_some() && neighbor_kind != Some(kind)) {
+            apply(FluidUpdate {
+                x: nx,
+                y,
+                z: nz,
+                state_id: side_state,
+            });
         }
     }
 }
@@ -145,70 +367,156 @@ pub fn tick_fluid(
 mod tests {
     use super::{FluidKind, FluidUpdate, block_state_ids, tick_fluid};
 
+    fn run_ticks(
+        blocks: &mut std::collections::HashMap<(i32, i32, i32), i32>,
+        ticks: usize,
+        min_x: i32,
+        min_z: i32,
+        max_x: i32,
+        max_z: i32,
+    ) {
+        for _ in 0..ticks {
+            let mut updates: Vec<FluidUpdate> = Vec::new();
+            tick_fluid(
+                min_x,
+                -64,
+                min_z,
+                max_x,
+                319,
+                max_z,
+                |x, y, z| *blocks.get(&(x, y, z)).unwrap_or(&0),
+                |update: FluidUpdate| updates.push(update),
+            );
+            for update in updates {
+                if update.state_id == 0 {
+                    blocks.remove(&(update.x, update.y, update.z));
+                } else {
+                    blocks.insert((update.x, update.y, update.z), update.state_id);
+                }
+            }
+        }
+    }
+
     #[test]
     fn fluid_kind_mapping() {
-        assert_eq!(FluidKind::from_state_id(block_state_ids::WATER), Some(FluidKind::Water));
-        assert_eq!(FluidKind::from_state_id(block_state_ids::WATER + 7), Some(FluidKind::Water));
-        assert_eq!(FluidKind::from_state_id(block_state_ids::LAVA), Some(FluidKind::Lava));
-        assert_eq!(FluidKind::from_state_id(block_state_ids::LAVA + 15), Some(FluidKind::Lava));
+        assert_eq!(
+            FluidKind::from_state_id(block_state_ids::WATER),
+            Some(FluidKind::Water)
+        );
+        assert_eq!(
+            FluidKind::from_state_id(block_state_ids::WATER + 7),
+            Some(FluidKind::Water)
+        );
+        assert_eq!(
+            FluidKind::from_state_id(block_state_ids::LAVA),
+            Some(FluidKind::Lava)
+        );
+        assert_eq!(
+            FluidKind::from_state_id(block_state_ids::LAVA + 15),
+            Some(FluidKind::Lava)
+        );
         assert_eq!(FluidKind::from_state_id(block_state_ids::STONE), None);
-        assert_eq!(FluidKind::level_from_state_id(block_state_ids::WATER), Some(0));
-        assert_eq!(FluidKind::level_from_state_id(block_state_ids::LAVA + 5), Some(5));
+        assert_eq!(
+            FluidKind::level_from_state_id(block_state_ids::WATER),
+            Some(0)
+        );
+        assert_eq!(
+            FluidKind::level_from_state_id(block_state_ids::LAVA + 5),
+            Some(5)
+        );
         assert_eq!(FluidKind::Water.state_id(3), block_state_ids::WATER + 3);
         assert_eq!(FluidKind::Lava.state_id(15), block_state_ids::LAVA + 15);
+        // LEVEL → amount 语义（vanilla）：源 8、流动 8-L、falling 16-L
+        assert_eq!(FluidKind::amount_of(0), 8);
+        assert_eq!(FluidKind::amount_of(1), 7);
+        assert_eq!(FluidKind::amount_of(7), 1);
+        assert_eq!(FluidKind::amount_of(8), 8);
+        assert_eq!(FluidKind::amount_of(15), 1);
+        assert_eq!(FluidKind::level_of(7), 1);
+        assert_eq!(FluidKind::level_of(1), 7);
     }
 
     #[test]
-    fn water_flows_down() {
-        // 3×1×1 竖井：顶部 y=2 放水源，下方 y=0/1 空气 → 逐格下流
+    fn water_pool_spreads_and_stabilizes() {
+        // 15×15 平面：中心 (7,0,7) 水源、全平面 y=-1 基岩地面阻挡下落 →
+        // 向四周扩散，水 dropoff 1 → 半径 7 的池子稳定（边缘 amount 1 = LEVEL 7）。
+        let mut blocks = std::collections::HashMap::new();
+        for x in 0..15 {
+            for z in 0..15 {
+                blocks.insert((x, -1, z), block_state_ids::BEDROCK);
+            }
+        }
+        blocks.insert((7, 0, 7), block_state_ids::WATER);
+        run_ticks(&mut blocks, 40, 0, 0, 14, 14);
+        // 半径 7 内（曼哈顿距离 ≤ 7 的菱形）全是水（含源），池外无
+        for dx in -7..=7 {
+            for dz in -7..=7 {
+                let state = *blocks.get(&(7 + dx, 0, 7 + dz)).unwrap_or(&0);
+                if dx.abs() + dz.abs() <= 7 {
+                    assert!(
+                        FluidKind::from_state_id(state) == Some(FluidKind::Water),
+                        "({dx},{dz}) should be water, got {state}"
+                    );
+                } else {
+                    assert_eq!(state, 0, "({dx},{dz}) outside pool should be air");
+                }
+            }
+        }
+        // 边缘（距源 7 格）amount 1 → LEVEL 7
+        let edge = *blocks.get(&(7 + 7, 0, 7)).unwrap();
+        assert_eq!(FluidKind::level_from_state_id(edge), Some(7));
+        // 池外无水
+        assert_eq!(blocks.get(&(7 + 8, 0, 7)), None);
+        // 源块仍在
+        assert_eq!(blocks.get(&(7, 0, 7)), Some(&block_state_ids::WATER));
+    }
+
+    #[test]
+    fn water_flows_down_as_falling_column() {
+        // 1×1 竖井：顶部 y=2 放水源、y=0 下方有地面 → 下落成 falling 柱
         let mut blocks = std::collections::HashMap::new();
         blocks.insert((0, 2, 0), block_state_ids::WATER);
-        let get = |x: i32, y: i32, z: i32| *blocks.get(&(x, y, z)).unwrap_or(&0);
-        let mut updates = Vec::new();
-        tick_fluid(
-            0,
-            0,
-            0,
-            2,
-            2,
-            0,
-            |x, y, z| get(x, y, z),
-            |update: FluidUpdate| updates.push(update),
+        blocks.insert((0, -1, 0), block_state_ids::BEDROCK);
+        run_ticks(&mut blocks, 20, 0, 0, 0, 0);
+        // 整列 0..2 均为水，下落态为 falling（LEVEL 8）
+        for y in 0..=2 {
+            let state = *blocks.get(&(0, y, 0)).unwrap_or(&0);
+            assert!(
+                FluidKind::from_state_id(state) == Some(FluidKind::Water),
+                "y={y} should be water"
+            );
+        }
+        assert_eq!(
+            FluidKind::level_from_state_id(*blocks.get(&(0, 1, 0)).unwrap()),
+            Some(8)
         );
-        // 水源应向下扩散：y=1 与四个方向之一
-        assert!(updates.iter().any(|u| u.y == 1 && u.x == 0 && u.z == 0));
-        // 更新后的 level 应递增
-        let down = updates
-            .iter()
-            .find(|u| u.y == 1 && u.x == 0 && u.z == 0)
-            .unwrap();
-        assert_eq!(down.state_id, block_state_ids::WATER + 1);
+        assert_eq!(
+            FluidKind::level_from_state_id(*blocks.get(&(0, 2, 0)).unwrap()),
+            Some(0)
+        );
     }
 
     #[test]
-    fn water_spreads_horizontally() {
-        // 5×1×5 平面：中心 (2,0,2) 水源、下方 (2,-1,2) 基岩阻挡下落 → 四方向各扩散一级
+    fn water_recedes_without_source() {
+        // 孤立流动态（无源）：下一 tick 消散为空气
         let mut blocks = std::collections::HashMap::new();
-        blocks.insert((2, 0, 2), block_state_ids::WATER);
-        blocks.insert((2, -1, 2), block_state_ids::BEDROCK);
-        let get = |x: i32, y: i32, z: i32| *blocks.get(&(x, y, z)).unwrap_or(&0);
-        let mut updates = Vec::new();
-        tick_fluid(
-            0,
-            -1,
-            0,
-            4,
-            0,
-            4,
-            |x, y, z| get(x, y, z),
-            |update: FluidUpdate| updates.push(update),
-        );
-        assert!(updates.len() >= 4, "got {updates:?}");
-        for (dx, dz) in [(1, 0), (-1, 0), (0, 1), (0, -1)] {
-            assert!(
-                updates.iter().any(|u| u.x == 2 + dx && u.z == 2 + dz),
-                "missing dir ({dx},{dz}) in {updates:?}"
-            );
+        blocks.insert((0, 0, 0), block_state_ids::WATER + 1); // 孤立的 LEVEL 1
+        run_ticks(&mut blocks, 3, 0, 0, 0, 0);
+        assert_eq!(blocks.get(&(0, 0, 0)), None, "isolated flow must drain");
+    }
+
+    #[test]
+    fn lava_flows_three_blocks() {
+        // 岩浆源 + 全地面：dropoff 2 → 平地铺 3 格（LEVEL 2/4/6），第 4 格无水
+        let mut blocks = std::collections::HashMap::new();
+        for x in 0..12 {
+            blocks.insert((x, -1, 0), block_state_ids::BEDROCK);
         }
+        blocks.insert((0, 0, 0), block_state_ids::LAVA);
+        run_ticks(&mut blocks, 40, 0, 0, 11, 0);
+        assert!(blocks.get(&(1, 0, 0)).is_some(), "lava 1 block");
+        assert!(blocks.get(&(2, 0, 0)).is_some(), "lava 2 blocks");
+        assert!(blocks.get(&(3, 0, 0)).is_some(), "lava 3 blocks");
+        assert_eq!(blocks.get(&(4, 0, 0)), None, "lava stops at 3 blocks");
     }
 }

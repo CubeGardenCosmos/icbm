@@ -156,7 +156,14 @@ impl MobManager {
     /// 生成一只随机友好生物（若未达上限）。
     ///
     /// `entity_id` 由调用方分配；返回是否生成。
-    pub fn try_spawn(&mut self, entity_id: i32, min_x: f64, max_x: f64, min_z: f64, max_z: f64) -> bool {
+    pub fn try_spawn(
+        &mut self,
+        entity_id: i32,
+        min_x: f64,
+        max_x: f64,
+        min_z: f64,
+        max_z: f64,
+    ) -> bool {
         if self.mobs.len() >= MAX_FRIENDLY_MOBS {
             return false;
         }
@@ -215,11 +222,7 @@ impl MobManager {
             mob.x = next_x;
             mob.z = next_z;
             mob.last_dir = dir;
-            moves.push((
-                mob.entity_id,
-                (dx * 4096.0) as i16,
-                (dz * 4096.0) as i16,
-            ));
+            moves.push((mob.entity_id, (dx * 4096.0) as i16, (dz * 4096.0) as i16));
         }
         moves
     }

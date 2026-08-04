@@ -18,23 +18,23 @@ use std::path::PathBuf;
 use std::sync::atomic::Ordering;
 use std::sync::{Arc, Mutex, OnceLock};
 
+use crate::net::play::about_message;
 use flate2::write::GzEncoder;
 use icbm_gameplay_icbm::bmtool::{BmToolCommand, format_bmtool_tps};
 use icbm_gameplay_minecraft::commands::{self, Command, GameMode, WhitelistAction};
-use crate::net::play::about_message;
 use icbm_mc_767::packets::play::clientbound::{
     CGameEvent, CPlayerAbilities, CPlayerInfoUpdate, PlayerInfoEntry,
 };
 use rustyline::completion::Completer;
+use rustyline::error::ReadlineError;
 use rustyline::highlight::Highlighter;
 use rustyline::hint::Hinter;
 use rustyline::history::FileHistory;
 use rustyline::validate::Validator;
 use rustyline::{Editor, Helper};
-use rustyline::error::ReadlineError;
 use time::{Duration, OffsetDateTime};
-use tracing::{error, info};
 use tracing::Subscriber;
+use tracing::{error, info};
 use tracing_subscriber::filter::LevelFilter;
 use tracing_subscriber::layer::SubscriberExt;
 use tracing_subscriber::util::SubscriberInitExt;
@@ -136,7 +136,9 @@ pub fn init_logging(level: LevelFilter, use_stderr: bool) {
             time::macros::format_description!("[year]-[month]-[day] [hour]:[minute]:[second]"),
         ));
 
-    let registry = tracing_subscriber::registry().with(env_filter).with(fmt_layer);
+    let registry = tracing_subscriber::registry()
+        .with(env_filter)
+        .with(fmt_layer);
     if let Some(file_logger) = file_logger {
         registry.with(file_logger).init();
     } else {
@@ -179,10 +181,7 @@ pub fn spawn_console(server: &Server) {
 
 /// rustyline 交互控制台线程（Ctrl-C 停止、Ctrl-D 停止；日志经 fmt 层直接写
 /// stdout，rustyline 在下次输入时重绘提示行）。
-fn run_readline_console(
-    server: Server,
-    mut rl: Editor<IcbmCommandCompleter, FileHistory>,
-) {
+fn run_readline_console(server: Server, mut rl: Editor<IcbmCommandCompleter, FileHistory>) {
     if let Some(helper) = rl.helper_mut() {
         helper.set_server(server.clone());
     }
@@ -236,8 +235,21 @@ fn run_stdin_console(server: Server) {
 
 /// 控制台命令名（升序；补全与提示用）。
 const CONSOLE_COMMANDS: &[&str] = &[
-    "about", "ban", "bmtool", "fill", "gamemode", "gamerule", "give", "help", "list", "regions",
-    "say", "setblock", "stop", "tp", "whitelist",
+    "about",
+    "ban",
+    "bmtool",
+    "fill",
+    "gamemode",
+    "gamerule",
+    "give",
+    "help",
+    "list",
+    "regions",
+    "say",
+    "setblock",
+    "stop",
+    "tp",
+    "whitelist",
 ];
 
 /// rustyline 补全/高亮/提示助手（参考 master `IcbmCommandCompleter`）。
@@ -330,15 +342,15 @@ impl Completer for IcbmCommandCompleter {
 
         let server = self.server();
         let mut candidates = match context.as_slice() {
-            [] => CONSOLE_COMMANDS.iter().map(|name| (*name).to_owned()).collect(),
+            [] => CONSOLE_COMMANDS
+                .iter()
+                .map(|name| (*name).to_owned())
+                .collect(),
             ["gamemode"] => ["survival", "creative", "adventure", "spectator"]
                 .into_iter()
                 .map(str::to_owned)
                 .collect(),
-            ["gamemode", _] => server
-                .as_ref()
-                .map(player_names)
-                .unwrap_or_default(),
+            ["gamemode", _] => server.as_ref().map(player_names).unwrap_or_default(),
             ["gamerule"] => icbm_gameplay_minecraft::gamerules::GAME_RULES
                 .iter()
                 .map(|rule| rule.name.to_owned())
@@ -418,7 +430,11 @@ impl Server {
                     let feedback = apply_fill(self, from, to, &block);
                     info!("{feedback}");
                 }
-                Command::Give { target, item, count } => {
+                Command::Give {
+                    target,
+                    item,
+                    count,
+                } => {
                     let feedback = apply_give(self, &target, &item, count);
                     info!("{feedback}");
                 }
@@ -466,7 +482,16 @@ impl Server {
                     let feedback = first_client.map_or_else(
                         || "控制台执行 /data 需要在线玩家作为响应通道".to_owned(),
                         |client| {
-                            apply_data(self, &client, action, x, y, z, path.as_deref(), nbt.as_deref())
+                            apply_data(
+                                self,
+                                &client,
+                                action,
+                                x,
+                                y,
+                                z,
+                                path.as_deref(),
+                                nbt.as_deref(),
+                            )
                         },
                     );
                     info!("{feedback}");
@@ -575,6 +600,7 @@ pub fn apply_gamemode(server: &Server, target: Option<&str>, mode: GameMode) -> 
             players: vec![PlayerInfoEntry {
                 uuid: *client.uuid.lock().expect("uuid"),
                 name: client.name.lock().expect("name").clone(),
+                properties: Vec::new(), // /gamemode 更新条目不含属性（仅 UPDATE_GAME_MODE）
                 game_mode: i32::from(mode.id()),
                 listed: true,
                 latency,
@@ -673,7 +699,8 @@ pub fn apply_fill(
     let (min_x, max_x) = (x1.min(x2), x1.max(x2));
     let (min_y, max_y) = (y1.min(y2), y1.max(y2));
     let (min_z, max_z) = (z1.min(z2), z1.max(z2));
-    let count = (max_x - min_x + 1).max(0) * (max_y - min_y + 1).max(0) * (max_z - min_z + 1).max(0);
+    let count =
+        (max_x - min_x + 1).max(0) * (max_y - min_y + 1).max(0) * (max_z - min_z + 1).max(0);
     // 与 vanilla `commandModificationBlockLimit` 一致：超过 32768 拒绝
     if count > 32768 {
         return format!("fill 区域过大：{count} 方块（上限 32768）");
@@ -780,11 +807,14 @@ pub fn apply_ban(server: &Server, target: &str, reason: Option<&str>) -> String 
         world.players.values().cloned().collect()
     };
     for player in players {
-        if player.name.lock().expect("name").eq_ignore_ascii_case(target) {
-            let msg = reason.map_or_else(
-                || "你已被封禁".to_owned(),
-                |r| format!("你已被封禁：{r}"),
-            );
+        if player
+            .name
+            .lock()
+            .expect("name")
+            .eq_ignore_ascii_case(target)
+        {
+            let msg =
+                reason.map_or_else(|| "你已被封禁".to_owned(), |r| format!("你已被封禁：{r}"));
             player.kick(&msg);
         }
     }
@@ -932,7 +962,12 @@ pub fn apply_weather(
     // 直接设目标态，并把梯度拉满/归零（立即生效，无需等待插值）
     let (rain, thunder) = {
         let mut weather = server.weather.lock().expect("weather");
-        weather.apply_from_core(raining, thundering, f32::from(raining), f32::from(thundering));
+        weather.apply_from_core(
+            raining,
+            thundering,
+            f32::from(raining),
+            f32::from(thundering),
+        );
         (weather.rain_gradient(), weather.thunder_gradient())
     };
     let regions: Vec<icbm_region::RegionId> = {
@@ -976,7 +1011,9 @@ pub fn apply_data(
     }
     match action {
         DataAction::Get => {
-            client.data_request_pending.store(true, std::sync::atomic::Ordering::Relaxed);
+            client
+                .data_request_pending
+                .store(true, std::sync::atomic::Ordering::Relaxed);
             if server
                 .ipc
                 .send(
@@ -991,7 +1028,9 @@ pub fn apply_data(
                 )
                 .is_err()
             {
-                client.data_request_pending.store(false, std::sync::atomic::Ordering::Relaxed);
+                client
+                    .data_request_pending
+                    .store(false, std::sync::atomic::Ordering::Relaxed);
                 return "无法发送方块 NBT 读取请求".to_owned();
             }
             let deadline = std::time::Instant::now() + std::time::Duration::from_secs(3);
@@ -1005,7 +1044,9 @@ pub fn apply_data(
                 }
                 std::thread::sleep(std::time::Duration::from_millis(5));
             };
-            client.data_request_pending.store(false, std::sync::atomic::Ordering::Relaxed);
+            client
+                .data_request_pending
+                .store(false, std::sync::atomic::Ordering::Relaxed);
             let Some(nbt) = response else {
                 return format!("[{x},{y},{z}] 的方块实体数据不可用");
             };
@@ -1023,7 +1064,9 @@ pub fn apply_data(
                 return format!("NBT 解析失败: {text}");
             };
             // 读取现有 NBT 合并后写回（命令方块 Command 等）
-            client.data_request_pending.store(true, std::sync::atomic::Ordering::Relaxed);
+            client
+                .data_request_pending
+                .store(true, std::sync::atomic::Ordering::Relaxed);
             let _ = server.ipc.send(
                 &region.service_name(),
                 icbm_region::protocol::kind::BLOCK_NBT_GET,
@@ -1045,7 +1088,9 @@ pub fn apply_data(
                 }
                 std::thread::sleep(std::time::Duration::from_millis(5));
             };
-            client.data_request_pending.store(false, std::sync::atomic::Ordering::Relaxed);
+            client
+                .data_request_pending
+                .store(false, std::sync::atomic::Ordering::Relaxed);
             let merged = match existing {
                 Some(Nbt::Compound(existing)) => {
                     let Nbt::Compound(add) = merge else {
@@ -1070,13 +1115,18 @@ pub fn apply_data(
                     &merged,
                 ),
             );
-            format!("[{x},{y},{z}] 的方块实体数据已更新: {}", nbt_to_snbt(&merged))
+            format!(
+                "[{x},{y},{z}] 的方块实体数据已更新: {}",
+                nbt_to_snbt(&merged)
+            )
         }
         DataAction::Remove => {
             let Some(path) = path else {
                 return "remove 需要路径".to_owned();
             };
-            client.data_request_pending.store(true, std::sync::atomic::Ordering::Relaxed);
+            client
+                .data_request_pending
+                .store(true, std::sync::atomic::Ordering::Relaxed);
             let _ = server.ipc.send(
                 &region.service_name(),
                 icbm_region::protocol::kind::BLOCK_NBT_GET,
@@ -1098,7 +1148,9 @@ pub fn apply_data(
                 }
                 std::thread::sleep(std::time::Duration::from_millis(5));
             };
-            client.data_request_pending.store(false, std::sync::atomic::Ordering::Relaxed);
+            client
+                .data_request_pending
+                .store(false, std::sync::atomic::Ordering::Relaxed);
             let Some(Nbt::Compound(mut compound)) = existing else {
                 return format!("[{x},{y},{z}] 没有方块实体数据");
             };
@@ -1130,7 +1182,10 @@ fn path_value<'a>(nbt: &'a icbm_mc_767::nbt::Nbt, path: &str) -> Option<&'a icbm
         let (key, index) = part.find('[').map_or((part, None), |bracket| {
             (
                 &part[..bracket],
-                part[bracket + 1..].trim_end_matches(']').parse::<usize>().ok(),
+                part[bracket + 1..]
+                    .trim_end_matches(']')
+                    .parse::<usize>()
+                    .ok(),
             )
         });
         match current {
@@ -1176,7 +1231,6 @@ fn remove_path(compound: &mut icbm_mc_767::nbt::NbtCompound, path: &str) -> bool
         _ => false,
     }
 }
-
 
 /// 广播系统消息（`say`）。
 fn broadcast_say(server: &Server, message: &str) {

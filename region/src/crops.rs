@@ -20,13 +20,34 @@ pub struct CropKind {
 /// `wheat` 4278 / `carrots` 8595 / `potatoes` 8603 / `beetroots` 12509 /
 /// `pumpkin_stem` 6821 / `melon_stem` 6829 / `cocoa` 7419）。
 pub const CROPS: [CropKind; 7] = [
-    CropKind { base: ids::WHEAT_AGE_0, max_age: 7 },
-    CropKind { base: ids::CARROTS_AGE_0, max_age: 7 },
-    CropKind { base: ids::POTATOES_AGE_0, max_age: 7 },
-    CropKind { base: ids::BEETROOTS_AGE_0, max_age: 3 },
-    CropKind { base: ids::PUMPKIN_STEM_AGE_0, max_age: 7 },
-    CropKind { base: ids::MELON_STEM_AGE_0, max_age: 7 },
-    CropKind { base: ids::COCOA_AGE_0, max_age: 2 },
+    CropKind {
+        base: ids::WHEAT_AGE_0,
+        max_age: 7,
+    },
+    CropKind {
+        base: ids::CARROTS_AGE_0,
+        max_age: 7,
+    },
+    CropKind {
+        base: ids::POTATOES_AGE_0,
+        max_age: 7,
+    },
+    CropKind {
+        base: ids::BEETROOTS_AGE_0,
+        max_age: 3,
+    },
+    CropKind {
+        base: ids::PUMPKIN_STEM_AGE_0,
+        max_age: 7,
+    },
+    CropKind {
+        base: ids::MELON_STEM_AGE_0,
+        max_age: 7,
+    },
+    CropKind {
+        base: ids::COCOA_AGE_0,
+        max_age: 2,
+    },
 ];
 
 /// 状态 ID 对应的作物（非作物返回 `None`）。
@@ -77,8 +98,7 @@ mod tests {
             // 成熟态 + 1 不再是该作物
             assert!(
                 is_crop(crop_state(crop, crop.max_age + 1)).is_none()
-                    || is_crop(crop_state(crop, crop.max_age + 1))
-                        != Some(crop)
+                    || is_crop(crop_state(crop, crop.max_age + 1)) != Some(crop)
             );
         }
         // 非作物

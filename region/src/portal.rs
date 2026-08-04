@@ -19,6 +19,29 @@ pub enum PortalAxis {
     Z,
 }
 
+impl PortalAxis {
+    /// 确定性轴选择（坐标奇偶；与 region `create_portal` 一致，core 据此计算
+    /// 玩家落点——固定种子可复现）。
+    #[must_use]
+    pub const fn from_pos(x: i32, z: i32) -> Self {
+        if (x ^ z).rem_euclid(2) == 0 {
+            Self::X
+        } else {
+            Self::Z
+        }
+    }
+}
+
+/// 传送门内部中心（玩家传送落点）：axis=X → (x, y, z+1)；axis=Z → (x+1, y, z)。
+/// 中心在内部 2×3 区域内（对照 [`build_portal`] 的填充坐标）。
+#[must_use]
+pub const fn portal_center(x: i32, y: i32, z: i32, axis: PortalAxis) -> (i32, i32, i32) {
+    match axis {
+        PortalAxis::X => (x, y, z + 1),
+        PortalAxis::Z => (x + 1, y, z),
+    }
+}
+
 /// 检测以 (x, z) 为左下角黑曜石柱的 4×5 框架。
 ///
 /// 返回填充内部所需的方块列表。框架：宽 4 格（沿主方向）、高 5 格；两列
@@ -96,6 +119,60 @@ pub const fn portal_state(axis: PortalAxis) -> i32 {
     }
 }
 
+/// 传送门构成：`(框架黑曜石坐标列表, 内部传送门方块坐标列表)`。
+pub type PortalBlocks = (Vec<(i32, i32, i32)>, Vec<(i32, i32, i32)>);
+
+/// 生成一扇全新传送门（vanilla `PortalForcer.createPortal` 行为）。
+///
+/// 以 (x, z) 为左下角黑曜石柱、`bottom_y` 为底部横梁 Y，建经典 4×5 单厚框架
+/// （14 黑曜石），内部 2×3 填充传送门方块。返回（框架坐标列表，填充坐标列表）。
+/// 玩家落点应取内部中心：axis=X → (x, `bottom_y` + 2, z + 1)；axis=Z →
+/// (x + 1, `bottom_y` + 2, z)。
+#[must_use]
+pub fn build_portal(x: i32, z: i32, bottom_y: i32, axis: PortalAxis) -> PortalBlocks {
+    let (a, b) = match axis {
+        PortalAxis::X => (z, z + 3),
+        PortalAxis::Z => (x, x + 3),
+    };
+    let mut frame = Vec::with_capacity(14);
+    let mut fill = Vec::with_capacity(6);
+    // 底部/顶部横梁（各 4 块）
+    for main in 0..4 {
+        let (bx, bz) = match axis {
+            PortalAxis::X => (x, z + main),
+            PortalAxis::Z => (x + main, z),
+        };
+        frame.push((bx, bottom_y, bz));
+        frame.push((bx, bottom_y + 4, bz));
+    }
+    // 两侧立柱（各 5 块，含四角；与横梁重叠无害）
+    for by in 0..=4 {
+        for (bx, bz) in [
+            match axis {
+                PortalAxis::X => (x, a),
+                PortalAxis::Z => (a, z),
+            },
+            match axis {
+                PortalAxis::X => (x, b),
+                PortalAxis::Z => (b, z),
+            },
+        ] {
+            frame.push((bx, bottom_y + by, bz));
+        }
+    }
+    // 内部 2×3
+    for main in 1..=2 {
+        for by in (bottom_y + 1)..=(bottom_y + 3) {
+            let (bx, bz) = match axis {
+                PortalAxis::X => (x, z + main),
+                PortalAxis::Z => (x + main, z),
+            };
+            fill.push((bx, by, bz));
+        }
+    }
+    (frame, fill)
+}
+
 #[cfg(test)]
 mod tests {
     use super::{PortalAxis, block_state_ids, detect_portal_frame, portal_state};
@@ -161,6 +238,30 @@ mod tests {
     #[test]
     fn portal_states() {
         assert_eq!(portal_state(PortalAxis::X), block_state_ids::NETHER_PORTAL);
-        assert_eq!(portal_state(PortalAxis::Z), block_state_ids::NETHER_PORTAL + 1);
+        assert_eq!(
+            portal_state(PortalAxis::Z),
+            block_state_ids::NETHER_PORTAL + 1
+        );
+    }
+
+    #[test]
+    fn build_portal_frame_matches_detection() {
+        use super::{build_portal, detect_portal_frame};
+        // 用 build_portal 生成的方块构造世界，detect_portal_frame 必须能检测到
+        for axis in [PortalAxis::X, PortalAxis::Z] {
+            let (frame, fill) = build_portal(0, 0, 0, axis);
+            let mut blocks = std::collections::HashMap::new();
+            for &(x, y, z) in &frame {
+                blocks.insert((x, y, z), block_state_ids::OBSIDIAN);
+            }
+            for &(x, y, z) in &fill {
+                blocks.insert((x, y, z), block_state_ids::NETHER_PORTAL);
+            }
+            let get = |x: i32, y: i32, z: i32| *blocks.get(&(x, y, z)).unwrap_or(&0);
+            let detected = detect_portal_frame(0, 0, 0, axis, &get);
+            assert!(detected.is_some(), "built {axis:?} frame must be detected");
+            let detected = detected.unwrap();
+            assert_eq!(detected, fill, "detection fill must match build fill");
+        }
     }
 }

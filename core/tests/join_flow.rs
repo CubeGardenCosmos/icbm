@@ -120,7 +120,10 @@ impl TestServer {
                 "--shm",
                 &shm_name,
             ])
-            .env("ICBM_ONLINE_MODE", if online { "online" } else { "offline" })
+            .env(
+                "ICBM_ONLINE_MODE",
+                if online { "online" } else { "offline" },
+            )
             .process_group(0) // 独立进程组：Drop 时整组清理 region 子进程
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
@@ -482,7 +485,10 @@ fn online_auth_failure_sends_valid_encrypted_disconnect() {
     // 不是 NBT——回归：曾写 NBT 导致客户端报 "unknown packet id"。
     let mut r = Reader::new(&payload);
     let json = r.read_string().expect("reason json string");
-    assert!(json.contains("translate") || json.contains("text"), "reason JSON: {json}");
+    assert!(
+        json.contains("translate") || json.contains("text"),
+        "reason JSON: {json}"
+    );
     assert!(!json.is_empty());
     eprintln!("[online-kick] encrypted disconnect reason json: {json}");
 }

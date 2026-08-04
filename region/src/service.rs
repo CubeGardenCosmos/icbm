@@ -13,9 +13,9 @@ use uuid::Uuid;
 
 use crate::protocol::{
     CORE_SERVICE, DIM_OVERWORLD, Ipc, IpcError, IpcMessage, decode_block_nbt_get,
-    decode_block_nbt_resp, decode_block_nbt_set, decode_block_query, decode_block_raycast,
-    decode_block_update, decode_chunk_request, decode_gamerule_update, decode_player_enter,
-    decode_player_leave, decode_player_move, decode_register_ack, decode_surface_query,
+    decode_block_nbt_set, decode_block_query, decode_block_raycast, decode_block_update,
+    decode_chunk_request, decode_gamerule_update, decode_player_enter, decode_player_leave,
+    decode_player_move, decode_portal_create, decode_register_ack, decode_surface_query,
     decode_time_update, decode_weather_update, encode_block_nbt_resp, encode_block_query_resp,
     encode_block_raycast_resp, encode_chunk_data, encode_command_execute, encode_entity_data,
     encode_heartbeat, encode_register, encode_stats, encode_surface_resp, kind,
@@ -262,10 +262,15 @@ impl RegionService {
         // TNT 方块放置：生成 TNT 实体（`minecraft:tnt`），不保留方块（vanilla
         // 放置即点火；此处放置即视为已放置方块并生成实体）
         if face == Face::Overworld && state_id == 2095 {
-            let entity_id = self.entity_base + 1000 + i32::try_from(self.entities.tnts.len())
-                .unwrap_or(i32::MAX);
-            self.entities
-                .spawn_tnt(entity_id, f64::from(x) + 0.5, f64::from(y) + 0.5, f64::from(z) + 0.5);
+            let entity_id = self.entity_base
+                + 1000
+                + i32::try_from(self.entities.tnts.len()).unwrap_or(i32::MAX);
+            self.entities.spawn_tnt(
+                entity_id,
+                f64::from(x) + 0.5,
+                f64::from(y) + 0.5,
+                f64::from(z) + 0.5,
+            );
             let tnt = self.entities.tnts.last().expect("just spawned").clone();
             let add = icbm_mc_767::packets::play::clientbound::CAddEntity {
                 entity_id: tnt.entity_id,
@@ -292,10 +297,44 @@ impl RegionService {
         Ok(())
     }
 
+    /// 维度切换目的端生成传送门（vanilla `PortalForcer.createPortal`）：
+    /// 以玩家落点 (x, y, z) 为中心建 4×5 黑曜石框架并填充传送门方块，
+    /// 向区域玩家广播 `CBlockUpdate`。
+    fn create_portal(&mut self, face: Face, x: i32, y: i32, z: i32) -> Result<(), RegionError> {
+        use crate::portal::{PortalAxis, build_portal, portal_state};
+        // 朝向确定性选择（坐标奇偶），与 core `portal_center` 落点一致
+        let axis = PortalAxis::from_pos(x, z);
+        let bottom_y = y - 2;
+        let (frame, fill) = build_portal(x, z, bottom_y, axis);
+        let obsidian = icbm_mc_767::packets::play::block_state_ids::OBSIDIAN;
+        let state = portal_state(axis);
+        let mut updates: Vec<(i32, i32, i32, i32)> = Vec::with_capacity(frame.len() + fill.len());
+        // 边界方块非本区域所有时跳过（set_block 返回 NotOwned）
+        for (fx, fy, fz) in frame {
+            if self.store.set_block(face, fx, fy, fz, obsidian).is_ok() {
+                updates.push((fx, fy, fz, obsidian));
+            }
+        }
+        for (fx, fy, fz) in fill {
+            if self.store.set_block(face, fx, fy, fz, state).is_ok() {
+                updates.push((fx, fy, fz, state));
+            }
+        }
+        for (ux, uy, uz, state_id) in updates {
+            let packet = icbm_mc_767::packets::play::clientbound::CBlockUpdate {
+                position: icbm_mc_767::packets::play::BlockPos::new(ux, uy, uz),
+                state_id,
+            };
+            self.send_entity_packet(play_ids::CLIENTBOUND_BLOCK_UPDATE, |w| {
+                packet.encode(w);
+            })?;
+        }
+        Ok(())
+    }
+
     /// 黑曜石放置后检查 4×5 传送门框架（两种朝向），构成则填充传送门方块并广播。
     fn try_build_portal(&mut self, x: i32, y: i32, z: i32) -> Result<(), RegionError> {
         use crate::portal::{PortalAxis, detect_portal_frame, portal_state};
-        use icbm_mc_767::packets::play::block_state_ids;
         // 先快照检测窗口内方块（避免闭包持 &mut store 与 set_block 冲突）
         let snapshot: std::collections::HashMap<(i32, i32, i32), i32> = {
             let mut map = std::collections::HashMap::new();
@@ -312,9 +351,7 @@ impl RegionService {
             }
             map
         };
-        let lookup = |bx: i32, by: i32, bz: i32| {
-            snapshot.get(&(bx, by, bz)).copied().unwrap_or(0)
-        };
+        let lookup = |bx: i32, by: i32, bz: i32| snapshot.get(&(bx, by, bz)).copied().unwrap_or(0);
         // 放置点可能是框架任意一格（底部/顶部横梁、两侧立柱），对两种朝向分别
         // 搜索框架原点（原点 = 放置点沿厚度方向不动、沿宽度方向回退 0..3 格）。
         let found: Option<FoundFrame> = {
@@ -416,6 +453,7 @@ impl RegionService {
         }
         Ok(())
     }
+
     /// 新建服务（连接 datarouter、打开存档）。
     pub fn new(config: RegionConfig) -> Result<Self, RegionError> {
         let ipc = Ipc::connect(
@@ -640,7 +678,9 @@ impl RegionService {
                 if let Ok((raining, thundering, rain, thunder)) =
                     decode_weather_update(&message.body)
                 {
-                    let toggled = self.weather.apply_from_core(raining, thundering, rain, thunder);
+                    let toggled = self
+                        .weather
+                        .apply_from_core(raining, thundering, rain, thunder);
                     // 晴雨切换：广播 START/STOP（对照 vanilla `tickWeather`）
                     if toggled {
                         let event = if raining {
@@ -687,7 +727,8 @@ impl RegionService {
                 let (dim, x, z) = decode_surface_query(&message.body)?;
                 let _ = dim;
                 let y = surface_height(&mut self.store, x, z);
-                self.ipc.send(CORE_SERVICE, kind::SURFACE_RESP, &encode_surface_resp(y))?;
+                self.ipc
+                    .send(CORE_SERVICE, kind::SURFACE_RESP, &encode_surface_resp(y))?;
             }
             kind::BLOCK_QUERY => {
                 let (dim, x, y, z) = decode_block_query(&message.body)?;
@@ -707,6 +748,13 @@ impl RegionService {
                     return Err(RegionError::InvalidMessage(format!("bad dim {dim}")));
                 };
                 self.apply_block_update(face, x, y, z, state_id)?;
+            }
+            kind::PORTAL_CREATE => {
+                let (dim, x, y, z) = decode_portal_create(&message.body)?;
+                let Some(face) = Face::from_byte(dim) else {
+                    return Err(RegionError::InvalidMessage(format!("bad dim {dim}")));
+                };
+                self.create_portal(face, x, y, z)?;
             }
             kind::REGION_STATS => {
                 let tps = if self.state == RegionState::Simulating {
@@ -740,16 +788,29 @@ impl RegionService {
     /// 1 tick 内出现，避免玩家在区块加载期间坠入虚空（区块请求半径 8 →
     /// 289 块，若中心块排在第 144 位、每 tick 8 块需约 0.9 秒，玩家已落到
     /// 世界底部之下）。
+    ///
+    /// 主世界（`Face::Overworld`）只入队本区域拥有的区块：视野跨区域时 core
+    /// 向每个覆盖 region 分别请求（沉睡 region 保持在线服务内存数据；已卸载
+    /// region 由 core 直读 .mca）。若本区域把邻区区块以 flat 生成重发，会覆盖
+    /// 客户端已有的真实地形（“区域切换显示”BUG 根因）。地狱面仅内存 flat，
+    /// flat 生成即真实地形，维持整视距发送。
     fn serve_chunks(&mut self, face: Face, cx: i32, cz: i32, radius: i32) {
         let radius = radius.clamp(0, 32);
+        let region = *self.store.id();
+        let owned = |chunk_x: i32, chunk_z: i32| match face {
+            Face::Overworld => chunk_x >> 5 == region.rx && chunk_z >> 5 == region.rz,
+            Face::Nether => true,
+        };
         for ring in 0..=radius {
             if ring == 0 {
-                self.pending_chunks.push_back((face, cx, cz));
+                if owned(cx, cz) {
+                    self.pending_chunks.push_back((face, cx, cz));
+                }
                 continue;
             }
             for dx in -ring..=ring {
                 for dz in -ring..=ring {
-                    if dx.abs() == ring || dz.abs() == ring {
+                    if (dx.abs() == ring || dz.abs() == ring) && owned(cx + dx, cz + dz) {
                         self.pending_chunks.push_back((face, cx + dx, cz + dz));
                     }
                 }
@@ -845,7 +906,13 @@ impl RegionService {
 
     /// 通用爆炸：破坏范围内方块、广播 `CExplosion` 与 `CBlockUpdate`、生成掉落物。
     /// `radius`：TNT 4、Creeper 3（vanilla `TntEntity`/`CreeperEntity` 爆炸半径）。
-    fn detonate_explosion(&mut self, x: f64, y: f64, z: f64, radius: f64) -> Result<(), RegionError> {
+    fn detonate_explosion(
+        &mut self,
+        x: f64,
+        y: f64,
+        z: f64,
+        radius: f64,
+    ) -> Result<(), RegionError> {
         use icbm_mc_767::packets::play::clientbound::{
             CBlockUpdate, CExplosion, ExplosionDestructionType,
         };
@@ -879,10 +946,19 @@ impl RegionService {
         // 破坏方块并广播更新、掉落物
         let mut spawns: Vec<(f64, f64, f64, String, i32)> = Vec::new();
         for (bx, by, bz) in &affected {
-            let state = self.store.block_at(Face::Overworld, *bx, *by, *bz).unwrap_or(0);
+            let state = self
+                .store
+                .block_at(Face::Overworld, *bx, *by, *bz)
+                .unwrap_or(0);
             if let Some(name) = icbm_mc_767::registry::state_id_to_name(state) {
                 let item_name = name.strip_prefix("minecraft:").unwrap_or(name);
-                spawns.push((f64::from(*bx), f64::from(*by), f64::from(*bz), item_name.to_owned(), 1));
+                spawns.push((
+                    f64::from(*bx),
+                    f64::from(*by),
+                    f64::from(*bz),
+                    item_name.to_owned(),
+                    1,
+                ));
             }
             self.store.set_block(Face::Overworld, *bx, *by, *bz, 0)?;
             let packet = CBlockUpdate {
@@ -895,9 +971,11 @@ impl RegionService {
         }
         // 生成掉落物（方块破坏掉落）
         for (sx, sy, sz, item, count) in spawns {
-            let entity_id = self.entity_base + 1000 + i32::try_from(self.entities.items.len())
-                .unwrap_or(i32::MAX);
-            self.entities.spawn_item(entity_id, sx, sy + 0.5, sz, &item, count);
+            let entity_id = self.entity_base
+                + 1000
+                + i32::try_from(self.entities.items.len()).unwrap_or(i32::MAX);
+            self.entities
+                .spawn_item(entity_id, sx, sy + 0.5, sz, &item, count);
             let item_entity = self.entities.items.last().expect("just spawned").clone();
             let add = icbm_mc_767::packets::play::clientbound::CAddEntity {
                 entity_id: item_entity.entity_id,
@@ -916,16 +994,17 @@ impl RegionService {
         Ok(())
     }
 
-    /// 红石 tick：对脏区块内的红石线计算供电、红石灯根据相邻信号点亮/熄灭。
+    /// 红石 tick：对脏区块内的红石线计算供电（6 方向电源 + 垂直/对角传导）、
+    /// 红石灯根据相邻信号点亮/熄灭。
     fn tick_redstone(&mut self) -> Result<(), RegionError> {
-        use crate::redstone::{compute_wire_power, lamp_should_light, wire_power, wire_state};
+        use crate::redstone::{compute_wire_power, neighbor_has_signal, wire_power, wire_state};
         use icbm_mc_767::packets::play::block_state_ids as ids;
         let chunks = self.store.redstone_chunks();
         if chunks.is_empty() {
             return Ok(());
         }
         // 1. 先收集所有红石线位置与当前强度（快照，避免 tick 中反复查询）
-        let mut wires: Vec<(i32, i32, i32, i32)> = Vec::new();
+        let mut wires: Vec<(i32, i32, i32)> = Vec::new();
         let mut lamps: Vec<(i32, i32, i32)> = Vec::new();
         let mut snapshot: std::collections::HashMap<(i32, i32, i32), i32> =
             std::collections::HashMap::new();
@@ -933,13 +1012,10 @@ impl RegionService {
             for x in cx * 16..cx * 16 + 16 {
                 for z in cz * 16..cz * 16 + 16 {
                     for y in -64..319 {
-                        let state = self
-                            .store
-                            .block_at(Face::Overworld, x, y, z)
-                            .unwrap_or(0);
+                        let state = self.store.block_at(Face::Overworld, x, y, z).unwrap_or(0);
                         snapshot.insert((x, y, z), state);
                         if wire_power(state).is_some() {
-                            wires.push((x, y, z, state));
+                            wires.push((x, y, z));
                         } else if state == ids::REDSTONE_LAMP || state == ids::REDSTONE_LAMP_ON {
                             lamps.push((x, y, z));
                         }
@@ -947,36 +1023,21 @@ impl RegionService {
                 }
             }
         }
-        // 2. 计算每条红石线的信号强度（考虑电源与相邻线衰减）
+        // 2. 计算每条红石线的信号强度（vanilla `calculateTargetStrength`：
+        //    6 方向电源/强信号穿透 + 线传导衰减）
         let mut wire_updates: Vec<(i32, i32, i32, i32)> = Vec::new();
-        for (x, y, z, _) in wires {
-            let neighbors = [(x + 1, y, z), (x - 1, y, z), (x, y, z + 1), (x, y, z - 1)]
-                .into_iter()
-                .map(|(nx, ny, nz)| snapshot.get(&(nx, ny, nz)).copied().unwrap_or(0))
-                .collect::<Vec<_>>();
-            let power = compute_wire_power(neighbors);
+        for (x, y, z) in wires {
+            let power = compute_wire_power(&snapshot, x, y, z);
             let current = snapshot.get(&(x, y, z)).copied().unwrap_or(0);
             if wire_power(current) != Some(power) {
                 wire_updates.push((x, y, z, wire_state(power)));
             }
         }
-        // 3. 红石灯：相邻信号 ≥ 1 点亮
+        // 3. 红石灯：相邻任一信号 > 0 点亮（`hasNeighborSignal`；线按全额强度）
         let mut lamp_updates: Vec<(i32, i32, i32, i32)> = Vec::new();
         for (x, y, z) in lamps {
-            let neighbors = [
-                (x + 1, y, z),
-                (x - 1, y, z),
-                (x, y, z + 1),
-                (x, y, z - 1),
-                (x, y + 1, z),
-                (x, y - 1, z),
-            ]
-            .into_iter()
-            .map(|(nx, ny, nz)| snapshot.get(&(nx, ny, nz)).copied().unwrap_or(0))
-            .collect::<Vec<_>>();
-            let power = compute_wire_power(neighbors);
-            let lit = lamp_should_light(power);
-            let target = if lit { ids::REDSTONE_LAMP_ON } else { ids::REDSTONE_LAMP };
+            let lit = neighbor_has_signal(&snapshot, x, y, z);
+            let target = crate::redstone::lamp_state(lit);
             let current = snapshot.get(&(x, y, z)).copied().unwrap_or(0);
             if current != target {
                 lamp_updates.push((x, y, z, target));
@@ -1004,7 +1065,7 @@ impl RegionService {
         }
         if any_changed {
             for (cx, cz) in chunks {
-                self.store.mark_redstone_dirty(cx, cz);
+                self.store.mark_redstone_region(cx, cz);
             }
         }
         Ok(())
@@ -1039,36 +1100,44 @@ impl RegionService {
         Ok(())
     }
 
-    /// 命令方块 tick：被红石信号供电（相邻方块红石强度 ≥ 1）且尚未触发时，
-    /// 经 `COMMAND_EXECUTE` 交给 core 以控制台身份执行其 `Command` NBT。
+    /// 命令方块 tick：被红石信号供电（相邻方块任一信号 > 0，vanilla
+    /// `hasNeighborSignal`——红石线按全额强度计）且尚未触发时，经
+    /// `COMMAND_EXECUTE` 交给 core 以控制台身份执行其 `Command` NBT。
     ///
     /// 三种命令方块（普通/循环/连锁）统一按“上升沿触发一次”处理（简化）；
     /// 循环方块原版每 tick 执行，此处同样只触发一次（避免刷屏）。
     /// 位置表由 store 维护（`set_block` 增量更新），避免全量扫描。
     fn tick_command_blocks(&mut self) -> Result<(), RegionError> {
-        use crate::redstone::compute_wire_power;
+        use crate::redstone::neighbor_has_signal;
         let positions = self.store.command_block_positions();
         if positions.is_empty() {
             return Ok(());
         }
+        // 供电检测快照（命令方块 ±1 范围）
+        let mut snapshot: std::collections::HashMap<(i32, i32, i32), i32> =
+            std::collections::HashMap::new();
+        for &(x, y, z) in &positions {
+            for dx in -1..=1 {
+                for dy in -1..=1 {
+                    for dz in -1..=1 {
+                        let key = (x + dx, y + dy, z + dz);
+                        snapshot.entry(key).or_insert_with(|| {
+                            self.store
+                                .block_at(Face::Overworld, key.0, key.1, key.2)
+                                .unwrap_or(0)
+                        });
+                    }
+                }
+            }
+        }
         let mut executions: Vec<(i32, i32, i32, String)> = Vec::new();
         for (x, y, z) in positions {
-            // 供电检测：相邻方块红石强度 ≥ 1（红石线/红石块/火把/灯等）
-            let neighbors = [
-                (x + 1, y, z),
-                (x - 1, y, z),
-                (x, y, z + 1),
-                (x, y, z - 1),
-                (x, y + 1, z),
-                (x, y - 1, z),
-            ]
-            .into_iter()
-            .map(|(nx, ny, nz)| {
-                self.store.block_at(Face::Overworld, nx, ny, nz).unwrap_or(0)
-            })
-            .collect::<Vec<_>>();
-            let powered = compute_wire_power(neighbors) >= 1;
-            let fired = self.command_block_fired.get(&(x, y, z)).copied().unwrap_or(false);
+            let powered = neighbor_has_signal(&snapshot, x, y, z);
+            let fired = self
+                .command_block_fired
+                .get(&(x, y, z))
+                .copied()
+                .unwrap_or(false);
             if powered && !fired {
                 if let Some(command) = self.store.command_block_command(x, y, z) {
                     executions.push((x, y, z, command));
@@ -1147,9 +1216,7 @@ impl RegionService {
                 continue; // 已成熟
             }
             // 生长概率：可可 2/3，其余 1/3（对照 `CropBlock`/`CocoaBlock`）
-            let chance = if crop.base
-                == icbm_mc_767::packets::play::block_state_ids::COCOA_AGE_0
-            {
+            let chance = if crop.base == icbm_mc_767::packets::play::block_state_ids::COCOA_AGE_0 {
                 2.0 / 3.0
             } else {
                 1.0 / 3.0
@@ -1203,8 +1270,8 @@ impl RegionService {
         let max_z = min_z + 512.0;
         // 生成：约每 2 秒尝试一只（上限由 MobManager 控制；`doMobSpawning` 关闭时禁止）
         if self.gamerule_bool("doMobSpawning") && self.rand_f64() < 1.0 / 40.0 {
-            let entity_id = self.entity_base + 2000 + i32::try_from(self.mobs.len())
-                .unwrap_or(i32::MAX);
+            let entity_id =
+                self.entity_base + 2000 + i32::try_from(self.mobs.len()).unwrap_or(i32::MAX);
             if self.mobs.try_spawn(entity_id, min_x, max_x, min_z, max_z) {
                 let mob = self.mobs.mobs.last().expect("just spawned").clone();
                 let add = icbm_mc_767::packets::play::clientbound::CAddEntity {
@@ -1392,7 +1459,7 @@ impl RegionService {
             z: f64::from(cz * 16) + self.rand_f64() * 16.0,
             yaw: (self.rand_f64() * 360.0) as f32,
             last_dir: 4, // 初始无方向
-            fuse: -1,   // 未点燃
+            fuse: -1,    // 未点燃
         };
         self.send_entity_packet(play_ids::CLIENTBOUND_ADD_ENTITY, |w| {
             CAddEntity {
@@ -1551,8 +1618,6 @@ pub fn run_region(config: RegionConfig) -> Result<(), RegionError> {
         }
     }
 }
-
-
 
 #[cfg(test)]
 mod tests {

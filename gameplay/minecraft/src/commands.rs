@@ -63,7 +63,15 @@ impl GameMode {
 /// 顶层命令名（客户端命令树与 Tab 补全建议用；icbm 命名空间的 `bmtool` 由
 /// `icbm-gameplay-icbm` 提供，core 汇总时追加）。
 pub const COMMAND_NAMES: &[&str] = &[
-    "about", "ban", "fill", "gamemode", "gamerule", "give", "help", "setblock", "tp",
+    "about",
+    "ban",
+    "fill",
+    "gamemode",
+    "gamerule",
+    "give",
+    "help",
+    "setblock",
+    "tp",
     "whitelist",
 ];
 
@@ -113,9 +121,7 @@ pub enum Command {
         reason: Option<String>,
     },
     /// `/whitelist on|off|add <玩家>|remove <玩家>|list`。
-    Whitelist {
-        action: WhitelistAction,
-    },
+    Whitelist { action: WhitelistAction },
     /// `/enchant <玩家> <附魔> [等级]`（附加到主手物品）。
     Enchant {
         target: String,
@@ -125,7 +131,10 @@ pub enum Command {
     /// `/time set <day|night|noon|midnight|<tick>>` 或 `/time add <tick>`。
     Time { set: Option<i64>, add: Option<i64> },
     /// `/weather clear|rain|thunder [时长秒]`。
-    Weather { kind: WeatherKind, duration: Option<i64> },
+    Weather {
+        kind: WeatherKind,
+        duration: Option<i64>,
+    },
     /// `/data get block <x> <y> <z> [路径]` / `/data merge block <x> <y> <z> <nbt>`
     /// / `/data remove block <x> <y> <z> <路径>`（NBT 编辑；方块实体/命令方块）。
     Data {
@@ -198,7 +207,10 @@ pub fn parse_command(line: &str) -> Option<Command> {
         "enchant" => {
             let target = parts.next()?.to_owned();
             let enchantment = parts.next()?.to_owned();
-            let level = parts.next().and_then(|v| v.parse::<i32>().ok()).unwrap_or(1);
+            let level = parts
+                .next()
+                .and_then(|v| v.parse::<i32>().ok())
+                .unwrap_or(1);
             Some(Command::Enchant {
                 target,
                 enchantment: normalize_name(&enchantment),
@@ -270,7 +282,10 @@ fn parse_time(mut parts: std::str::SplitWhitespace<'_>) -> Command {
             set: None,
             add: parts.next().and_then(|v| v.parse::<i64>().ok()),
         },
-        _ => Command::Time { set: None, add: None },
+        _ => Command::Time {
+            set: None,
+            add: None,
+        },
     }
 }
 
@@ -325,8 +340,16 @@ fn parse_fill(parts: std::str::SplitWhitespace<'_>) -> Option<Command> {
         return None;
     }
     Some(Command::Fill {
-        from: (values[0].parse().ok()?, values[1].parse().ok()?, values[2].parse().ok()?),
-        to: (values[3].parse().ok()?, values[4].parse().ok()?, values[5].parse().ok()?),
+        from: (
+            values[0].parse().ok()?,
+            values[1].parse().ok()?,
+            values[2].parse().ok()?,
+        ),
+        to: (
+            values[3].parse().ok()?,
+            values[4].parse().ok()?,
+            values[5].parse().ok()?,
+        ),
         block: normalize_name(values[6]),
     })
 }

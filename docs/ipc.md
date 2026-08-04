@@ -78,6 +78,7 @@ offset 1: 载荷（按 kind 定义，全部小端）
 | 0x15  | WEATHER_UPDATE     | C → R     | `[u8 raining][u8 thundering][f32 rain_gradient][f32 thunder_gradient]`（core 全局天气同步） |
 | 0x16  | SURFACE_QUERY      | C → R     | `[u8 dim][i32 x][i32 z]`（地表高度查询 → 0x96；新玩家出生点适配）           |
 | 0x96  | SURFACE_RESP       | R → C     | `[i32 y]`（最高非空气方块 y+1）                                             |
+| 0x17  | PORTAL_CREATE      | C → R     | `[u8 dim][i32 x][i32 y][i32 z]`（维度切换目的端生成返回传送门；以玩家落点周边建 4×5 黑曜石框架并填充传送门方块，广播 `CBlockUpdate`） |
 
 ## 生命周期
 
@@ -90,14 +91,20 @@ offset 1: 载荷（按 kind 定义，全部小端）
    `[base, base+999]`）后，region 进入正常模拟；每 1 秒发送一次
    `REGION_HEARTBEAT`（含 TPS 与沉睡状态）。
 4. 玩家进出：core 发送 `PLAYER_ENTER` / `PLAYER_LEAVE`；region 在无玩家时进入沉睡（停止 tick），持续 30 秒后由 core 发送 `REGION_UNLOAD` 卸载。
-5. 区块数据：core 收到客户端进入时向所在 region 发 `CHUNK_REQUEST`，region 从 `lib/anvil` 读取或 flat 生成后返回 `CHUNK_DATA`（网络序列化），core 转发给客户端；改动经 `lib/anvil` 写回 `.mca`。
+5. 区块数据：core 收到客户端进入/跨区时，向视野覆盖的**全部** region 发
+   `CHUNK_REQUEST`（视野方块 [cx±r, cz±r] 最多覆盖 4 个主世界 region）；region
+   只回其拥有的区块（主世界 32×32 裁剪，不再把邻区区块以 flat 生成覆盖），
+   沉睡 region 保持在线继续服务区块请求；**已卸载** region 的 .mca 由 core
+   只读打开（`RegionFile::open_readonly`，共享锁）直接构建区块数据转发，
+   区块缺失时用 flat 生成兜底。改动经 `lib/anvil` 写回 `.mca`。
 6. 实体：region 模拟 Creeper 敌对生物（夜晚生成、追逐/引爆），经 `ENTITY_DATA` 把
    `ADD_ENTITY`/`MOVE_ENTITY_POS` 等 clientbound 包发给 core，core 转发给位于
    该区域的玩家；region 卸载时 core 按实体 ID 段发 `REMOVE_ENTITIES` 清理客户端实体。
 7. 方块交互：`/setblock`/`/fill`（BLOCK_UPDATE）、方块查询（BLOCK_QUERY，传送门/屏障检测）、
    方块实体 NBT（BLOCK_NBT_GET/SET，`/data` 与命令方块 Command）、末影珍珠落点
-   （BLOCK_RAYCAST）、地表高度（SURFACE_QUERY，新玩家出生点适配）均经 IPC 到 region；
-   命令方块被红石供电后经 COMMAND_EXECUTE 交回 core 以控制台身份执行。
+   （BLOCK_RAYCAST）、地表高度（SURFACE_QUERY，新玩家出生点适配）、维度切换目的端
+   生成返回传送门（PORTAL_CREATE）均经 IPC 到 region；命令方块被红石供电后经
+   COMMAND_EXECUTE 交回 core 以控制台身份执行。
 8. **全局时间/天气由 core 管理**：receiver 线程每秒推进 core 全局时间（`doDaylightCycle`）
    与天气（`doWeatherCycle`）并广播 `TIME_UPDATE`/`WEATHER_UPDATE` 给所有 region；
    region 不再各自推进，只把收到的状态广播给各自玩家（跨区域一致）。`/time`、

@@ -72,12 +72,24 @@ impl WeatherState {
     }
 
     /// 应用 core 同步的完整天气状态（含梯度）；返回晴雨是否切换。
-    pub const fn apply_from_core(&mut self, raining: bool, thundering: bool, rain: f32, thunder: f32) -> bool {
+    pub const fn apply_from_core(
+        &mut self,
+        raining: bool,
+        thundering: bool,
+        rain: f32,
+        thunder: f32,
+    ) -> bool {
         let toggled = raining != self.raining;
         self.raining = raining;
         self.thundering = thundering;
         // clamp 手动实现（保持 const fn 兼容）
-        self.rain_gradient = if rain < 0.0 { 0.0 } else if rain > 1.0 { 1.0 } else { rain };
+        self.rain_gradient = if rain < 0.0 {
+            0.0
+        } else if rain > 1.0 {
+            1.0
+        } else {
+            rain
+        };
         self.thunder_gradient = if thunder < 0.0 {
             0.0
         } else if thunder > 1.0 {
@@ -131,7 +143,8 @@ impl WeatherState {
                         thundering = !thundering;
                     }
                 } else if thundering {
-                    self.thunder_time = Self::random_duration(THUNDER_MIN, THUNDER_MAX, 0xA5A5_5A5A);
+                    self.thunder_time =
+                        Self::random_duration(THUNDER_MIN, THUNDER_MAX, 0xA5A5_5A5A);
                 } else {
                     self.thunder_time =
                         Self::random_duration(CLEAR_THUNDER_MIN, CLEAR_THUNDER_MAX, 0x5A5A_A5A5);
@@ -192,8 +205,8 @@ pub const GAME_EVENT_THUNDER_GRADIENT: u8 = 8;
 #[cfg(test)]
 mod tests {
     use super::{
-        WeatherState, GAME_EVENT_RAIN_GRADIENT, GAME_EVENT_RAIN_STARTED,
-        GAME_EVENT_RAIN_STOPPED, GAME_EVENT_THUNDER_GRADIENT,
+        GAME_EVENT_RAIN_GRADIENT, GAME_EVENT_RAIN_STARTED, GAME_EVENT_RAIN_STOPPED,
+        GAME_EVENT_THUNDER_GRADIENT, WeatherState,
     };
 
     #[test]

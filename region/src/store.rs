@@ -120,21 +120,26 @@ impl ChunkStore {
 
     /// 校验区块归属。
     const fn check_owned(&self, face: Face, cx: i32, cz: i32) -> Result<(), StoreError> {
+        if self.owns(face, cx, cz) {
+            Ok(())
+        } else {
+            Err(StoreError::NotOwned(
+                match face {
+                    Face::Overworld => "overworld",
+                    Face::Nether => "nether",
+                },
+                cx,
+                cz,
+            ))
+        }
+    }
+
+    /// 区块是否属于本区域（主世界 32×32 / 地狱 4×4）。
+    #[must_use]
+    pub const fn owns(&self, face: Face, cx: i32, cz: i32) -> bool {
         match face {
-            Face::Overworld => {
-                if cx >> 5 == self.id.rx && cz >> 5 == self.id.rz {
-                    Ok(())
-                } else {
-                    Err(StoreError::NotOwned("overworld", cx, cz))
-                }
-            }
-            Face::Nether => {
-                if cx >> 2 == self.id.rx && cz >> 2 == self.id.rz {
-                    Ok(())
-                } else {
-                    Err(StoreError::NotOwned("nether", cx, cz))
-                }
-            }
+            Face::Overworld => cx >> 5 == self.id.rx && cz >> 5 == self.id.rz,
+            Face::Nether => cx >> 2 == self.id.rx && cz >> 2 == self.id.rz,
         }
     }
 
@@ -265,8 +270,14 @@ impl ChunkStore {
             if crate::fluids::is_fluid(state_id) || crate::fluids::is_fluid(old_state) {
                 self.fluid_dirty.insert((cx, cz));
             }
-            if crate::redstone::is_redstone_block(state_id) {
-                self.redstone_dirty.insert((cx, cz));
+            // 红石：旧/新状态任一为红石方块都重新计算——拆除电源/导线也必须
+            // 触发相邻导线重新求值（旧实现只查新状态，拆掉红石块后导线永远
+            // 保持点亮，红石“不传导/无法熄灭”）。同时标记正交邻接区块：
+            // 电源在邻区时本区导线也要更新（跨区块传导）。
+            if crate::redstone::is_redstone_block(state_id)
+                || crate::redstone::is_redstone_block(old_state)
+            {
+                self.mark_redstone_region(cx, cz);
             }
             // 维护命令方块位置表（tick_command_blocks 增量遍历）
             if is_command_block(state_id) {
@@ -322,9 +333,15 @@ impl ChunkStore {
         chunks
     }
 
-    /// 重新标记区块含红石（功率传播未稳定时由 `tick_redstone` 调回）。
-    pub fn mark_redstone_dirty(&mut self, cx: i32, cz: i32) {
+    /// 标记区块及其正交邻接区块含红石（红石功率跨区块传播：电源在邻区时
+    /// 本区导线也需重新计算；仅标记本区域拥有的区块）。
+    pub fn mark_redstone_region(&mut self, cx: i32, cz: i32) {
         self.redstone_dirty.insert((cx, cz));
+        for (nx, nz) in [(cx + 1, cz), (cx - 1, cz), (cx, cz + 1), (cx, cz - 1)] {
+            if self.owns(Face::Overworld, nx, nz) {
+                self.redstone_dirty.insert((nx, nz));
+            }
+        }
     }
 
     /// 读取方块实体 NBT（不存在返回 `None`）。
@@ -334,13 +351,7 @@ impl ChunkStore {
     }
 
     /// 写入方块实体 NBT（`/data merge block` 与命令方块命令）。
-    pub fn set_block_entity(
-        &mut self,
-        x: i32,
-        y: i32,
-        z: i32,
-        nbt: icbm_mc_767::nbt::Nbt,
-    ) {
+    pub fn set_block_entity(&mut self, x: i32, y: i32, z: i32, nbt: icbm_mc_767::nbt::Nbt) {
         self.block_entities.insert((x, y, z), nbt);
     }
 
@@ -509,6 +520,44 @@ pub const fn gen_dimension(dim_byte: u8) -> GenDimension {
     } else {
         GenDimension::Overworld
     }
+}
+
+/// 从磁盘只读读取指定区域（已卸载）的某个区块并构建网络载荷。
+///
+/// 返回 `Ok(None)`：文件不存在 / 区块不存在 / 文件被活动 region 独占锁占用
+/// （此时应改用进程内请求）。供 core 在玩家视野覆盖**已卸载** region 时直读
+/// 其 .mca（对照 README「卸载的 region 可被 core 只读打开读取地图」）。
+/// 活动（含沉睡）region 必须由进程内请求服务——其内存态可能比 .mca 新。
+pub fn read_chunk_payload_from_disk(
+    world_dir: &Path,
+    rx: i32,
+    rz: i32,
+    cx: i32,
+    cz: i32,
+) -> Result<Option<Vec<u8>>, StoreError> {
+    use icbm_anvil::region_file::{RegionFile, RegionFileError, chunk_index, local_coord};
+    let path = world_dir.join("region").join(format!("r.{rx}.{rz}.mca"));
+    let mut file = match RegionFile::open_readonly(&path) {
+        Ok(file) => file,
+        Err(RegionFileError::Io(err)) if err.kind() == std::io::ErrorKind::NotFound => {
+            return Ok(None); // 区域从未生成：由调用方 flat 兑底
+        }
+        Err(RegionFileError::Locked) => return Ok(None), // 区域仍存活：改用进程内请求
+        Err(err) => return Err(err.into()),
+    };
+    let index = chunk_index(local_coord(cx), local_coord(cz));
+    let Some(nbt) = file.read_chunk(index)? else {
+        return Ok(None);
+    };
+    Ok(Some(build_network_chunk(&chunk_from_anvil(&nbt))))
+}
+
+/// 生成 flat 网络载荷（覆盖“区域从未生成/区块缺失”时的兑底；与 region 内存
+/// 生成一致——确定性地形，固定种子可复现）。
+#[must_use]
+pub fn generate_chunk_payload(dim: u8, cx: i32, cz: i32) -> Vec<u8> {
+    let column = generate_chunk(gen_dimension(dim), cx, cz);
+    build_network_chunk(&column)
 }
 
 /// 是否命令方块状态（普通 7906..=7917 / 循环 12515..=12526 / 连锁 12527..=12538）。

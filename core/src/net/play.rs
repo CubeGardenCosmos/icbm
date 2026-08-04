@@ -22,6 +22,7 @@ use tracing::{debug, info, warn};
 
 use crate::client::{Client, NetError, Position};
 use crate::server::Server;
+use crate::server::forward_chunk_to_pending;
 use crate::world::ChunkPending;
 
 /// Y>400 虚拟区：该高度活动不加载/不模拟任何 region（core 接管，对照 README
@@ -69,27 +70,7 @@ pub fn load_initial_chunks(server: &Server, client: &Arc<Client>) -> Result<(), 
     server.ensure_region(region_id)?;
 
     let radius = effective_view_distance(server);
-    let side = 2 * radius + 1;
-    let total = usize::try_from(side).expect("radius").pow(2);
-
-    {
-        let mut world = server.world.lock().expect("world lock");
-        let _ = world.chunk_pending.insert(ChunkPending {
-            player: *client.uuid.lock().expect("uuid"),
-            total,
-            received: 0,
-            in_batch: false,
-            min_x: chunk_x - radius,
-            max_x: chunk_x + radius,
-            min_z: chunk_z - radius,
-            max_z: chunk_z + radius,
-        });
-    }
-    server.ipc.send(
-        &region_id.service_name(),
-        icbm_region::protocol::kind::CHUNK_REQUEST,
-        &encode_chunk_request(DIM_OVERWORLD, chunk_x, chunk_z, radius),
-    )?;
+    request_view_chunks(server, client, chunk_x, chunk_z, radius);
 
     // 通知 region 玩家进入
     server.notify_player_enter(client, &region_id)?;
@@ -136,6 +117,57 @@ pub fn request_chunks_around(
     server.ensure_region(region_id)?;
 
     let radius = effective_view_distance(server);
+    // 先更新区块缓存中心并通知客户端，再发起视野请求：core 直读已卸载
+    // region .mca 的区块在请求路径内同步转发，若后发 center 会先于
+    // center 到达（客户端按 center 消费会吃掉批次开始）。
+    *client.chunk_center.lock().expect("chunk center") = (chunk_x, chunk_z);
+    client.send_encoded(
+        icbm_mc_767::packets::play_ids::CLIENTBOUND_SET_CHUNK_CACHE_CENTER,
+        |w| {
+            icbm_mc_767::packets::play::clientbound::CSetChunkCacheCenter { chunk_x, chunk_z }
+                .encode(w);
+        },
+    )?;
+    request_view_chunks(server, client, chunk_x, chunk_z, radius);
+    Ok(())
+}
+
+/// 视野方块 [cx±radius, cz±radius] 覆盖的全部主世界 region（去重）。
+///
+/// 主世界 region = 32×32 区块；可视半径 8 时最多覆盖 2×2 = 4 个 region。
+#[must_use]
+fn covering_regions(cx: i32, cz: i32, radius: i32) -> Vec<RegionId> {
+    let (min_rx, max_rx) = ((cx - radius) >> 5, (cx + radius) >> 5);
+    let (min_rz, max_rz) = ((cz - radius) >> 5, (cz + radius) >> 5);
+    let mut regions = Vec::with_capacity(4);
+    for rx in min_rx..=max_rx {
+        for rz in min_rz..=max_rz {
+            regions.push(RegionId { rx, rz });
+        }
+    }
+    regions
+}
+
+/// 向视野覆盖的全部 region 请求区块（“区域切换显示”修复核心）。
+///
+/// - **存活 region（含沉睡）**：core 向其发送 `CHUNK_REQUEST`；region 的
+///   `serve_chunks` 只回其拥有的区块（不再把邻区区块以 flat 生成覆盖，避免
+///   覆盖客户端已有的真实地形）。沉睡 region 仍在 `tick_sleeping` 中
+///   `drain_messages`，可以继续传输地图数据。
+/// - **已卸载 region**：core 只读打开其 .mca（卸载 flush 后已落盘）直接转发；
+///   区块缺失（从未生成）用 flat 生成兜底（与 region 内存生成一致）。
+///
+/// 每块区块恰好由一个提供方服务；`ChunkPending` 的总数仍为 `(2r+1)^2`。
+/// 各提供方的错误（发送失败/读 .mca 失败）都在内部降级（改读 .mca / flat
+/// 兜底），不向上传播——请求永不失败，失败只会导致部分区块晚到。
+fn request_view_chunks(
+    server: &Server,
+    client: &Arc<Client>,
+    chunk_x: i32,
+    chunk_z: i32,
+    radius: i32,
+) {
+    let radius = radius.clamp(2, 32);
     let side = 2 * radius + 1;
     let total = usize::try_from(side).expect("radius").pow(2);
     {
@@ -151,20 +183,77 @@ pub fn request_chunks_around(
             max_z: chunk_z + radius,
         });
     }
-    server.ipc.send(
-        &region_id.service_name(),
-        icbm_region::protocol::kind::CHUNK_REQUEST,
-        &encode_chunk_request(DIM_OVERWORLD, chunk_x, chunk_z, radius),
-    )?;
-    *client.chunk_center.lock().expect("chunk center") = (chunk_x, chunk_z);
-    client.send_encoded(
-        icbm_mc_767::packets::play_ids::CLIENTBOUND_SET_CHUNK_CACHE_CENTER,
-        |w| {
-            icbm_mc_767::packets::play::clientbound::CSetChunkCacheCenter { chunk_x, chunk_z }
-                .encode(w);
-        },
-    )?;
-    Ok(())
+    let world_dir = server.world.lock().expect("world lock").world_dir.clone();
+    let mut unloaded: Vec<RegionId> = Vec::new();
+    for id in covering_regions(chunk_x, chunk_z, radius) {
+        let alive = server
+            .world
+            .lock()
+            .expect("world lock")
+            .regions
+            .get(&id)
+            .is_some_and(|entry| entry.alive);
+        if alive {
+            let send_ok = server
+                .ipc
+                .send(
+                    &id.service_name(),
+                    icbm_region::protocol::kind::CHUNK_REQUEST,
+                    &icbm_region::protocol::encode_chunk_request(
+                        icbm_region::protocol::DIM_OVERWORLD,
+                        chunk_x,
+                        chunk_z,
+                        radius,
+                    ),
+                )
+                .is_ok();
+            if send_ok {
+                continue;
+            }
+            warn!(
+                id = %id.service_name(),
+                "chunk request to live region failed, falling back to .mca read"
+            );
+        }
+        unloaded.push(id);
+    }
+    // 已卸载 region：core 只读直读 .mca（或 flat 兜底）并转发
+    for id in unloaded {
+        serve_unloaded_region(server, client, id, chunk_x, chunk_z, radius, &world_dir);
+    }
+}
+
+/// core 直读已卸载 region 的 .mca：把该 region 与视野方块交集内的每个区块
+/// 转发给等待玩家。区块缺失（从未生成）或读取出错时用 flat 生成兜底
+/// （与 region 内存生成一致，固定种子可复现）。
+fn serve_unloaded_region(
+    server: &Server,
+    client: &Arc<Client>,
+    id: RegionId,
+    cx: i32,
+    cz: i32,
+    radius: i32,
+    world_dir: &std::path::Path,
+) {
+    use icbm_region::protocol::DIM_OVERWORLD;
+    use icbm_region::store::{generate_chunk_payload, read_chunk_payload_from_disk};
+    let (min_x, max_x) = (
+        (id.rx * 32).max(cx - radius),
+        (id.rx * 32 + 31).min(cx + radius),
+    );
+    let (min_z, max_z) = (
+        (id.rz * 32).max(cz - radius),
+        (id.rz * 32 + 31).min(cz + radius),
+    );
+    for x in min_x..=max_x {
+        for z in min_z..=max_z {
+            let payload = match read_chunk_payload_from_disk(world_dir, id.rx, id.rz, x, z) {
+                Ok(Some(payload)) => payload,
+                Ok(None) | Err(_) => generate_chunk_payload(DIM_OVERWORLD, x, z),
+            };
+            forward_chunk_to_pending(server, client, x, z, &payload);
+        }
+    }
 }
 
 /// 预拉相邻 region：拉起周边 3×3 子 region 并请求少量区块（半径 0）让地形
@@ -312,7 +401,10 @@ pub fn handle_play_packet(
                 pos.yaw = packet.yaw;
                 pos.pitch = packet.pitch;
             })?;
-            *client.last_barrier_check.lock().expect("last barrier check") = Instant::now();
+            *client
+                .last_barrier_check
+                .lock()
+                .expect("last barrier check") = Instant::now();
         }
         play_ids::SERVERBOUND_PLAYER_ACTION => {
             let packet = SPlayerAction::decode(reader)?;
@@ -327,8 +419,7 @@ pub fn handle_play_packet(
             let _ = icbm_mc_767::packets::play::serverbound::SPlayerAbilities::decode(reader)?;
         }
         play_ids::SERVERBOUND_USE_ITEM_ON => {
-            let packet =
-                icbm_mc_767::packets::play::serverbound::SUseItemOn::decode(reader)?;
+            let packet = icbm_mc_767::packets::play::serverbound::SUseItemOn::decode(reader)?;
             handle_use_item_on(server, client, &packet)?;
         }
         play_ids::SERVERBOUND_USE_ITEM => {
@@ -336,13 +427,23 @@ pub fn handle_play_packet(
             handle_use_item_ender_pearl(server, client)?;
         }
         play_ids::SERVERBOUND_SET_CREATIVE_MODE_SLOT => {
-            let packet = icbm_mc_767::packets::play::serverbound::SSetCreativeModeSlot::decode(
-                reader,
-            )?;
+            let packet =
+                icbm_mc_767::packets::play::serverbound::SSetCreativeModeSlot::decode(reader)?;
             handle_set_creative_slot(client, &packet);
         }
         play_ids::SERVERBOUND_SET_CARRIED_ITEM => {
-            let _ = icbm_mc_767::packets::play::serverbound::SSetCarriedItem::decode(reader)?;
+            // 选中热栏槽（0..8）：手持物品 = 热栏对应槽（若有物品）。
+            // 旧实现直接丢弃该包，真实客户端（创造/生存）放置方块永远
+            // 没有手持物品（红石无法激活根因）。
+            let packet = icbm_mc_767::packets::play::serverbound::SSetCarriedItem::decode(reader)?;
+            client.carried_slot.store(packet.slot, Ordering::Relaxed);
+            let item = {
+                let hotbar = client.hotbar.lock().expect("hotbar");
+                hotbar
+                    .get(usize::try_from(packet.slot).unwrap_or(usize::MAX))
+                    .and_then(Clone::clone)
+            };
+            *client.held_item.lock().expect("held item") = item;
         }
         play_ids::SERVERBOUND_PLAYER_COMMAND => {
             let _ = icbm_mc_767::packets::play::serverbound::SPlayerCommand::decode(reader)?;
@@ -521,7 +622,10 @@ fn update_position(
             >= Duration::from_millis(250)
     {
         check_barrier_blocked(server, client, region, uuid)?;
-        *client.last_barrier_check.lock().expect("last barrier check") = Instant::now();
+        *client
+            .last_barrier_check
+            .lock()
+            .expect("last barrier check") = Instant::now();
     }
     // 传送门检测（节流：约每 0.5 秒一次，避免每 tick 查询 region）
     check_portal_entry(server, client)?;
@@ -546,7 +650,9 @@ fn check_barrier_blocked(
             position.z.floor() as i32,
         )
     };
-    client.barrier_query_pending.store(true, std::sync::atomic::Ordering::Relaxed);
+    client
+        .barrier_query_pending
+        .store(true, std::sync::atomic::Ordering::Relaxed);
     server.ipc.send(
         &region.service_name(),
         icbm_region::protocol::kind::BLOCK_QUERY,
@@ -560,7 +666,9 @@ fn check_barrier_blocked(
     // 等待响应（receiver 线程路由到 pending_barrier_state）
     let deadline = Instant::now() + Duration::from_millis(300);
     let state = loop {
-        let value = client.pending_barrier_state.load(std::sync::atomic::Ordering::Relaxed);
+        let value = client
+            .pending_barrier_state
+            .load(std::sync::atomic::Ordering::Relaxed);
         if value != -1 {
             break value;
         }
@@ -573,7 +681,9 @@ fn check_barrier_blocked(
     client
         .pending_barrier_state
         .store(-1, std::sync::atomic::Ordering::Relaxed);
-    client.barrier_query_pending.store(false, std::sync::atomic::Ordering::Relaxed);
+    client
+        .barrier_query_pending
+        .store(false, std::sync::atomic::Ordering::Relaxed);
     if state != icbm_mc_767::packets::play::block_state_ids::BARRIER {
         // 位置合法：记录为回退基准
         *client.last_valid_position.lock().expect("last valid") =
@@ -623,7 +733,9 @@ pub fn adjust_spawn_to_surface(server: &Server, client: &Arc<Client>) -> Result<
     };
     let region = icbm_region::RegionId::from_overworld_block(sx, sz);
     server.ensure_region(region)?;
-    client.surface_query_pending.store(true, std::sync::atomic::Ordering::Relaxed);
+    client
+        .surface_query_pending
+        .store(true, std::sync::atomic::Ordering::Relaxed);
     server.ipc.send(
         &region.service_name(),
         icbm_region::protocol::kind::SURFACE_QUERY,
@@ -641,7 +753,9 @@ pub fn adjust_spawn_to_surface(server: &Server, client: &Arc<Client>) -> Result<
         std::thread::sleep(Duration::from_millis(5));
     };
     client.pending_surface.lock().expect("surface").take();
-    client.surface_query_pending.store(false, std::sync::atomic::Ordering::Relaxed);
+    client
+        .surface_query_pending
+        .store(false, std::sync::atomic::Ordering::Relaxed);
     let mut position = client.position.lock().expect("position");
     position.x = f64::from(sx) + 0.5;
     position.y = f64::from(surface);
@@ -655,7 +769,21 @@ pub fn adjust_spawn_to_surface(server: &Server, client: &Arc<Client>) -> Result<
 /// 查询玩家脚下方块（经 IPC 到所在 region）；传送门方块触发 1:8 缩放传送。
 fn check_portal_entry(server: &Server, client: &Arc<Client>) -> Result<(), NetError> {
     // 节流：每 10 tick（0.5 秒）查询一次
-    if client.last_portal_check.lock().expect("portal check").elapsed()
+    if client
+        .last_portal_check
+        .lock()
+        .expect("portal check")
+        .elapsed()
+        < Duration::from_millis(500)
+    {
+        return Ok(());
+    }
+    // 维度切换冷却（10 tick = 0.5s）：刚传送完成不立即重入
+    if client
+        .last_portal_switch
+        .lock()
+        .expect("portal switch")
+        .elapsed()
         < Duration::from_millis(500)
     {
         return Ok(());
@@ -670,27 +798,43 @@ fn check_portal_entry(server: &Server, client: &Arc<Client>) -> Result<(), NetEr
     if !in_region {
         return Ok(()); // 虚拟区（Y>400）不检测
     }
+    let dimension = client.dimension.load(Ordering::Relaxed);
     let (bx, by, bz) = {
         let position = client.position.lock().expect("position");
-        (position.x.floor() as i32, position.y.floor() as i32, position.z.floor() as i32)
+        (
+            position.x.floor() as i32,
+            position.y.floor() as i32,
+            position.z.floor() as i32,
+        )
     };
-    let region_id = RegionId::from_overworld_chunk(bx.div_euclid(16), bz.div_euclid(16));
+    // 按当前维度查询：主世界查主世界面；地狱查地狱面（地狱坐标 ≠ 主世界坐标，
+    // 旧实现恒用主世界面导致地狱内的返回传送门永远检测不到）
+    let (dim_byte, region_id) = if dimension == 1 {
+        (
+            icbm_region::protocol::DIM_NETHER,
+            icbm_region::RegionId::from_nether_chunk(bx.div_euclid(16), bz.div_euclid(16)),
+        )
+    } else {
+        (
+            icbm_region::protocol::DIM_OVERWORLD,
+            icbm_region::RegionId::from_overworld_chunk(bx.div_euclid(16), bz.div_euclid(16)),
+        )
+    };
     // 置传送门查询标志（receiver 据此把响应路由到 pending_portal_block，
     // 不与屏障检测的 pending_barrier_state 混淆）
-    client.portal_query_pending.store(true, std::sync::atomic::Ordering::Relaxed);
-    // 查询脚下与脚下-1 方块
-    for probe_y in [by, by - 1] {
-        server.ipc.send(
-            &region_id.service_name(),
-            icbm_region::protocol::kind::BLOCK_QUERY,
-            &icbm_region::protocol::encode_block_query(
-                icbm_region::protocol::DIM_OVERWORLD,
-                bx,
-                probe_y,
-                bz,
-            ),
-        )?;
-    }
+    client
+        .portal_query_pending
+        .store(true, std::sync::atomic::Ordering::Relaxed);
+    // 只查询脚下方块一个探针：玩家站在传送门内部（2×3 开口）时脚下方块即为
+    // 传送门。旧实现同时查脚下与脚下-1 两次，两次响应都匹配路由
+    // `(py == y || py - 1 == y)`，与屏障检测（同样发 BLOCK_QUERY）并发时
+    // 第一个响应可能被 `barrier_query_pending` 抢先消费 → 传送门查询超时
+    // （“站入传送门不触发切换”）。单探针后每次查询恰好一个响应。
+    server.ipc.send(
+        &region_id.service_name(),
+        icbm_region::protocol::kind::BLOCK_QUERY,
+        &icbm_region::protocol::encode_block_query(dim_byte, bx, by, bz),
+    )?;
     // 等待响应（receiver 线程处理 BLOCK_QUERY_RESP 后设置标记）
     let deadline = Instant::now() + Duration::from_millis(200);
     let mut found = false;
@@ -708,14 +852,13 @@ fn check_portal_entry(server: &Server, client: &Arc<Client>) -> Result<(), NetEr
         return Ok(());
     }
     // 触发维度切换：主世界 → 地狱（1:8 缩放），地狱 → 主世界
-    let dimension = client.dimension.load(Ordering::Relaxed);
     let (nx, ny, nz) = if dimension == 0 {
         (bx as f64 / 8.0, by as f64, bz as f64 / 8.0)
     } else {
         (bx as f64 * 8.0, by as f64, bz as f64 * 8.0)
     };
     let target = u8::from(dimension == 0);
-    let result = switch_dimension(server, client, target, nx, ny, nz);
+    let result = switch_dimension(server, client, target, nx, nz);
     *client.last_portal_check.lock().expect("portal check") = Instant::now();
     result
 }
@@ -762,28 +905,57 @@ pub fn update_position_for_teleport(
 /// 维度切换（下界传送门）：`CRespawn` + 更新位置 + 重请求视野区块。
 ///
 /// 目标坐标按 1:8 缩放（主世界 ↔ 地狱）；`dimension` 为 0（主世界）或 1（地狱）。
+/// 目的端 Y 固定到该维度地表（主世界超平坦地表 -60 / 地狱顶部基岩之上 128），
+/// 并在落点生成一扇返回传送门（vanilla `PortalForcer.createPortal` 行为，
+/// 对照 README“进入时无传送门生成/激活失败”修复）；玩家传送到传送门内部
+/// 中心，走进即可返回原维度。
 pub fn switch_dimension(
     server: &Server,
     client: &Arc<Client>,
     dimension: u8,
     x: f64,
-    y: f64,
     z: f64,
 ) -> Result<(), NetError> {
     use icbm_mc_767::packets::play::clientbound::{CRespawn, PlayerSpawnData};
     use icbm_mc_767::packets::play::dimension_names;
     use icbm_mc_767::packets::play::dimension_type_ids;
+    use icbm_region::portal::{PortalAxis, portal_center};
     let current = client.dimension.load(Ordering::Relaxed);
     if current == dimension {
         return Ok(()); // 已在目标维度
     }
-    // 目标 Y 钳制到目标维度地表：主世界 → 超平坦地表；地狱 → 顶部基岩之上。
-    // 否则传送门在 -63 触发时会把玩家丢进地狱虚空（地狱 min_y=0）。
+    // 目标 Y 固定到目标维度地表（superflat：主世界 -60 / 地狱 128），避免
+    // 从另一维度返回时把源维度高度带过来（旧实现 `max` 保留源 Y，主世界
+    // 返回会落在 y=128 空中）。
     let (x, y, z) = if dimension == 1 {
-        (x, NETHER_SURFACE_FEET_Y.max(y), z)
+        (x, NETHER_SURFACE_FEET_Y, z)
     } else {
-        (x, OVERWORLD_SURFACE_FEET_Y.max(y), z)
+        (x, OVERWORLD_SURFACE_FEET_Y, z)
     };
+    // 目的端生成返回传送门（fire-and-forget；region 在落点周边建 4×5 框架并
+    // 填充传送门方块——没有返回传送门玩家将困在目的维度）
+    let (region_id, dim_byte) = if dimension == 1 {
+        (
+            icbm_region::RegionId::from_nether_block(x as i32, z as i32),
+            icbm_region::protocol::DIM_NETHER,
+        )
+    } else {
+        (
+            icbm_region::RegionId::from_overworld_block(x as i32, z as i32),
+            icbm_region::protocol::DIM_OVERWORLD,
+        )
+    };
+    server.ensure_region(region_id)?;
+    let _ = server.ipc.send(
+        &region_id.service_name(),
+        icbm_region::protocol::kind::PORTAL_CREATE,
+        &icbm_region::protocol::encode_portal_create(dim_byte, x as i32, y as i32, z as i32),
+    );
+    // 玩家传送到传送门内部中心（走进即可返回；中心与 region `create_portal`
+    // 的轴选择一致——确定性奇偶公式）
+    let axis = PortalAxis::from_pos(x as i32, z as i32);
+    let (px, py, pz) = portal_center(x as i32, y as i32, z as i32, axis);
+    let (x, y, z) = (f64::from(px), f64::from(py), f64::from(pz));
     // 更新服务端位置（先处理跨 region 迁移）
     update_position(server, client, |pos| {
         pos.x = x;
@@ -818,15 +990,21 @@ pub fn switch_dimension(
         respawn.encode(w);
     })?;
     client.dimension.store(dimension, Ordering::Relaxed);
-    // 位置同步
+    *client.last_portal_switch.lock().expect("portal switch") = Instant::now();
+    // 位置同步（yaw/pitch 先单次短锁取出，避免发送闭包内重复锁 position——
+    // 同一表达式两个临时 guard 会让 std Mutex 死锁，维度切换后连接线程挂死）
+    let (yaw, pitch) = {
+        let position = client.position.lock().expect("position");
+        (position.yaw, position.pitch)
+    };
     let teleport_id = client.next_teleport_id();
     client.send_encoded(CPlayerPosition::packet_id(), |w| {
         CPlayerPosition {
             x,
             y,
             z,
-            yaw: client.position.lock().expect("position").yaw,
-            pitch: client.position.lock().expect("position").pitch,
+            yaw,
+            pitch,
             flags: 0,
             teleport_id,
         }
@@ -930,14 +1108,21 @@ fn handle_use_item_on(
     let Some(item) = held else {
         return Ok(()); // 空手：不放置
     };
+    // 物品名 → 方块名（多数一致；红石粉物品注册键 `redstone` 对应方块
+    // `redstone_wire`，对照 vanilla `BlockItem` 注册）
+    let block = item_to_block_name(&item);
     // give 的物品名即方块名（stone/dirt 等）
-    let state_id = icbm_mc_767::registry::name_to_state_id(&format!("minecraft:{item}"));
+    let state_id = icbm_mc_767::registry::name_to_state_id(&format!("minecraft:{block}"));
     let Some(state_id) = state_id else {
         return Ok(());
     };
     // 放置位置：点击方块 + 面方向
     let (dx, dy, dz) = face_offset(packet.face);
-    let (bx, by, bz) = (packet.location.x + dx, packet.location.y + dy, packet.location.z + dz);
+    let (bx, by, bz) = (
+        packet.location.x + dx,
+        packet.location.y + dy,
+        packet.location.z + dz,
+    );
     // Y>400 虚拟区不放置
     if f64::from(by) > VIRTUAL_ZONE_MIN_Y {
         return Ok(());
@@ -972,6 +1157,20 @@ const fn face_offset(face: i32) -> (i32, i32, i32) {
     }
 }
 
+/// 物品名 → 可放置方块名（多数物品名即方块名；`redstone`（红石粉）对应
+/// 方块 `redstone_wire`——物品与方块的注册键不同名，对照 vanilla `BlockItem`）。
+/// 桶（`FluidItem`/`BucketItem`）放置的是对应流体方块：`water_bucket → water`、
+/// `lava_bucket → lava`（`LiquidBlock` 默认态 = 源块，level 0）。
+#[must_use]
+fn item_to_block_name(item: &str) -> String {
+    match item {
+        "redstone" => "redstone_wire".to_owned(),
+        "water_bucket" => "water".to_owned(),
+        "lava_bucket" => "lava".to_owned(),
+        other => other.to_owned(),
+    }
+}
+
 /// 使用末影珍珠：从眼睛位置沿视线方向射线检测（region 计算落点），
 /// 命中后直接传送（不加载区块、无实体投掷——对照需求“计算落点后直接传送”）。
 fn handle_use_item_ender_pearl(server: &Server, client: &Arc<Client>) -> Result<(), NetError> {
@@ -996,7 +1195,9 @@ fn handle_use_item_ender_pearl(server: &Server, client: &Arc<Client>) -> Result<
         icbm_region::RegionId::from_overworld_chunk(position.chunk_x(), position.chunk_z())
     };
     server.ensure_region(region)?;
-    client.raycast_pending.store(true, std::sync::atomic::Ordering::Relaxed);
+    client
+        .raycast_pending
+        .store(true, std::sync::atomic::Ordering::Relaxed);
     server.ipc.send(
         &region.service_name(),
         icbm_region::protocol::kind::BLOCK_RAYCAST,
@@ -1011,7 +1212,9 @@ fn handle_use_item_ender_pearl(server: &Server, client: &Arc<Client>) -> Result<
             break result;
         }
         if Instant::now() > deadline {
-            client.raycast_pending.store(false, std::sync::atomic::Ordering::Relaxed);
+            client
+                .raycast_pending
+                .store(false, std::sync::atomic::Ordering::Relaxed);
             break (false, 0.0, 0.0, 0.0);
         }
         std::thread::sleep(Duration::from_millis(5));
@@ -1030,11 +1233,43 @@ fn handle_use_item_ender_pearl(server: &Server, client: &Arc<Client>) -> Result<
     Ok(())
 }
 
-/// 创造模式物品栏槽位更新：记录主手（槽 0）物品为手持物品。
+/// 创造模式物品栏槽位更新：记录热栏（槽 36..44）物品为手持物品。
+///
+/// vanilla `SET_CREATIVE_MODE_SLOT` 的槽位是 `InventoryMenu` 槽号：
+/// 0=合成结果、1..4=合成格、5..8=防具、9..35=主包、**36..44=热栏**、45=副手
+/// （对照 `ServerGamePacketListenerImpl.handleSetCreativeModeSlot` 的
+/// `inventoryMenu.getSlot(slotNum)` 与客户端 `handleCreativeModeItemAdd(stack, 36+j)`）。
+/// 旧实现按槽 1..9 当热栏——真实客户端发送 36..44，热栏永不记录、`held_item`
+/// 恒 None，**任何方块/桶都无法放置**（红石/黑曜石框架/水桶的共同根因）。
+/// 热栏物品在 `SET_CARRIED_ITEM` 选中后作为手持物品。
 fn handle_set_creative_slot(
     client: &Arc<Client>,
     packet: &icbm_mc_767::packets::play::serverbound::SSetCreativeModeSlot,
 ) {
+    // 热栏：vanilla 槽 36..44（hotbar index 0..8）。槽 < 0 = 丢弃（光标，无槽位）。
+    let hotbar_slot = match packet.slot {
+        36..=44 => Some(packet.slot - 36),
+        // 兼容旧客户端/直接写槽号（1..9）的记录
+        1..=9 => Some(packet.slot - 1),
+        _ => None,
+    };
+    if let Some(index) = hotbar_slot {
+        let index = usize::try_from(index).unwrap_or(0);
+        let item = packet.stack.item.clone();
+        {
+            let mut hotbar = client.hotbar.lock().expect("hotbar");
+            if let Some(slot) = hotbar.get_mut(index) {
+                *slot = item;
+            }
+        }
+        if i32::from(index as i16) == client.carried_slot.load(Ordering::Relaxed) {
+            let hotbar = client.hotbar.lock().expect("hotbar");
+            (*client.held_item.lock().expect("held item"))
+                .clone_from(&hotbar.get(index).and_then(Clone::clone));
+        }
+        return;
+    }
+    // 槽 0：兼容旧客户端/直接写槽 0 的记录（保留原行为）
     if packet.slot == 0 {
         (*client.held_item.lock().expect("held item")).clone_from(&packet.stack.item);
     }
@@ -1080,7 +1315,10 @@ fn handle_player_command(server: &Server, client: &Arc<Client>, command: &str) {
             }
         }
         Some(Command::Help) => {
-            let _ = client.send_system_chat("可用命令: /about, /gamemode, /gamerule, /bmtool tps, /tp, /setblock, /fill, /give", false);
+            let _ = client.send_system_chat(
+                "可用命令: /about, /gamemode, /gamerule, /bmtool tps, /tp, /setblock, /fill, /give",
+                false,
+            );
         }
         Some(Command::About) => {
             let _ = client.send_system_chat(&about_message(), false);
@@ -1097,7 +1335,11 @@ fn handle_player_command(server: &Server, client: &Arc<Client>, command: &str) {
             let feedback = crate::console::apply_fill(server, from, to, &block);
             let _ = client.send_system_chat(&feedback, false);
         }
-        Some(Command::Give { target, item, count }) => {
+        Some(Command::Give {
+            target,
+            item,
+            count,
+        }) => {
             let feedback = crate::console::apply_give(server, &target, &item, count);
             let _ = client.send_system_chat(&feedback, false);
         }
@@ -1134,8 +1376,16 @@ fn handle_player_command(server: &Server, client: &Arc<Client>, command: &str) {
             path,
             nbt,
         }) => {
-            let feedback =
-                crate::console::apply_data(server, client, action, x, y, z, path.as_deref(), nbt.as_deref());
+            let feedback = crate::console::apply_data(
+                server,
+                client,
+                action,
+                x,
+                y,
+                z,
+                path.as_deref(),
+                nbt.as_deref(),
+            );
             let _ = client.send_system_chat(&feedback, false);
         }
         None => {}
@@ -1152,8 +1402,18 @@ fn handle_player_command(server: &Server, client: &Arc<Client>, command: &str) {
 /// 顶层命令名（minecraft 命名空间 + icbm 命名空间 `bmtool`；升序，与
 /// `command_suggestions` 的排序约定一致）。
 const TOP_LEVEL_COMMANDS: &[&str] = &[
-    "about", "ban", "bmtool", "enchant", "fill", "gamemode", "gamerule", "give", "help",
-    "setblock", "tp", "whitelist",
+    "about",
+    "ban",
+    "bmtool",
+    "enchant",
+    "fill",
+    "gamemode",
+    "gamerule",
+    "give",
+    "help",
+    "setblock",
+    "tp",
+    "whitelist",
 ];
 
 /// 构建客户端命令树（0x11 `CommandTreeS2CPacket`）。
@@ -1319,12 +1579,10 @@ fn command_suggestions(server: &Server, input: &str) -> (i32, i32, Vec<String>) 
             .collect(),
         ["gamerule", rule] => gamerule_value_suggestions(rule),
         ["bmtool"] => vec!["tps".to_owned()],
-        ["whitelist"] => {
-            vec!["on", "off", "add", "remove", "list"]
-                .into_iter()
-                .map(str::to_owned)
-                .collect()
-        }
+        ["whitelist"] => vec!["on", "off", "add", "remove", "list"]
+            .into_iter()
+            .map(str::to_owned)
+            .collect(),
         _ => Vec::new(),
     };
     candidates.retain(|candidate| candidate.starts_with(typing));

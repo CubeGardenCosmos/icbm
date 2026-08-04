@@ -182,10 +182,12 @@ pub const fn chunk_index(local_x: usize, local_z: usize) -> usize {
     (local_x << 5) | local_z
 }
 
-/// 已打开的 .mca region 文件（独占锁）。
+/// 已打开的 .mca region 文件（独占锁；`open_readonly` 为共享锁只读）。
 pub struct RegionFile {
     path: PathBuf,
     file: File,
+    /// 只读模式（`open_readonly`）：禁止 `write_chunk`/`flush`。
+    readonly: bool,
     /// 位置表（offset<<8|size，0 = 空）。
     locations: [u32; CHUNK_COUNT],
     /// 时间戳表。
@@ -205,7 +207,22 @@ impl RegionFile {
             .write(true)
             .open(&path)?;
         lock_exclusive(&file)?;
+        Self::from_file(path, file, false)
+    }
 
+    /// 只读打开（不存在返回 `Io(NotFound)`）并加**共享锁**。
+    ///
+    /// 供 core/邻区读取**已卸载** region 的 .mca（`LOCK_SH` 与活动 region 的
+    /// `LOCK_EX` 互斥：文件被持有独占锁时返回 `Locked`，调用方应视为
+    /// “区域仍存活、改用进程内请求”）。
+    pub fn open_readonly(path: impl AsRef<Path>) -> Result<Self, RegionFileError> {
+        let path = path.as_ref().to_path_buf();
+        let file = OpenOptions::new().read(true).open(&path)?;
+        lock_shared(&file)?;
+        Self::from_file(path, file, true)
+    }
+
+    fn from_file(path: PathBuf, file: File, readonly: bool) -> Result<Self, RegionFileError> {
         let mut locations = [0u32; CHUNK_COUNT];
         let mut timestamps = [0u32; CHUNK_COUNT];
         let mut header = [0u8; 2 * SECTOR_BYTES];
@@ -234,6 +251,7 @@ impl RegionFile {
         Ok(Self {
             path,
             file,
+            readonly,
             locations,
             timestamps,
             chunks: vec![None; CHUNK_COUNT],
@@ -267,8 +285,14 @@ impl RegionFile {
         ChunkNbt::from_bytes(&raw).map(Some).map_err(From::from)
     }
 
-    /// 写入区块 NBT（内存态，需 `flush` 落盘）。
+    /// 写入区块 NBT（内存态，需 `flush` 落盘；只读句柄拒绝）。
     pub fn write_chunk(&mut self, index: usize, chunk: &ChunkNbt) -> Result<(), RegionFileError> {
+        if self.readonly {
+            return Err(RegionFileError::Io(std::io::Error::new(
+                std::io::ErrorKind::PermissionDenied,
+                "region file opened read-only",
+            )));
+        }
         self.chunks[index] = Some(chunk.to_bytes()?);
         self.timestamps[index] = now_epoch_seconds();
         Ok(())
@@ -276,6 +300,9 @@ impl RegionFile {
 
     /// 删除区块（内存态）。
     pub fn delete_chunk(&mut self, index: usize) {
+        if self.readonly {
+            return;
+        }
         if let Some(slot) = self.chunks.get_mut(index) {
             *slot = None;
         }
@@ -340,8 +367,14 @@ impl RegionFile {
             .join(format!("c.{x}.{z}.mcc"))
     }
 
-    /// 落盘：按索引顺序 bump 分配扇区，整体重写头部与数据。
+    /// 落盘：按索引顺序 bump 分配扇区，整体重写头部与数据（只读句柄拒绝）。
     pub fn flush(&mut self) -> Result<(), RegionFileError> {
+        if self.readonly {
+            return Err(RegionFileError::Io(std::io::Error::new(
+                std::io::ErrorKind::PermissionDenied,
+                "region file opened read-only",
+            )));
+        }
         let mut sector_data: Vec<Vec<u8>> = Vec::new();
         let mut next_sector = 2usize;
         let mut locations = [0u32; CHUNK_COUNT];
@@ -414,6 +447,25 @@ impl Drop for RegionFile {
 fn lock_exclusive(file: &File) -> Result<(), RegionFileError> {
     use std::os::unix::io::AsRawFd;
     let ret = unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) };
+    if ret == 0 {
+        Ok(())
+    } else {
+        match std::io::Error::last_os_error().kind() {
+            std::io::ErrorKind::WouldBlock | std::io::ErrorKind::Interrupted => {
+                Err(RegionFileError::Locked)
+            }
+            other => Err(RegionFileError::Io(std::io::Error::new(
+                other,
+                "flock failed",
+            ))),
+        }
+    }
+}
+
+/// 对文件加共享 flock（非阻塞；与独占锁互斥）。
+fn lock_shared(file: &File) -> Result<(), RegionFileError> {
+    use std::os::unix::io::AsRawFd;
+    let ret = unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_SH | libc::LOCK_NB) };
     if ret == 0 {
         Ok(())
     } else {
@@ -538,6 +590,39 @@ mod tests {
         let _first = RegionFile::open(&path).unwrap();
         let second = RegionFile::open(&path);
         assert!(second.is_err());
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn readonly_open_reads_but_locks_out_exclusive() {
+        let dir = std::env::temp_dir().join(format!("anvil-ro-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("r.0.0.mca");
+
+        // 写入一个区块后关闭（释放独占锁）
+        let mut file = RegionFile::open(&path).unwrap();
+        file.write_chunk(0, &sample_chunk(0, 0)).unwrap();
+        file.flush().unwrap();
+        drop(file);
+        // 只读句柄可读取；独占句柄被锁拒（模拟已卸载区域由 core 直读）
+        let mut ro = RegionFile::open_readonly(&path).unwrap();
+        assert!(ro.read_chunk(0).unwrap().is_some());
+        assert!(ro.write_chunk(0, &sample_chunk(0, 0)).is_err());
+        assert!(ro.flush().is_err());
+        let exclusive = RegionFile::open(&path);
+        assert!(
+            exclusive.is_err(),
+            "exclusive open must fail while read-only held"
+        );
+        drop(ro);
+        // 只读句柄释放后可独占
+        let exclusive = RegionFile::open(&path);
+        assert!(exclusive.is_ok());
+        // 独占句柄持有期间只读被锁拒（模拟活动 region 由进程内服务）
+        let ro = RegionFile::open_readonly(&path);
+        assert!(ro.is_err());
+        drop(exclusive);
+
         std::fs::remove_dir_all(&dir).unwrap();
     }
 }

@@ -17,8 +17,8 @@ use std::io::{self, Read, Write};
 
 use aes::Aes128;
 use aes::cipher::{Block, BlockEncrypt, KeyInit};
-use base64::engine::general_purpose::STANDARD as BASE64;
 use base64::Engine as _;
+use base64::engine::general_purpose::STANDARD as BASE64;
 use num_bigint::BigInt;
 use rsa::pkcs8::{DecodePublicKey, EncodePublicKey};
 use rsa::{Pkcs1v15Encrypt, RsaPrivateKey, RsaPublicKey};
@@ -255,6 +255,9 @@ pub struct ProfileProperty {
     pub name: String,
     /// base64 值。
     pub value: String,
+    /// 签名（Mojang 返回带签名；第三方认证服务器可能缺省）。
+    #[serde(default)]
+    pub signature: Option<String>,
 }
 
 impl GameProfile {
@@ -265,8 +268,7 @@ impl GameProfile {
     }
 }
 
-const MOJANG_SESSION_URL: &str =
-    "https://sessionserver.mojang.com/session/minecraft/hasJoined?username={username}&serverId={server_hash}";
+const MOJANG_SESSION_URL: &str = "https://sessionserver.mojang.com/session/minecraft/hasJoined?username={username}&serverId={server_hash}";
 
 /// 认证服务器地址（`ICBM_AUTH_URL` 可覆盖，支持 Drasl/Blessing Skin 等第三方；
 /// 占位符 `{username}`/`{server_hash}` 会被替换）。
@@ -280,10 +282,12 @@ fn auth_timeout() -> std::time::Duration {
         .ok()
         .and_then(|v| v.parse::<u64>().ok())
         .map_or(8_000, |ms| ms)
-        .max(500)
-        .min(30_000)
+        .clamp(500, 30_000)
         .checked_div(1_000)
-        .map_or(std::time::Duration::from_secs(8), std::time::Duration::from_secs)
+        .map_or(
+            std::time::Duration::from_secs(8),
+            std::time::Duration::from_secs,
+        )
 }
 
 /// 是否在 hasJoined 请求中附带客户端 IP（对应 vanilla `prevent-proxy-connections`，
@@ -292,7 +296,7 @@ fn auth_timeout() -> std::time::Duration {
 fn auth_send_client_ip() -> bool {
     matches!(
         std::env::var("ICBM_AUTH_SEND_IP").as_deref(),
-        Ok("1") | Ok("true")
+        Ok("1" | "true")
     )
 }
 

@@ -21,8 +21,8 @@ use crate::packets::play_ids::{
     CLIENTBOUND_REMOVE_ENTITIES, CLIENTBOUND_RESPAWN, CLIENTBOUND_SECTION_BLOCKS_UPDATE,
     CLIENTBOUND_SET_CHUNK_CACHE_CENTER, CLIENTBOUND_SET_CHUNK_CACHE_RADIUS,
     CLIENTBOUND_SET_DEFAULT_SPAWN_POSITION, CLIENTBOUND_SET_ENTITY_MOTION,
-    CLIENTBOUND_SET_EXPERIENCE, CLIENTBOUND_SET_HEALTH, CLIENTBOUND_SET_TIME,
-    CLIENTBOUND_SOUND, CLIENTBOUND_SOUND_ENTITY, CLIENTBOUND_SYSTEM_CHAT, CLIENTBOUND_UPDATE_TAGS,
+    CLIENTBOUND_SET_EXPERIENCE, CLIENTBOUND_SET_HEALTH, CLIENTBOUND_SET_TIME, CLIENTBOUND_SOUND,
+    CLIENTBOUND_SOUND_ENTITY, CLIENTBOUND_SYSTEM_CHAT, CLIENTBOUND_UPDATE_TAGS,
 };
 
 /// 区块 section 的网络数据（4096 个方块状态 ID + 64 个生物群系 ID）。
@@ -778,13 +778,26 @@ impl CPlayerAbilities {
     }
 }
 
-/// 玩家信息条目（Phase 1 固定发送 `ADD_PLAYER` + `GAME_MODE` + `LISTED` + `LATENCY`）。
-#[derive(Debug, Clone)]
+/// 玩家 profile 属性（`textures` 等；皮肤/披风纹理地址，base64 值）。
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct ProfileProperty {
+    /// 属性名（如 `textures`）。
+    pub name: String,
+    /// base64 值。
+    pub value: String,
+    /// 签名（可空；正版 Mojang 属性带签名，第三方认证服务器可能无）。
+    pub signature: Option<String>,
+}
+
+/// 玩家信息条目（`ADD_PLAYER | UPDATE_GAME_MODE | UPDATE_LISTED | UPDATE_LATENCY`）。
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct PlayerInfoEntry {
     /// 玩家 UUID。
     pub uuid: Uuid,
     /// 玩家名。
     pub name: String,
+    /// profile 属性（皮肤/披风纹理；客户端据此渲染皮肤）。
+    pub properties: Vec<ProfileProperty>,
     /// 游戏模式。
     pub game_mode: i32,
     /// 是否列入 Tab 列表。
@@ -801,7 +814,12 @@ pub struct CPlayerInfoUpdate {
 }
 
 impl CPlayerInfoUpdate {
-    /// 编码载荷（`ADD_PLAYER` | `UPDATE_GAME_MODE` | `UPDATE_LISTED` | `UPDATE_LATENCY`）。
+    /// 编码载荷（`ADD_PLAYER | UPDATE_GAME_MODE | UPDATE_LISTED | UPDATE_LATENCY`）。
+    ///
+    /// `ADD_PLAYER` 对照 vanilla `ClientboundPlayerInfoUpdatePacket.Action.ADD_PLAYER`
+    /// 与 `ByteBufCodecs.GAME_PROFILE_PROPERTIES`：名字 + 属性列表（每项
+    /// `name/value/signature?`）。属性缺失时客户端无法渲染皮肤（“皮肤不显示”
+    /// 根因）。
     pub fn encode(&self, writer: &mut Writer) {
         const FLAGS: u8 = 0x01 | 0x04 | 0x08 | 0x10;
         writer.write_u8(FLAGS);
@@ -810,7 +828,20 @@ impl CPlayerInfoUpdate {
             writer.write_uuid(&player.uuid);
             // ADD_PLAYER
             writer.write_string(&player.name);
-            writer.write_var_int(0); // 属性数量
+            writer.write_var_int(
+                i32::try_from(player.properties.len()).expect("properties exceed i32"),
+            );
+            for property in &player.properties {
+                writer.write_string(&property.name);
+                writer.write_string(&property.value);
+                match &property.signature {
+                    Some(signature) => {
+                        writer.write_bool(true);
+                        writer.write_string(signature);
+                    }
+                    None => writer.write_bool(false),
+                }
+            }
             // UPDATE_GAME_MODE
             writer.write_var_int(player.game_mode);
             // UPDATE_LISTED
@@ -1150,9 +1181,7 @@ impl CSectionBlocksUpdate {
         let z = self.section.z as i64 & 0x3FF_FFFF;
         let y = i64::from(self.section.y) & 0xFFF;
         writer.write_i64_be((x << 42) | (z << 20) | y);
-        writer.write_var_int(
-            i32::try_from(self.updates.len()).expect("updates exceed i32"),
-        );
+        writer.write_var_int(i32::try_from(self.updates.len()).expect("updates exceed i32"));
         for (pos, state) in &self.updates {
             let local_x = pos.x & 0xF;
             let local_y = pos.y & 0xF;
@@ -1561,7 +1590,8 @@ impl CExplosion {
         writer.write_f32_be(self.player_velocity[1]);
         writer.write_f32_be(self.player_velocity[2]);
         writer.write_var_int(self.destruction_type as i32);
-        let particle_id = crate::registry::particle_id(&self.particle).expect("unregistered particle");
+        let particle_id =
+            crate::registry::particle_id(&self.particle).expect("unregistered particle");
         writer.write_var_int(particle_id + 1);
         let emitter_id =
             crate::registry::particle_id(&self.emitter_particle).expect("unregistered particle");
@@ -1843,5 +1873,57 @@ mod tests {
         assert!(!r.read_bool().unwrap()); // reduced_debug_info
         assert!(r.read_bool().unwrap()); // enable_respawn_screen
         assert!(!r.read_bool().unwrap()); // limited_crafting
+    }
+
+    #[test]
+    fn player_info_update_encodes_profile_properties() {
+        // 皮肤链路：`ADD_PLAYER` 的属性列表按 `ByteBufCodecs.GAME_PROFILE_PROPERTIES`
+        // 编码（name/value/signature?）。属性缺失时客户端无法渲染皮肤。
+        let packet = CPlayerInfoUpdate {
+            players: vec![PlayerInfoEntry {
+                uuid: Uuid::from_u128(0x1122_3344_5566_7788_99aa_bbcc_ddee_ff00),
+                name: "skinplayer".to_owned(),
+                properties: vec![
+                    ProfileProperty {
+                        name: "textures".to_owned(),
+                        value: "base64tex".to_owned(),
+                        signature: Some("signed".to_owned()),
+                    },
+                    ProfileProperty {
+                        name: "no_signature".to_owned(),
+                        value: "v".to_owned(),
+                        signature: None,
+                    },
+                ],
+                game_mode: 0,
+                listed: true,
+                latency: 12,
+            }],
+        };
+        let mut w = Writer::new();
+        packet.encode(&mut w);
+        let bytes = w.into_bytes();
+        let mut r = Reader::new(&bytes);
+        assert_eq!(r.read_u8().unwrap(), 0x01 | 0x04 | 0x08 | 0x10); // ADD_PLAYER|GAME_MODE|LISTED|LATENCY
+        assert_eq!(r.read_var_int().unwrap(), 1); // 玩家数
+        assert_eq!(
+            r.read_uuid().unwrap(),
+            Uuid::from_u128(0x1122_3344_5566_7788_99aa_bbcc_ddee_ff00)
+        );
+        // ADD_PLAYER：名字 + 属性
+        assert_eq!(r.read_string().unwrap(), "skinplayer");
+        assert_eq!(r.read_var_int().unwrap(), 2);
+        assert_eq!(r.read_string().unwrap(), "textures");
+        assert_eq!(r.read_string().unwrap(), "base64tex");
+        assert!(r.read_bool().unwrap()); // signature 存在
+        assert_eq!(r.read_string().unwrap(), "signed");
+        assert_eq!(r.read_string().unwrap(), "no_signature");
+        assert_eq!(r.read_string().unwrap(), "v");
+        assert!(!r.read_bool().unwrap()); // 无签名
+        // 其余 action
+        assert_eq!(r.read_var_int().unwrap(), 0); // game_mode
+        assert!(r.read_bool().unwrap()); // listed
+        assert_eq!(r.read_var_int().unwrap(), 12); // latency
+        assert!(r.is_empty());
     }
 }

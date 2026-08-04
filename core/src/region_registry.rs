@@ -94,7 +94,10 @@ impl RegionRegistry {
     /// 全部 region ID。
     #[must_use]
     pub fn ids(&self) -> Vec<RegionId> {
-        self.entries.keys().map(|&(rx, rz)| RegionId { rx, rz }).collect()
+        self.entries
+            .keys()
+            .map(|&(rx, rz)| RegionId { rx, rz })
+            .collect()
     }
 
     /// 拉起 region 子进程（已存在则不重复拉起）。

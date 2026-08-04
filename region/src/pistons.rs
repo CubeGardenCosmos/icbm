@@ -69,7 +69,13 @@ pub const fn is_piston_head(state_id: i32) -> bool {
 #[must_use]
 pub const fn piston_head_facing(state_id: i32) -> usize {
     let f = (state_id - PISTON_HEAD_BASE) / 4;
-    (if f < 0 { 0 } else if f > 5 { 5 } else { f }) as usize
+    (if f < 0 {
+        0
+    } else if f > 5 {
+        5
+    } else {
+        f
+    }) as usize
 }
 
 /// 活塞头状态（`facing` 的子态 0 = 普通）。
@@ -152,25 +158,28 @@ pub fn tick_pistons(
     actions
 }
 
-/// 活塞是否被供电：相邻方块红石强度 ≥ 1，或正上方方块供电（QC 准连接）。
+/// 活塞是否被供电：相邻方块任一信号 > 0（`hasNeighborSignal`，含电源强信号
+/// 穿透导体），或正上方方块供电（QC 准连接）。
 fn is_powered(access: &mut impl BlockAccess, x: i32, y: i32, z: i32) -> bool {
-    let neighbors = [
-        (x + 1, y, z),
-        (x - 1, y, z),
-        (x, y, z + 1),
-        (x, y, z - 1),
-        (x, y + 1, z),
-        (x, y - 1, z),
-    ]
-    .into_iter()
-    .map(|(nx, ny, nz)| access.block_at(nx, ny, nz))
-    .collect::<Vec<_>>();
-    if crate::redstone::compute_wire_power(neighbors) >= 1 {
+    // 快照 ±2 范围：电源穿透导体需查两格（火把在下方方块之下）
+    let mut snapshot: HashMap<(i32, i32, i32), i32> = HashMap::new();
+    for dx in -2..=2 {
+        for dy in -2..=2 {
+            for dz in -2..=2 {
+                let key = (x + dx, y + dy, z + dz);
+                snapshot
+                    .entry(key)
+                    .or_insert_with(|| access.block_at(key.0, key.1, key.2));
+            }
+        }
+    }
+    if crate::redstone::neighbor_has_signal(&snapshot, x, y, z) {
         return true;
     }
     // QC：正上方方块是电源（红石块/点亮火把）或红石线有强度
-    let above = access.block_at(x, y + 1, z);
-    crate::redstone::is_power_source(above) || crate::redstone::wire_power(above) >= Some(1)
+    let above = snapshot.get(&(x, y + 1, z)).copied().unwrap_or(0);
+    crate::redstone::is_power_source(above)
+        || crate::redstone::wire_power(above).is_some_and(|p| p >= 1)
 }
 
 /// 伸出：把前方 ≤12 个可推方块整体前移 1 格，放置活塞头。
@@ -228,9 +237,7 @@ fn extend_piston(
         updates.push((dup_pos, dup_state));
     }
     // 链首置为活塞头
-    let head_pos = chain
-        .first()
-        .map_or((x + dx, y + dy, z + dz), |(p, _)| *p);
+    let head_pos = chain.first().map_or((x + dx, y + dy, z + dz), |(p, _)| *p);
     let head_state = piston_head_state(facing);
     access.set_block(head_pos.0, head_pos.1, head_pos.2, head_state);
     updates.push((head_pos, head_state));
@@ -338,7 +345,9 @@ mod tests {
         };
         // 活塞朝上（facing=1）位于 y=0，前方依次 stone, coral_fan
         let piston_pos = (0, 0, 0);
-        blocks.map.insert(piston_pos, piston_state(PISTON_BASE, 1, false));
+        blocks
+            .map
+            .insert(piston_pos, piston_state(PISTON_BASE, 1, false));
         blocks.map.insert((0, 1, 0), 1); // stone
         blocks.map.insert((0, 2, 0), 12_843); // coral fan
         blocks.map.insert((1, 0, 0), 9223); // 红石块供电
@@ -348,7 +357,10 @@ mod tests {
         assert_eq!(actions.len(), 1, "piston should extend once");
         // 伸出后布局：y=1 活塞头，y=2 stone，y=3 coral_fan（前移），
         // y=4 珊瑚扇副本（末端刷取）
-        assert_eq!(blocks.map.get(&(0, 1, 0)).copied(), Some(piston_head_state(1)));
+        assert_eq!(
+            blocks.map.get(&(0, 1, 0)).copied(),
+            Some(piston_head_state(1))
+        );
         assert_eq!(blocks.map.get(&(0, 2, 0)).copied(), Some(1));
         assert_eq!(blocks.map.get(&(0, 3, 0)).copied(), Some(12_843));
         assert_eq!(blocks.map.get(&(0, 4, 0)).copied(), Some(12_843));
@@ -360,7 +372,9 @@ mod tests {
             map: HashMap::new(),
         };
         let piston_pos = (5, 5, 5);
-        blocks.map.insert(piston_pos, piston_state(PISTON_BASE, 1, false));
+        blocks
+            .map
+            .insert(piston_pos, piston_state(PISTON_BASE, 1, false));
         let mut last = HashMap::new();
         let _ = tick_pistons(&[piston_pos], &mut last, &mut blocks);
         assert!(!last.get(&piston_pos).copied().unwrap_or(false));

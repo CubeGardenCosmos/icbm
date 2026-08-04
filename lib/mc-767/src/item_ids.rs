@@ -1346,7 +1346,6 @@ pub fn item_id(name: &str) -> Option<i32> {
     }
 }
 
-
 /// 网络 ID → 名字（`item_id` 的反向映射）。
 #[must_use]
 #[allow(clippy::too_many_lines)] // 生成表

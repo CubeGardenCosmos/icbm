@@ -75,6 +75,9 @@ pub mod kind {
     pub const BLOCK_RAYCAST: u8 = 0x14;
     /// R→C：射线命中响应（`[u8 hit][f64 x][f64 y][f64 z]`；未命中 hit=0）。
     pub const BLOCK_RAYCAST_RESP: u8 = 0x94;
+    /// C→R：维度切换目的端生成传送门（`[u8 dim][i32 x][i32 y][i32 z]`；
+    /// 玩家落点，region 在其周边建 4×5 框架并填充传送门方块）。
+    pub const PORTAL_CREATE: u8 = 0x17;
 }
 
 /// IPC 错误。
@@ -510,6 +513,30 @@ pub fn decode_portal_enter(body: &[u8]) -> Result<(Uuid, u8, i32, i32, i32), Ipc
     ))
 }
 
+/// `PORTAL_CREATE` 载荷：`[u8 dim][i32 x][i32 y][i32 z]`（玩家落点）。
+#[must_use]
+pub fn encode_portal_create(dim: u8, x: i32, y: i32, z: i32) -> Vec<u8> {
+    let mut out = Vec::with_capacity(13);
+    out.push(dim);
+    out.extend_from_slice(&x.to_le_bytes());
+    out.extend_from_slice(&y.to_le_bytes());
+    out.extend_from_slice(&z.to_le_bytes());
+    out
+}
+
+/// 解析 `PORTAL_CREATE` 载荷。
+pub fn decode_portal_create(body: &[u8]) -> Result<(u8, i32, i32, i32), IpcError> {
+    if body.len() < 13 {
+        return Err(IpcError::Length("portal create", body.len()));
+    }
+    Ok((
+        body[0],
+        i32::from_le_bytes(body[1..5].try_into().expect("slice")),
+        i32::from_le_bytes(body[5..9].try_into().expect("slice")),
+        i32::from_le_bytes(body[9..13].try_into().expect("slice")),
+    ))
+}
+
 /// `BLOCK_QUERY` 载荷：`[u8 dim][i32 x][i32 y][i32 z]`。
 #[must_use]
 pub fn encode_block_query(dim: u8, x: i32, y: i32, z: i32) -> Vec<u8> {
@@ -582,8 +609,7 @@ pub fn decode_gamerule_update(body: &[u8]) -> Result<(String, String), IpcError>
         return Err(IpcError::Length("gamerule update", body.len()));
     }
     let name = String::from_utf8_lossy(&body[1..=name_len]).into_owned();
-    let value =
-        String::from_utf8_lossy(&body[2 + name_len..2 + name_len + value_len]).into_owned();
+    let value = String::from_utf8_lossy(&body[2 + name_len..2 + name_len + value_len]).into_owned();
     Ok((name, value))
 }
 
@@ -620,14 +646,19 @@ pub fn decode_block_nbt_get(body: &[u8]) -> Result<(u8, i32, i32, i32), IpcError
 
 /// `BLOCK_NBT_RESP` 载荷：`[u8 dim][i32 x][i32 y][i32 z][u8 has][NBT]`。
 #[must_use]
-pub fn encode_block_nbt_resp(dim: u8, x: i32, y: i32, z: i32, nbt: Option<&icbm_mc_767::nbt::Nbt>) -> Vec<u8> {
+pub fn encode_block_nbt_resp(
+    dim: u8,
+    x: i32,
+    y: i32,
+    z: i32,
+    nbt: Option<&icbm_mc_767::nbt::Nbt>,
+) -> Vec<u8> {
     let mut out = encode_block_nbt_get(dim, x, y, z);
     match nbt {
         Some(nbt) => {
             out.push(1);
             let mut writer = icbm_mc_767::codec::Writer::new();
-            icbm_mc_767::nbt::encode_named(nbt, &mut writer)
-                .expect("block nbt must encode");
+            icbm_mc_767::nbt::encode_named(nbt, &mut writer).expect("block nbt must encode");
             out.extend_from_slice(&writer.into_bytes());
         }
         None => out.push(0),
@@ -636,7 +667,9 @@ pub fn encode_block_nbt_resp(dim: u8, x: i32, y: i32, z: i32, nbt: Option<&icbm_
 }
 
 /// 解析 `BLOCK_NBT_RESP` 载荷。
-pub fn decode_block_nbt_resp(body: &[u8]) -> Result<(u8, i32, i32, i32, Option<icbm_mc_767::nbt::Nbt>), IpcError> {
+pub fn decode_block_nbt_resp(
+    body: &[u8],
+) -> Result<(u8, i32, i32, i32, Option<icbm_mc_767::nbt::Nbt>), IpcError> {
     let (dim, x, y, z) = decode_block_nbt_get(body)?;
     let has = body.get(13).is_some_and(|&b| b != 0);
     if !has {
@@ -650,7 +683,13 @@ pub fn decode_block_nbt_resp(body: &[u8]) -> Result<(u8, i32, i32, i32, Option<i
 
 /// `BLOCK_NBT_SET` 载荷：`[u8 dim][i32 x][i32 y][i32 z][NBT]`。
 #[must_use]
-pub fn encode_block_nbt_set(dim: u8, x: i32, y: i32, z: i32, nbt: &icbm_mc_767::nbt::Nbt) -> Vec<u8> {
+pub fn encode_block_nbt_set(
+    dim: u8,
+    x: i32,
+    y: i32,
+    z: i32,
+    nbt: &icbm_mc_767::nbt::Nbt,
+) -> Vec<u8> {
     let mut out = encode_block_nbt_get(dim, x, y, z);
     let mut writer = icbm_mc_767::codec::Writer::new();
     icbm_mc_767::nbt::encode_named(nbt, &mut writer).expect("block nbt must encode");
@@ -659,7 +698,9 @@ pub fn encode_block_nbt_set(dim: u8, x: i32, y: i32, z: i32, nbt: &icbm_mc_767::
 }
 
 /// 解析 `BLOCK_NBT_SET` 载荷。
-pub fn decode_block_nbt_set(body: &[u8]) -> Result<(u8, i32, i32, i32, icbm_mc_767::nbt::Nbt), IpcError> {
+pub fn decode_block_nbt_set(
+    body: &[u8],
+) -> Result<(u8, i32, i32, i32, icbm_mc_767::nbt::Nbt), IpcError> {
     let (dim, x, y, z) = decode_block_nbt_get(body)?;
     let mut reader = icbm_mc_767::codec::Reader::new(&body[13..]);
     let nbt = icbm_mc_767::nbt::decode_named(&mut reader)
@@ -871,6 +912,13 @@ mod tests {
         let (decoded, dim, x, y, z) = decode_portal_enter(&body).unwrap();
         assert_eq!(decoded, uuid);
         assert_eq!((dim, x, y, z), (DIM_NETHER, 3, 64, -8));
+    }
+
+    #[test]
+    fn portal_create_round_trip() {
+        let body = encode_portal_create(DIM_OVERWORLD, -12, 64, 300);
+        let (dim, x, y, z) = decode_portal_create(&body).unwrap();
+        assert_eq!((dim, x, y, z), (DIM_OVERWORLD, -12, 64, 300));
     }
 
     #[test]

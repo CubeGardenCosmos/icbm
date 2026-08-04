@@ -10,6 +10,7 @@ use std::sync::atomic::{AtomicBool, AtomicI32, AtomicU8, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
+use crate::net::crypto::AesCfb8;
 use icbm_gameplay_minecraft::commands::GameMode;
 use icbm_mc_767::ConnectionState;
 use icbm_mc_767::codec::{Reader, Writer};
@@ -25,7 +26,6 @@ use icbm_mc_767::packets::play::clientbound::{
     CSetChunkCacheRadius, CSetDefaultSpawnPosition, PlayerInfoEntry,
 };
 use icbm_mc_767::packets::play_ids;
-use crate::net::crypto::AesCfb8;
 use icbm_mc_767::packets::status::{CPongResponse, CStatusResponse, SPingRequest, SStatusRequest};
 use icbm_mc_767::packets::status_ids;
 use icbm_region::{OVERWORLD_SURFACE_FEET_Y, RegionId};
@@ -171,6 +171,16 @@ pub struct Client {
     pub locale: Mutex<String>,
     /// 主手手持物品（`give`/创造模式设置；放置方块用）。
     pub held_item: Mutex<Option<String>>,
+    /// 热栏物品（槽 0..8；`SET_CREATIVE_MODE_SLOT` 槽 1..9 写入，`SET_CARRIED_ITEM`
+    /// 选中后作为手持物品）。
+    pub hotbar: Mutex<Vec<Option<String>>>,
+    /// 选中热栏槽（0..8；`SET_CARRIED_ITEM` 更新）。
+    pub carried_slot: AtomicI32,
+    /// 正版 profile 属性（`textures` 皮肤/披风；登录时从 Mojang 获取，
+    /// `PlayerInfoUpdate` 转发给客户端渲染）。
+    pub profile_properties: Mutex<Vec<icbm_mc_767::packets::play::clientbound::ProfileProperty>>,
+    /// 上次维度切换时间（传送门重入冷却，对照 vanilla `portalCooldown` 10 tick）。
+    pub last_portal_switch: Mutex<Instant>,
     /// 是否存活（连接可继续）。
     pub alive: AtomicBool,
     /// 待确认的 keep alive。
@@ -263,6 +273,10 @@ impl Client {
             dimension: AtomicU8::new(0),
             locale: Mutex::new(String::new()),
             held_item: Mutex::new(None),
+            hotbar: Mutex::new(vec![None; 9]),
+            carried_slot: AtomicI32::new(0),
+            profile_properties: Mutex::new(Vec::new()),
+            last_portal_switch: Mutex::new(Instant::now()),
             alive: AtomicBool::new(true),
             keep_alive: Mutex::new(None),
             teleport_id: AtomicI32::new(0),
@@ -461,7 +475,9 @@ impl Client {
     /// 记录一次位置更新并估算移动速度（方块/秒，3D 距离/间隔，EMA 平滑）。
     ///
     /// 间隔超出 [20ms, 2s] 视为传送/停滞：只更新基准不改变速度。
-    pub fn note_move(&self) {let now = Instant::now();        let position = *self.position.lock().expect("position");
+    pub fn note_move(&self) {
+        let now = Instant::now();
+        let position = *self.position.lock().expect("position");
         let mut last = self.last_move.lock().expect("last move");
         let dt = now.duration_since(last.1).as_secs_f64();
         if (0.02..=2.0).contains(&dt) {
@@ -851,14 +867,31 @@ fn handle_login_key(
             let ip = client.peer_ip();
             match crate::net::crypto::verify_session(&name, &hash, ip.as_deref()) {
                 Ok(profile) => {
-                    let uuid = profile.uuid().map_err(|_| {
-                        NetError::BadPacket("auth profile missing uuid")
-                    })?;
+                    let uuid = profile
+                        .uuid()
+                        .map_err(|_| NetError::BadPacket("auth profile missing uuid"))?;
                     *client.uuid.lock().expect("uuid") = uuid;
                     // 若 Mojang 返回的 name 与请求一致（大小写可不同），采用 profile 名
                     if !profile.name.is_empty() {
                         *client.name.lock().expect("name") = profile.name;
                     }
+                    // 保存 profile 属性（textures：皮肤/披风纹理），
+                    // `PlayerInfoUpdate` 时转发给客户端渲染
+                    let properties: Vec<_> = profile
+                        .properties
+                        .iter()
+                        .map(
+                            |p| icbm_mc_767::packets::play::clientbound::ProfileProperty {
+                                name: p.name.clone(),
+                                value: p.value.clone(),
+                                signature: p.signature.clone(),
+                            },
+                        )
+                        .collect();
+                    *client
+                        .profile_properties
+                        .lock()
+                        .expect("profile properties") = properties;
                     finish_login(server, client, uuid)?;
                 }
                 Err(err) => {
@@ -869,11 +902,11 @@ fn handle_login_key(
                             "{\"translate\":\"multiplayer.disconnect.unverified_username\"}"
                                 .to_owned()
                         }
-                        CE::Banned => "{\"translate\":\"multiplayer.disconnect.banned\"}"
-                            .to_owned(),
+                        CE::Banned => {
+                            "{\"translate\":\"multiplayer.disconnect.banned\"}".to_owned()
+                        }
                         CE::AuthRequest => {
-                            "{\"translate\":\"multiplayer.disconnect.authservers_down\"}"
-                                .to_owned()
+                            "{\"translate\":\"multiplayer.disconnect.authservers_down\"}".to_owned()
                         }
                         other => format!(
                             "{{\"text\":\"{}\"}}",
@@ -1076,7 +1109,11 @@ pub fn enter_play(server: &Server, client: &Arc<Client>) -> Result<(), NetError>
     };
     let ip = client.peer_ip().unwrap_or_else(|| "unknown".to_owned());
     let locale = client.locale.lock().expect("locale").clone();
-    let locale = if locale.is_empty() { "unknown".to_owned() } else { locale };
+    let locale = if locale.is_empty() {
+        "unknown".to_owned()
+    } else {
+        locale
+    };
     info!(
         name = %name,
         %uuid,
@@ -1152,14 +1189,21 @@ fn send_join_sequence(server: &Server, client: &Arc<Client>) -> Result<(), NetEr
     // 能力（按游戏模式）
     send_abilities(client)?;
 
-    // 玩家信息（加入 Tab）
+    // 玩家信息（加入 Tab；含正版 profile 属性——皮肤/披风纹理，
+    // 客户端据此渲染皮肤，对照 vanilla `ADD_PLAYER` + `GAME_PROFILE_PROPERTIES`）
     let latency = client.latency.load(Ordering::Relaxed);
     let gamemode = client.gamemode.lock().expect("gamemode").id();
+    let properties = client
+        .profile_properties
+        .lock()
+        .expect("profile properties")
+        .clone();
     client.send_encoded(CPlayerInfoUpdate::packet_id(), |w| {
         CPlayerInfoUpdate {
             players: vec![PlayerInfoEntry {
                 uuid: *client.uuid.lock().expect("uuid"),
                 name: client.name.lock().expect("name").clone(),
+                properties,
                 game_mode: i32::from(gamemode),
                 listed: true,
                 latency,
@@ -1283,10 +1327,7 @@ fn save_player_data(server: &Server, client: &Arc<Client>) {
     ]);
     pos.tag = icbm_mc_767::nbt::TagId::Double;
     root.insert("Pos", Nbt::List(Box::new(pos)));
-    let mut rot = NbtList::from_values(vec![
-        Nbt::Float(position.yaw),
-        Nbt::Float(position.pitch),
-    ]);
+    let mut rot = NbtList::from_values(vec![Nbt::Float(position.yaw), Nbt::Float(position.pitch)]);
     rot.tag = icbm_mc_767::nbt::TagId::Float;
     root.insert("Rotation", Nbt::List(Box::new(rot)));
     root.insert("Dimension", Nbt::String(dimension.to_owned()));

@@ -202,14 +202,14 @@ pub fn compute_explosion(
             }
         }
     }
-    ExplosionResult { affected_blocks: affected }
+    ExplosionResult {
+        affected_blocks: affected,
+    }
 }
 
 #[cfg(test)]
 mod tests {
-    use super::{
-        EntityManager, ExplosionResult, compute_explosion, entity_type_ids,
-    };
+    use super::{EntityManager, ExplosionResult, compute_explosion, entity_type_ids};
     use icbm_mc_767::packets::play::block_state_ids;
 
     #[test]

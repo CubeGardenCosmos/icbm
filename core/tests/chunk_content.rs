@@ -108,7 +108,9 @@ struct TestServer {
 
 impl TestServer {
     fn start(name: &str) -> Self {
-        let _serial_guard = SERVER_LOCK.lock().unwrap_or_else(|poison| poison.into_inner());
+        let _serial_guard = SERVER_LOCK
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner());
         let world_dir =
             std::env::temp_dir().join(format!("icbm-chunk-test-{}-{name}", std::process::id()));
         let _ = std::fs::remove_dir_all(&world_dir);
@@ -319,7 +321,10 @@ fn chunk_terrain_matches_vanilla_flat() {
         );
     }
     // section 0 之下不存在（首个即世界底部）；section 0 内不得有雪草（8）
-    assert!(!surface.contains(&8), "snowy grass_block (id 8) must not be generated");
+    assert!(
+        !surface.contains(&8),
+        "snowy grass_block (id 8) must not be generated"
+    );
     // 草方块必须是非 snowy 的全局 ID 9（8 是 snowy=true），且只出现在 section 0
     let mut grass_found = false;
     for (index, section) in palettes.iter().enumerate() {
@@ -596,7 +601,10 @@ fn creeper_spawns_in_region() {
     let _x = r.read_f64_be().unwrap();
     let y = r.read_f64_be().unwrap();
     let _z = r.read_f64_be().unwrap();
-    assert_eq!(y, -60.0, "creeper spawns on flat surface (superflat at Y=-64)");
+    assert_eq!(
+        y, -60.0,
+        "creeper spawns on flat surface (superflat at Y=-64)"
+    );
     assert!(entity_id >= 1000, "region entity ids start at 1000");
 }
 
@@ -671,14 +679,23 @@ fn data_command_and_command_block() {
     // 放置命令方块并写入 Command NBT（/data merge block）
     send_chat_command(&mut client, "setblock 20 -60 20 command_block");
     recv_chat_until(&mut client, "已放置");
-    send_chat_command(&mut client, r#"data merge block 20 -60 20 {Command:"setblock 21 -60 20 stone"}"#);
+    send_chat_command(
+        &mut client,
+        r#"data merge block 20 -60 20 {Command:"setblock 21 -60 20 stone"}"#,
+    );
     let merge_feedback = recv_chat_until(&mut client, "方块实体数据已更新");
-    assert!(merge_feedback.contains("setblock 21 -60 20 stone"), "merge feedback: {merge_feedback}");
+    assert!(
+        merge_feedback.contains("setblock 21 -60 20 stone"),
+        "merge feedback: {merge_feedback}"
+    );
 
     // /data get block 应回显 Command
     send_chat_command(&mut client, "data get block 20 -60 20");
     let get_feedback = recv_chat_until(&mut client, "方块实体数据");
-    assert!(get_feedback.contains("setblock 21 -60 20 stone"), "get feedback: {get_feedback}");
+    assert!(
+        get_feedback.contains("setblock 21 -60 20 stone"),
+        "get feedback: {get_feedback}"
+    );
 
     // 旁边放红石块供电 → 命令方块触发 → setblock 21 -60 20 stone
     send_chat_command(&mut client, "setblock 19 -60 20 redstone_block");
@@ -687,7 +704,10 @@ fn data_command_and_command_block() {
     // 等待 CBlockUpdate：位置 (21, -60, 20) 变石头
     let deadline = Instant::now() + Duration::from_secs(20);
     let placed = loop {
-        assert!(Instant::now() < deadline, "command block did not place stone");
+        assert!(
+            Instant::now() < deadline,
+            "command block did not place stone"
+        );
         let (id, payload) = client.recv();
         if id == play_ids::CLIENTBOUND_BLOCK_UPDATE {
             let mut r = Reader::new(&payload);
@@ -703,7 +723,10 @@ fn data_command_and_command_block() {
     // /data remove block 移除 Command 键
     send_chat_command(&mut client, "data remove block 20 -60 20 Command");
     let remove_feedback = recv_chat_until(&mut client, "已从");
-    assert!(remove_feedback.contains("Command"), "remove feedback: {remove_feedback}");
+    assert!(
+        remove_feedback.contains("Command"),
+        "remove feedback: {remove_feedback}"
+    );
 }
 
 /// 末影珍珠：计算落点直接传送（region 射线检测，无实体投掷）。
@@ -903,7 +926,10 @@ fn nether_portal_builds_and_activates() {
 
     let deadline = Instant::now() + Duration::from_secs(15);
     let respawn = loop {
-        assert!(Instant::now() < deadline, "no respawn after entering portal");
+        assert!(
+            Instant::now() < deadline,
+            "no respawn after entering portal"
+        );
         let (id, payload) = client.recv();
         if id == play_ids::CLIENTBOUND_RESPAWN {
             break payload;
@@ -914,6 +940,379 @@ fn nether_portal_builds_and_activates() {
     let _dimension_type = r.read_var_int().unwrap();
     let dimension_name = r.read_string().unwrap();
     assert_eq!(dimension_name, "minecraft:the_nether", "switched to nether");
+}
+
+/// 跨区后上一 region 的真实地形必须保留：视野覆盖旧区区块时由旧区（沉睡
+/// region 仍在线服务内存数据）或 core 直读旧区 .mca 提供，不得被新区以 flat
+/// 生成覆盖（区域切换显示 BUG）。
+#[allow(clippy::too_many_lines)]
+#[test]
+fn crossing_preserves_previous_region_terrain() {
+    let server = TestServer::start("crossing-terrain");
+    let mut client = FakeClient::connect(&server.addr);
+    join_to_play(&mut client);
+    client.recv_until(play_ids::CLIENTBOUND_CHUNK_BATCH_FINISHED, "initial batch");
+
+    // 在 (498,-60,0) 放置石头做标记（chunk (31,0) → region 0 内、跨区后
+    // 视野 [29..45] 覆盖该 chunk）
+    send_chat_command(&mut client, "setblock 498 -60 0 stone");
+    recv_chat_until(&mut client, "已放置");
+
+    // 跨区到 (600,4,0)（region 1）
+    let mut move_packet = Writer::new();
+    move_packet.write_f64_be(600.0);
+    move_packet.write_f64_be(4.0);
+    move_packet.write_f64_be(0.0);
+    move_packet.write_bool(true);
+    client.send(play_ids::SERVERBOUND_MOVE_POS, &move_packet.into_bytes());
+    client.recv_until(
+        play_ids::CLIENTBOUND_SET_CHUNK_CACHE_CENTER,
+        "crossing center",
+    );
+    client.recv_until(
+        play_ids::CLIENTBOUND_CHUNK_BATCH_START,
+        "crossing batch start",
+    );
+
+    // 批次中 chunk (31,0) 必须保留真实地形（含 stone 全局 ID 1）：
+    // 由沉睡的 region 0 内存数据或 .mca 提供，不得被 region 1 flat 覆盖
+    let deadline = Instant::now() + Duration::from_secs(30);
+    let mut chunk_31_0_stone = false;
+    let mut finished = false;
+    while Instant::now() < deadline && !finished {
+        let (id, payload) = client.recv();
+        if id == play_ids::CLIENTBOUND_CHUNK_BATCH_FINISHED {
+            finished = true;
+            continue;
+        }
+        if id != play_ids::CLIENTBOUND_LEVEL_CHUNK_WITH_LIGHT {
+            continue;
+        }
+        let mut r = Reader::new(&payload);
+        let x = r.read_i32_be().unwrap();
+        let z = r.read_i32_be().unwrap();
+        if (x, z) != (31, 0) {
+            continue;
+        }
+        let _heightmap = r.read_nbt().unwrap().unwrap();
+        let data_len = r.read_var_int().unwrap() as usize;
+        let data = r.read_bytes(data_len).unwrap();
+        let mut sr = Reader::new(data);
+        for _ in 0..24 {
+            let _nonair = sr.read_i16_be().unwrap();
+            let (_, entries) = read_palette_container(&mut sr);
+            if entries.contains(&1) {
+                chunk_31_0_stone = true;
+            }
+            read_biome_container(&mut sr);
+        }
+    }
+    assert!(finished, "crossing batch must finish");
+    assert!(
+        chunk_31_0_stone,
+        "previous region chunk (31,0) must keep real terrain (stone) after crossing"
+    );
+}
+
+/// 真实客户端创造模式放置红石：创造物品栏热栏槽（槽 1..9）+ 选中槽
+/// （`SET_CARRIED_ITEM`）→ `USE_ITEM_ON` 放置红石线（红石无法激活 BUG）。
+#[test]
+fn creative_inventory_places_redstone() {
+    let server = TestServer::start("creative-redstone");
+    let mut client = FakeClient::connect(&server.addr);
+    join_to_play(&mut client);
+    client.recv_until(play_ids::CLIENTBOUND_CHUNK_BATCH_FINISHED, "initial batch");
+
+    // 真实 vanilla 客户端：把红石粉放入热栏第 5 格（hotbar index 4）发送
+    // `SET_CREATIVE_MODE_SLOT` 槽 40（36+4，`InventoryMenu` 热栏槽号），
+    // 选中热栏第 5 格发送 `SET_CARRIED_ITEM`（short 4）。
+    // 回归：旧实现按槽 1..9 记录热栏，真实客户端 36..44 永不命中，手持物品
+    // 恒 None（任何方块/桶都放不出来——红石/黑曜石框架/水桶的共同根因）。
+    send_creative_slot(&mut client, 40, "redstone");
+    let mut w = Writer::new();
+    w.write_i16_be(4);
+    client.send(play_ids::SERVERBOUND_SET_CARRIED_ITEM, &w.into_bytes());
+    std::thread::sleep(Duration::from_millis(200));
+
+    // USE_ITEM_ON：点击 (20,-61,10) 顶面 → 落点 (20,-60,10)
+    send_use_item_on(&mut client, 20, -61, 10, 1);
+
+    // 红石线（4138 = power 0）应被放置
+    let deadline = Instant::now() + Duration::from_secs(8);
+    let placed = loop {
+        assert!(
+            Instant::now() < deadline,
+            "redstone not placed via creative inventory"
+        );
+        let (id, payload) = client.recv();
+        if id == play_ids::CLIENTBOUND_BLOCK_UPDATE {
+            let mut r = Reader::new(&payload);
+            let pos = icbm_mc_767::packets::play::BlockPos::from_long(r.read_i64_be().unwrap());
+            let state = r.read_var_int().unwrap();
+            if pos == icbm_mc_767::packets::play::BlockPos::new(20, -60, 10) {
+                break state;
+            }
+        }
+    };
+    assert_eq!(placed, 4138, "placed redstone wire (power 0)");
+}
+
+/// 红石块（真实客户端路径放置）相邻红石线 → 线亮（power 15 = 4153）。
+/// 回归：旧实现手持物品恒 None，红石块与红石粉都放不出来（基础红石不工作）。
+#[test]
+fn creative_redstone_block_powers_wire() {
+    let server = TestServer::start("creative-redstone-power");
+    let mut client = FakeClient::connect(&server.addr);
+    join_to_play(&mut client);
+    client.recv_until(play_ids::CLIENTBOUND_CHUNK_BATCH_FINISHED, "initial batch");
+
+    // 热栏第 5 格（槽 40）放红石粉并选中 → 点击 (20,-61,10) 顶面放置
+    send_creative_slot(&mut client, 40, "redstone");
+    let mut carried = Writer::new();
+    carried.write_i16_be(4);
+    client.send(
+        play_ids::SERVERBOUND_SET_CARRIED_ITEM,
+        &carried.into_bytes(),
+    );
+    send_use_item_on(&mut client, 20, -61, 10, 1);
+    // 热栏第 4 格（槽 39）放红石块并选中 → 点击 (19,-61,10) 顶面放置
+    send_creative_slot(&mut client, 39, "redstone_block");
+    let mut carried = Writer::new();
+    carried.write_i16_be(3);
+    client.send(
+        play_ids::SERVERBOUND_SET_CARRIED_ITEM,
+        &carried.into_bytes(),
+    );
+    send_use_item_on(&mut client, 19, -61, 10, 1);
+
+    // 导线 (20,-60,10) 应点亮为 4153（power 15）
+    let deadline = Instant::now() + Duration::from_secs(15);
+    let mut powered = false;
+    while Instant::now() < deadline && !powered {
+        let (id, payload) = client.recv();
+        if id == play_ids::CLIENTBOUND_BLOCK_UPDATE {
+            let mut r = Reader::new(&payload);
+            let pos = icbm_mc_767::packets::play::BlockPos::from_long(r.read_i64_be().unwrap());
+            let state = r.read_var_int().unwrap();
+            if pos == icbm_mc_767::packets::play::BlockPos::new(20, -60, 10) {
+                powered = state == 4153;
+            }
+        }
+    }
+    assert!(
+        powered,
+        "wire should be powered (4153) by adjacent redstone block"
+    );
+}
+
+/// 水桶（真实客户端路径放置）：水方块出现并向下/四周扩散（流体不工作）。
+#[test]
+fn water_bucket_places_and_flows() {
+    let server = TestServer::start("water-bucket");
+    let mut client = FakeClient::connect(&server.addr);
+    join_to_play(&mut client);
+    client.recv_until(play_ids::CLIENTBOUND_CHUNK_BATCH_FINISHED, "initial batch");
+
+    // 热栏第 5 格放水桶并选中 → 点击 (25,-61,10) 顶面 → 水放于 (25,-60,10)
+    send_creative_slot(&mut client, 40, "water_bucket");
+    let mut carried = Writer::new();
+    carried.write_i16_be(4);
+    client.send(
+        play_ids::SERVERBOUND_SET_CARRIED_ITEM,
+        &carried.into_bytes(),
+    );
+    send_use_item_on(&mut client, 25, -61, 10, 1);
+
+    // 等待水源（WATER = 80，level 0）或扩散的流动态（80..95）出现
+    let deadline = Instant::now() + Duration::from_secs(15);
+    let mut saw_water = false;
+    let mut spread = false;
+    while Instant::now() < deadline && !(saw_water && spread) {
+        let (id, payload) = client.recv();
+        if id == play_ids::CLIENTBOUND_BLOCK_UPDATE {
+            let mut r = Reader::new(&payload);
+            let pos = icbm_mc_767::packets::play::BlockPos::from_long(r.read_i64_be().unwrap());
+            let state = r.read_var_int().unwrap();
+            let water = (80..=95).contains(&state);
+            if pos == icbm_mc_767::packets::play::BlockPos::new(25, -60, 10) && water {
+                saw_water = true;
+            }
+            if pos != icbm_mc_767::packets::play::BlockPos::new(25, -60, 10) && water {
+                spread = true; // 扩散到相邻格
+            }
+        }
+    }
+    assert!(saw_water, "water block should be placed by bucket");
+    assert!(spread, "water should spread to neighbors");
+}
+
+/// 辅助：`SET_CREATIVE_MODE_SLOT`（vanilla 线格式：槽位 short + ItemStack）。
+fn send_creative_slot(client: &mut FakeClient, slot: i32, item: &str) {
+    let mut w = Writer::new();
+    w.write_i16_be(slot as i16);
+    w.write_var_int(1); // count
+    let item_id = icbm_mc_767::item_ids::item_id(item).unwrap() + 1;
+    w.write_var_int(item_id);
+    w.write_var_int(0); // to_add
+    w.write_var_int(0); // to_remove
+    client.send(
+        play_ids::SERVERBOUND_SET_CREATIVE_MODE_SLOT,
+        &w.into_bytes(),
+    );
+}
+
+/// 辅助：`USE_ITEM_ON`（vanilla 线格式：手 + BlockHitResult + sequence）。
+fn send_use_item_on(client: &mut FakeClient, x: i32, y: i32, z: i32, face: i32) {
+    let mut w = Writer::new();
+    w.write_var_int(0); // hand = main
+    w.write_i64_be(icbm_mc_767::packets::play::BlockPos::new(x, y, z).as_long());
+    w.write_var_int(face);
+    w.write_f32_be(0.5); // hit_x
+    w.write_f32_be(1.0); // hit_y
+    w.write_f32_be(0.5); // hit_z
+    w.write_bool(false); // inside
+    w.write_var_int(0); // sequence
+    client.send(play_ids::SERVERBOUND_USE_ITEM_ON, &w.into_bytes());
+}
+
+/// 红石线点亮后拆除电源必须熄灭（旧实现 set_block 只查新状态，拆除电源
+/// 不触发重新求值，导线永远保持点亮）。
+#[test]
+fn redstone_wire_turns_off_when_source_removed() {
+    let server = TestServer::start("redstone-off");
+    let mut client = FakeClient::connect(&server.addr);
+    join_to_play(&mut client);
+    client.recv_until(play_ids::CLIENTBOUND_CHUNK_BATCH_FINISHED, "initial batch");
+
+    send_chat_command(&mut client, "setblock 20 -60 10 redstone_wire");
+    recv_chat_until(&mut client, "已放置");
+    send_chat_command(&mut client, "setblock 19 -60 10 redstone_block");
+    recv_chat_until(&mut client, "已放置");
+
+    // 等导线点亮（4153 = power 15）
+    let deadline = Instant::now() + Duration::from_secs(15);
+    let mut powered = false;
+    while Instant::now() < deadline && !powered {
+        let (id, payload) = client.recv();
+        if id == play_ids::CLIENTBOUND_BLOCK_UPDATE {
+            let mut r = Reader::new(&payload);
+            let pos = icbm_mc_767::packets::play::BlockPos::from_long(r.read_i64_be().unwrap());
+            let state = r.read_var_int().unwrap();
+            if pos == icbm_mc_767::packets::play::BlockPos::new(20, -60, 10) {
+                powered = state == 4153;
+            }
+        }
+    }
+    assert!(
+        powered,
+        "wire should be powered (4153) by adjacent redstone block"
+    );
+
+    // 拆除电源 → 导线必须回到 power 0（4138）
+    send_chat_command(&mut client, "setblock 19 -60 10 air");
+    recv_chat_until(&mut client, "已放置");
+    let deadline = Instant::now() + Duration::from_secs(15);
+    let mut off = false;
+    while Instant::now() < deadline && !off {
+        let (id, payload) = client.recv();
+        if id == play_ids::CLIENTBOUND_BLOCK_UPDATE {
+            let mut r = Reader::new(&payload);
+            let pos = icbm_mc_767::packets::play::BlockPos::from_long(r.read_i64_be().unwrap());
+            let state = r.read_var_int().unwrap();
+            if pos == icbm_mc_767::packets::play::BlockPos::new(20, -60, 10) {
+                off = state == 4138;
+            }
+        }
+    }
+    assert!(
+        off,
+        "wire must turn off (4138) after the power source is removed"
+    );
+}
+
+/// 地狱门往返：主世界 → 地狱（目的端自动生成返回传送门）→ 走回传送门返回
+/// 主世界（地狱门无法打开 BUG：无返回传送门 + 地狱面检测不到）。
+#[test]
+fn nether_portal_round_trip_generates_return_portal() {
+    let server = TestServer::start("portal-round-trip");
+    let mut client = FakeClient::connect(&server.addr);
+    join_to_play(&mut client);
+    client.recv_until(play_ids::CLIENTBOUND_CHUNK_BATCH_FINISHED, "initial batch");
+
+    send_chat_command(&mut client, "fill 20 -58 0 20 -58 3 obsidian");
+    recv_chat_until(&mut client, "已填充");
+    send_chat_command(&mut client, "fill 20 -54 0 20 -54 3 obsidian");
+    recv_chat_until(&mut client, "已填充");
+    send_chat_command(&mut client, "fill 20 -57 0 20 -55 0 obsidian");
+    recv_chat_until(&mut client, "已填充");
+    send_chat_command(&mut client, "fill 20 -57 3 20 -55 3 obsidian");
+    recv_chat_until(&mut client, "已填充");
+
+    // 站入传送门内部 (20,-56,1) → CRespawn（进入地狱）
+    let mut move_in = Writer::new();
+    move_in.write_f64_be(20.0);
+    move_in.write_f64_be(-56.0);
+    move_in.write_f64_be(1.0);
+    move_in.write_bool(true);
+    client.send(play_ids::SERVERBOUND_MOVE_POS, &move_in.into_bytes());
+
+    let deadline = Instant::now() + Duration::from_secs(15);
+    let mut to_nether = false;
+    let mut nether_portal_seen = false;
+    while Instant::now() < deadline && !to_nether {
+        let (id, payload) = client.recv();
+        if id == play_ids::CLIENTBOUND_RESPAWN {
+            let mut r = Reader::new(&payload);
+            let _dimension_type = r.read_var_int().unwrap();
+            let dimension_name = r.read_string().unwrap();
+            to_nether = dimension_name == "minecraft:the_nether";
+        }
+        if id == play_ids::CLIENTBOUND_BLOCK_UPDATE {
+            let mut r = Reader::new(&payload);
+            let _pos = r.read_i64_be().unwrap();
+            let state = r.read_var_int().unwrap();
+            if state == 5864 || state == 5865 {
+                nether_portal_seen = true; // 目的端返回传送门已生成
+            }
+        }
+    }
+    assert!(to_nether, "must switch to nether");
+    assert!(
+        nether_portal_seen,
+        "return portal must be generated at the nether destination"
+    );
+
+    // 等维度切换冷却（10 tick）过去后，移出传送门再走回触发返回
+    std::thread::sleep(Duration::from_millis(800));
+    let mut move_out = Writer::new();
+    move_out.write_f64_be(2.0);
+    move_out.write_f64_be(128.0);
+    move_out.write_f64_be(5.0);
+    move_out.write_bool(true);
+    client.send(play_ids::SERVERBOUND_MOVE_POS, &move_out.into_bytes());
+    std::thread::sleep(Duration::from_millis(800));
+    let mut move_back = Writer::new();
+    move_back.write_f64_be(2.0);
+    move_back.write_f64_be(128.0);
+    move_back.write_f64_be(1.0);
+    move_back.write_bool(true);
+    client.send(play_ids::SERVERBOUND_MOVE_POS, &move_back.into_bytes());
+
+    let deadline = Instant::now() + Duration::from_secs(15);
+    let mut back_to_overworld = false;
+    while Instant::now() < deadline && !back_to_overworld {
+        let (id, payload) = client.recv();
+        if id == play_ids::CLIENTBOUND_RESPAWN {
+            let mut r = Reader::new(&payload);
+            let _dimension_type = r.read_var_int().unwrap();
+            let dimension_name = r.read_string().unwrap();
+            back_to_overworld = dimension_name == "minecraft:overworld";
+        }
+    }
+    assert!(
+        back_to_overworld,
+        "must return to overworld via nether portal"
+    );
 }
 
 /// 玩家数据持久化：离线后重新进入恢复游戏模式与位置。
@@ -957,7 +1356,9 @@ fn playerdata_persists_gamemode_and_position() {
     let nbt = icbm_anvil::player::read_player(&files[0])
         .expect("read playerdata")
         .expect("exists");
-    let icbm_mc_767::nbt::Nbt::Compound(root) = nbt else { panic!("playerdata compound") };
+    let icbm_mc_767::nbt::Nbt::Compound(root) = nbt else {
+        panic!("playerdata compound")
+    };
     assert_eq!(root.get_i32("playerGameType"), Some(1), "creative saved");
     let icbm_mc_767::nbt::Nbt::List(pos_list) = root.get("Pos").expect("Pos") else {
         panic!("Pos list");
@@ -1164,8 +1565,18 @@ fn run_command_tab_completion() {
     assert_eq!(
         texts,
         vec![
-            "about", "ban", "bmtool", "enchant", "fill", "gamemode", "gamerule", "give", "help",
-            "setblock", "tp", "whitelist",
+            "about",
+            "ban",
+            "bmtool",
+            "enchant",
+            "fill",
+            "gamemode",
+            "gamerule",
+            "give",
+            "help",
+            "setblock",
+            "tp",
+            "whitelist",
         ]
     );
 
@@ -1345,7 +1756,10 @@ fn creative_inventory_take_does_not_kick() {
     w.write_var_int(1 + 1); // sharpness (raw 1) + 1
     w.write_var_int(3); // level = 3
     w.write_bool(true); // showInTooltip
-    client.send(play_ids::SERVERBOUND_SET_CREATIVE_MODE_SLOT, &w.into_bytes());
+    client.send(
+        play_ids::SERVERBOUND_SET_CREATIVE_MODE_SLOT,
+        &w.into_bytes(),
+    );
 
     // 再放一个普通石头栈到槽 5（无组件），两包都不得导致断线。
     let mut w = Writer::new();
@@ -1355,7 +1769,10 @@ fn creative_inventory_take_does_not_kick() {
     w.write_var_int(stone);
     w.write_var_int(0); // to_add = 0
     w.write_var_int(0); // to_remove = 0
-    client.send(play_ids::SERVERBOUND_SET_CREATIVE_MODE_SLOT, &w.into_bytes());
+    client.send(
+        play_ids::SERVERBOUND_SET_CREATIVE_MODE_SLOT,
+        &w.into_bytes(),
+    );
 
     // 5 秒内不得收到 DISCONNECT（数据包处理失败）。
     client.set_read_timeout(Duration::from_millis(200));
@@ -1371,7 +1788,10 @@ fn creative_inventory_take_does_not_kick() {
     }
     client.set_read_timeout(Duration::from_secs(10));
     // 服务器进程仍在运行（连接未被踢则无 REMOVE_ENTITIES/断开痕迹）
-    assert!(server.child.try_wait().expect("try_wait").is_none(), "server exited");
+    assert!(
+        server.child.try_wait().expect("try_wait").is_none(),
+        "server exited"
+    );
 }
 
 /// 玩家移动到负数坐标时，该区域的 terrain 必须生成并送达（修复"地形不在
@@ -1404,7 +1824,10 @@ fn negative_coordinates_terrain_is_generated() {
     // 视野区块到达（批次开始 → 完成），289 = (2*8+1)^2；同时收集批次中
     // 是否出现负数坐标区块（-38 属 region (-2,0) 内部，必然出现），并解码其
     // 地形 palette 确认是真实的超平坦（草/泥土/基岩），而非空气。
-    client.recv_until(play_ids::CLIENTBOUND_CHUNK_BATCH_START, "negative batch start");
+    client.recv_until(
+        play_ids::CLIENTBOUND_CHUNK_BATCH_START,
+        "negative batch start",
+    );
     let deadline = Instant::now() + Duration::from_secs(30);
     let mut saw_negative_chunk = false;
     let mut negative_palettes: Option<Vec<Vec<i32>>> = None;
@@ -1484,7 +1907,11 @@ fn void_fall_rescued_to_spawn() {
             break (x, y, z);
         }
     };
-    assert_eq!((x, y, z), (0.0, -60.0, 0.0), "rescued to world spawn (superflat top)");
+    assert_eq!(
+        (x, y, z),
+        (0.0, -60.0, 0.0),
+        "rescued to world spawn (superflat top)"
+    );
 }
 
 /// 玩家放置与破坏方块：`give` 石头 → 右键（USE_ITEM_ON）在脚下放置 →
