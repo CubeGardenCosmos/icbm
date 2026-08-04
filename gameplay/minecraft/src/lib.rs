@@ -26,6 +26,7 @@ pub mod crops;
 pub mod entities;
 pub mod fluid;
 pub mod gamerules;
+pub mod inventory;
 pub mod mob_behavior;
 pub mod mobs;
 pub mod pistons;

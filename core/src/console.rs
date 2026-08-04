@@ -766,12 +766,12 @@ pub fn apply_give(server: &Server, target: &str, item: &str, count: i32) -> Stri
     .unwrap_or(0)
     .clamp(0, 8);
     let slot = i16::try_from(hotbar_index + 36).unwrap_or(36);
-    {
-        let mut inventory = client.inventory.lock().expect("inventory");
-        if let Some(cell) = inventory.get_mut(hotbar_index + 36) {
-            *cell = Some(item.to_owned());
-        }
-    }
+    client
+        .inventory
+        .lock()
+        .expect("inventory")
+        .slot_mut(hotbar_index + 36)
+        .0 = CItemStack::of(item, count);
     *client.held_item.lock().expect("held item") = Some(item.to_owned());
     let stack = CItemStack::of(item, count);
     let _ = client.send_encoded(CSetSlot::packet_id(), |w| {

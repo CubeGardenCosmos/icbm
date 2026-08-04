@@ -7,12 +7,12 @@ use crate::packets::play_ids::{
     SERVERBOUND_CHAT, SERVERBOUND_CHAT_ACK, SERVERBOUND_CHAT_COMMAND,
     SERVERBOUND_CHAT_COMMAND_SIGNED, SERVERBOUND_CHUNK_BATCH_RECEIVED, SERVERBOUND_CLIENT_COMMAND,
     SERVERBOUND_CLIENT_INFORMATION, SERVERBOUND_COMMAND_SUGGESTION, SERVERBOUND_CONFIRM_TELEPORT,
-    SERVERBOUND_KEEP_ALIVE, SERVERBOUND_MOVE_POS, SERVERBOUND_MOVE_POS_ROT, SERVERBOUND_MOVE_ROT,
-    SERVERBOUND_MOVE_STATUS_ONLY, SERVERBOUND_MOVE_VEHICLE, SERVERBOUND_PICK_ITEM,
-    SERVERBOUND_PLAYER_ABILITIES, SERVERBOUND_PLAYER_ACTION, SERVERBOUND_PLAYER_COMMAND,
-    SERVERBOUND_PLAYER_INPUT, SERVERBOUND_PONG, SERVERBOUND_SET_CARRIED_ITEM,
-    SERVERBOUND_SET_CREATIVE_MODE_SLOT, SERVERBOUND_SWING, SERVERBOUND_USE_ITEM,
-    SERVERBOUND_USE_ITEM_ON,
+    SERVERBOUND_CONTAINER_CLICK, SERVERBOUND_KEEP_ALIVE, SERVERBOUND_MOVE_POS,
+    SERVERBOUND_MOVE_POS_ROT, SERVERBOUND_MOVE_ROT, SERVERBOUND_MOVE_STATUS_ONLY,
+    SERVERBOUND_MOVE_VEHICLE, SERVERBOUND_PICK_ITEM, SERVERBOUND_PLAYER_ABILITIES,
+    SERVERBOUND_PLAYER_ACTION, SERVERBOUND_PLAYER_COMMAND, SERVERBOUND_PLAYER_INPUT,
+    SERVERBOUND_PONG, SERVERBOUND_SET_CARRIED_ITEM, SERVERBOUND_SET_CREATIVE_MODE_SLOT,
+    SERVERBOUND_SWING, SERVERBOUND_USE_ITEM, SERVERBOUND_USE_ITEM_ON,
 };
 
 /// Serverbound：确认传送（0x00）。
@@ -822,6 +822,66 @@ impl SSetCreativeModeSlot {
     #[must_use]
     pub const fn packet_id() -> i32 {
         SERVERBOUND_SET_CREATIVE_MODE_SLOT
+    }
+}
+
+/// Serverbound：容器点击（0x0E `ServerboundContainerClickPacket`）。
+///
+/// 背包/容器交互（移动物品）：`click_type`（`PICKUP`/`QUICK_MOVE`/`SWAP`/`THROW`/
+/// `QUICK_CRAFT`/`CLONE`/`PICKUP_ALL`）+ 槽位 + 按钮 + 变更槽快照 + 光标物品。
+#[derive(Debug, Clone)]
+pub struct SContainerClick {
+    /// 容器窗口 ID（0 = 玩家物品栏）。
+    pub container_id: i8,
+    /// 状态修订号（与 `CSetContainerContent`/`CSetSlot` 的 revision 对应）。
+    pub state_id: i32,
+    /// 槽位（-999 = 窗口外）。
+    pub slot: i16,
+    /// 按钮（左 0 / 右 1 / shift、数字键 0..8、Q 丢出等）。
+    pub button: i8,
+    /// 点击类型（vanilla `ClickType` 序：0 `PICKUP` / 1 `QUICK_MOVE` / 2 `SWAP` /
+    /// 3 `CLONE` / 4 `THROW` / 5 `QUICK_CRAFT` / 6 `PICKUP_ALL`）。
+    pub click_type: i8,
+    /// 变更槽快照（槽号 → 物品；客户端认为这些槽变化了）。
+    pub changed_slots: Vec<(u8, super::clientbound::CItemStack)>,
+    /// 客户端当前光标物品。
+    pub carried: super::clientbound::CItemStack,
+}
+
+impl SContainerClick {
+    /// 解码（对照 `ServerboundContainerClickPacket.java`：containerId(byte) +
+    /// stateId(VarInt) + slotNum(short) + buttonNum(byte) + clickType(VarInt) +
+    /// `changedSlots`（`SLOTS_STREAM_CODEC`：`VarInt` 长度 + 每项 `(byte slot, item_stack)`) +
+    /// carriedItem(ItemStack)）。
+    pub fn decode(reader: &mut Reader<'_>) -> Result<Self, CodecError> {
+        let container_id = reader.read_i8()?;
+        let state_id = reader.read_var_int()?;
+        let slot = reader.read_i16_be()?;
+        let button = reader.read_i8()?;
+        let click_type = reader.read_var_int()?;
+        let mut changed_slots = Vec::new();
+        let count = reader.read_var_int()?;
+        for _ in 0..count.max(0) {
+            let slot = reader.read_u8()?;
+            let stack = decode_item_stack(reader)?;
+            changed_slots.push((slot, stack));
+        }
+        let carried = decode_item_stack(reader)?;
+        Ok(Self {
+            container_id,
+            state_id,
+            slot,
+            button,
+            click_type: i8::try_from(click_type).unwrap_or(-1),
+            changed_slots,
+            carried,
+        })
+    }
+
+    /// 包 ID。
+    #[must_use]
+    pub const fn packet_id() -> i32 {
+        SERVERBOUND_CONTAINER_CLICK
     }
 }
 

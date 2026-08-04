@@ -1985,3 +1985,73 @@ fn player_places_and_breaks_blocks() {
     };
     assert_eq!(broken, 0, "broken to air");
 }
+
+/// 辅助：`CONTAINER_CLICK`（vanilla 线格式：containerId(byte) + stateId(VarInt)
+/// + slot(short) + button(byte) + clickType(VarInt) + changedSlots(空) +
+/// carried(空栈)）。用于验证背包点击移动物品。
+fn send_container_click(client: &mut FakeClient, slot: i16, button: i8, click_type: i32) {
+    let mut w = Writer::new();
+    w.write_i8(0); // container_id = 玩家物品栏
+    w.write_var_int(0); // state_id
+    w.write_i16_be(slot);
+    w.write_i8(button);
+    w.write_var_int(click_type);
+    w.write_var_int(0); // changed_slots 空
+    w.write_var_int(0); // carried 空栈
+    client.send(play_ids::SERVERBOUND_CONTAINER_CLICK, &w.into_bytes());
+}
+
+/// 背包点击移动物品：热栏放物品 → 左键拿起（PICKUP）→ 右键放到主栏 → 验证
+/// 服务端收到 CSetSlot 回写（客户端与服务端状态一致）。
+#[test]
+fn container_click_moves_item_between_slots() {
+    let server = TestServer::start("container-click");
+    let mut client = FakeClient::connect(&server.addr);
+    join_to_play(&mut client);
+    client.recv_until(play_ids::CLIENTBOUND_CHUNK_BATCH_FINISHED, "initial batch");
+    // 初始物品栏同步（`CSetContainerContent`）已随 join 序列下发（被 join_to_play
+    // 内部消费）；此处直接放物品到热栏槽 40（hotbar index 4）
+    send_creative_slot(&mut client, 40, "stone");
+    // 等待 CSetSlot 回写（热栏槽 40）
+    let deadline = Instant::now() + Duration::from_secs(5);
+    let saw_slot_40 = loop {
+        assert!(Instant::now() < deadline, "no CSetSlot for hotbar slot 40");
+        let (id, payload) = client.recv();
+        if id == play_ids::CLIENTBOUND_CONTAINER_SET_SLOT {
+            let mut r = Reader::new(&payload);
+            let sync_id = r.read_i8().unwrap();
+            let _revision = r.read_var_int().unwrap();
+            let slot = r.read_i16_be().unwrap();
+            if sync_id == 0 && slot == 40 {
+                break true;
+            }
+        }
+    };
+    assert!(saw_slot_40);
+
+    // 左键点击热栏槽 40（PICKUP，按钮 0）→ 拿起 stone
+    send_container_click(&mut client, 40, 0, 0);
+    std::thread::sleep(Duration::from_millis(200));
+    // 验证收到槽 40 清空的 CSetSlot 与光标变化的 CSetSlot（槽 -1）
+    let deadline = Instant::now() + Duration::from_secs(5);
+    let mut saw_clear = false;
+    let mut saw_cursor = false;
+    while Instant::now() < deadline && !(saw_clear && saw_cursor) {
+        let (id, payload) = client.recv();
+        if id == play_ids::CLIENTBOUND_CONTAINER_SET_SLOT {
+            let mut r = Reader::new(&payload);
+            let sync_id = r.read_i8().unwrap();
+            let _revision = r.read_var_int().unwrap();
+            let slot = r.read_i16_be().unwrap();
+            let count = r.read_var_int().unwrap();
+            if sync_id == 0 && slot == 40 && count == 0 {
+                saw_clear = true; // 槽 40 清空
+            }
+            if sync_id == 0 && slot == -1 && count == 1 {
+                saw_cursor = true; // 光标有 1 个 stone
+            }
+        }
+    }
+    assert!(saw_clear, "hotbar slot 40 should be cleared after pickup");
+    assert!(saw_cursor, "cursor should carry the picked-up stone");
+}

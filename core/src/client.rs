@@ -171,13 +171,13 @@ pub struct Client {
     pub locale: Mutex<String>,
     /// 主手手持物品（`give`/创造模式设置；放置方块用）。
     pub held_item: Mutex<Option<String>>,
-    /// 热栏物品（槽 0..8；`SET_CREATIVE_MODE_SLOT` 槽 1..9 写入，`SET_CARRIED_ITEM`
-    /// 选中后作为手持物品）。
+    /// 热栏物品（槽 0..8；`SET_CREATIVE_MODE_SLOT` 槽写入，`SET_CARRIED_ITEM`
+    /// 选中后作为手持物品；`inventory` 热栏段的便捷视图）。
     pub hotbar: Mutex<Vec<Option<String>>>,
-    /// 完整物品栏（46 槽，`InventoryMenu` 槽号：热栏 36..44、主栏 9..35、装备
-    /// 5..8、副手 45；`SET_CREATIVE_MODE_SLOT` 写入，进服时全量下发
-    /// `CSetContainerContent`）。`hotbar` 为其热栏段的便捷视图。
-    pub inventory: Mutex<Vec<Option<String>>>,
+    /// 完整玩家物品栏（`PlayerInventory`：46 槽 + 光标；`InventoryMenu` 槽号：
+    /// 热栏 36..44、主栏 9..35、装备 5..8、副手 45）。进服全量下发
+    /// `CSetContainerContent`，点击/放置经 `CSetSlot` 同步。
+    pub inventory: Mutex<icbm_gameplay_minecraft::inventory::PlayerInventory>,
     /// 选中热栏槽（0..8；`SET_CARRIED_ITEM` 更新）。
     pub carried_slot: AtomicI32,
     /// 正版 profile 属性（`textures` 皮肤/披风；登录时从 Mojang 获取，
@@ -278,7 +278,7 @@ impl Client {
             locale: Mutex::new(String::new()),
             held_item: Mutex::new(None),
             hotbar: Mutex::new(vec![None; 9]),
-            inventory: Mutex::new(vec![None; 46]),
+            inventory: Mutex::new(icbm_gameplay_minecraft::inventory::PlayerInventory::new()),
             carried_slot: AtomicI32::new(0),
             profile_properties: Mutex::new(Vec::new()),
             last_portal_switch: Mutex::new(Instant::now()),
@@ -399,18 +399,12 @@ impl Client {
     pub fn send_inventory_sync(&self) -> Result<(), NetError> {
         use icbm_mc_767::packets::play::clientbound::{CItemStack, CSetContainerContent};
         let inventory = self.inventory.lock().expect("inventory");
-        let slots: Vec<CItemStack> = inventory
-            .iter()
-            .map(|item| {
-                item.as_deref()
-                    .map_or_else(CItemStack::empty, |item| CItemStack::of(item, 1))
-            })
-            .collect();
+        let slots: Vec<CItemStack> = inventory.slots.iter().map(|slot| slot.0.clone()).collect();
         let content = CSetContainerContent {
             sync_id: 0,
             revision: 0,
             slots,
-            carried: CItemStack::empty(),
+            carried: inventory.carried.0.clone(),
         };
         drop(inventory);
         self.send_encoded(CSetContainerContent::packet_id(), |w| {
@@ -1338,8 +1332,47 @@ fn load_player_data(server: &Server, client: &Arc<Client>) -> bool {
         };
         client.dimension.store(dim_id, Ordering::Relaxed);
     }
+    // 物品栏（`Inventory` 列表，vanilla 内部槽号 → 网络槽号）
+    if let Some(Nbt::List(list)) = root.get("Inventory") {
+        let decoded = icbm_anvil::player::decode_inventory(list);
+        let mut inventory = client.inventory.lock().expect("inventory");
+        for (slot, item) in decoded.iter().enumerate() {
+            if let Some((name, count)) = item {
+                inventory.slot_mut(slot).0 =
+                    icbm_mc_767::packets::play::clientbound::CItemStack::of(name, *count);
+            }
+        }
+        // 同步热栏便捷视图
+        drop(inventory);
+        sync_hotbar_view(client);
+    }
     debug!(%uuid, "player data loaded");
     true
+}
+
+/// 同步 `hotbar` 便捷视图（从 `inventory` 热栏段 36..44 派生），并更新
+/// `held_item`（当前选中槽）。物品栏加载/点击/设置后调用。
+fn sync_hotbar_view(client: &Arc<Client>) {
+    use icbm_gameplay_minecraft::inventory::HOTBAR_START;
+    let inventory = client.inventory.lock().expect("inventory");
+    let mut hotbar = client.hotbar.lock().expect("hotbar");
+    for index in 0..9 {
+        if let Some(cell) = hotbar.get_mut(index) {
+            cell.clone_from(&inventory.slot(HOTBAR_START + index).0.item);
+        }
+    }
+    let selected = client.carried_slot.load(Ordering::Relaxed).clamp(0, 8) as usize;
+    drop(hotbar);
+    drop(inventory);
+    let item = client
+        .inventory
+        .lock()
+        .expect("inventory")
+        .slot(HOTBAR_START + selected)
+        .0
+        .item
+        .clone();
+    *client.held_item.lock().expect("held item") = item;
 }
 
 /// 保存玩家存档（游戏模式与位置；离线后可恢复）。
@@ -1367,6 +1400,21 @@ fn save_player_data(server: &Server, client: &Arc<Client>) {
     root.insert("Rotation", Nbt::List(Box::new(rot)));
     root.insert("Dimension", Nbt::String(dimension.to_owned()));
     root.insert("playerGameType", Nbt::Int(i32::from(gamemode)));
+    // 物品栏（`Inventory` 列表，vanilla 内部槽号）
+    let items: Vec<Option<(String, i32)>> = {
+        let inventory = client.inventory.lock().expect("inventory");
+        inventory
+            .slots
+            .iter()
+            .map(|slot| {
+                slot.0
+                    .item
+                    .as_ref()
+                    .map(|name| (name.clone(), slot.0.count))
+            })
+            .collect()
+    };
+    root.insert("Inventory", icbm_anvil::player::encode_inventory(&items));
     let dir = server.config.world_dir.join("playerdata");
     if std::fs::create_dir_all(&dir).is_ok() {
         let path = dir.join(icbm_anvil::player::player_file_name(&uuid));

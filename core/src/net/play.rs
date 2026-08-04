@@ -431,6 +431,10 @@ pub fn handle_play_packet(
                 icbm_mc_767::packets::play::serverbound::SSetCreativeModeSlot::decode(reader)?;
             handle_set_creative_slot(client, &packet);
         }
+        play_ids::SERVERBOUND_CONTAINER_CLICK => {
+            let packet = icbm_mc_767::packets::play::serverbound::SContainerClick::decode(reader)?;
+            handle_container_click(client, &packet);
+        }
         play_ids::SERVERBOUND_SET_CARRIED_ITEM => {
             // 选中热栏槽（0..8）：手持物品 = 热栏对应槽（若有物品）。
             // 旧实现直接丢弃该包，真实客户端（创造/生存）放置方块永远
@@ -438,9 +442,11 @@ pub fn handle_play_packet(
             let packet = icbm_mc_767::packets::play::serverbound::SSetCarriedItem::decode(reader)?;
             client.carried_slot.store(packet.slot, Ordering::Relaxed);
             let item = {
+                use icbm_gameplay_minecraft::inventory::HOTBAR_START;
                 let inventory = client.inventory.lock().expect("inventory");
                 let index = usize::try_from(packet.slot).unwrap_or(usize::MAX);
-                inventory.get(index + 36).and_then(Clone::clone)
+                let stack = &inventory.slot(HOTBAR_START + index.min(8)).0;
+                stack.item.clone()
             };
             *client.held_item.lock().expect("held item") = item;
         }
@@ -1246,15 +1252,19 @@ fn handle_set_creative_slot(
     client: &Arc<Client>,
     packet: &icbm_mc_767::packets::play::serverbound::SSetCreativeModeSlot,
 ) {
+    use icbm_gameplay_minecraft::inventory::{HOTBAR_END, HOTBAR_START};
     use icbm_mc_767::packets::play::clientbound::{CItemStack, CSetSlot};
     // 槽位是 `InventoryMenu` 槽号（vanilla）：热栏 36..44、主栏 9..35、装备
     // 5..8、副手 45；-1 = 光标丢弃。写入完整物品栏并同步回客户端。
-    let slot = packet.slot;
-    if (5..=45).contains(&slot) && slot != 45 - 1 {
+    let slot = i16::try_from(packet.slot).unwrap_or(0);
+    if icbm_gameplay_minecraft::inventory::PlayerInventory::is_valid_slot(slot) {
         let index = usize::try_from(slot).unwrap_or(0);
-        if let Some(target) = client.inventory.lock().expect("inventory").get_mut(index) {
-            target.clone_from(&packet.stack.item);
-        }
+        client
+            .inventory
+            .lock()
+            .expect("inventory")
+            .slot_mut(index)
+            .0 = packet.stack.clone();
         // 同步回客户端（CSetSlot，sync_id=0 玩家物品栏；保持客户端与服务端一致）
         let stack = packet
             .stack
@@ -1263,12 +1273,11 @@ fn handle_set_creative_slot(
             .map_or_else(CItemStack::empty, |item| {
                 CItemStack::of(item, packet.stack.count.max(1))
             });
-        let slot_i16 = i16::try_from(slot).unwrap_or(0);
         let _ = client.send_encoded(CSetSlot::packet_id(), |w| {
             CSetSlot {
                 sync_id: 0,
                 revision: 0,
-                slot: slot_i16,
+                slot,
                 stack,
             }
             .encode(w);
@@ -1278,14 +1287,16 @@ fn handle_set_creative_slot(
         return;
     }
     // 热栏快捷视图同步（held_item 由 carried_slot 派生）
-    if (36..=44).contains(&slot) {
+    if (HOTBAR_START..HOTBAR_END).contains(&usize::try_from(slot).unwrap_or(0)) {
         let index = usize::try_from(slot - 36).unwrap_or(0);
         let item = client
             .inventory
             .lock()
             .expect("inventory")
-            .get(index + 36)
-            .and_then(Clone::clone);
+            .slot(HOTBAR_START + index)
+            .0
+            .item
+            .clone();
         {
             let mut hotbar = client.hotbar.lock().expect("hotbar");
             if let Some(cell) = hotbar.get_mut(index) {
@@ -1296,6 +1307,90 @@ fn handle_set_creative_slot(
             (*client.held_item.lock().expect("held item")) = item;
         }
     }
+}
+
+/// 处理容器点击（`SContainerClick`，vanilla `AbstractContainerMenu.clicked` 简化）：
+/// 调用 gameplay 的 `handle_click` 纯计算，随后把变更槽逐个 `CSetSlot` 同步回
+/// 客户端（含光标，槽 -1）。
+fn handle_container_click(
+    client: &Arc<Client>,
+    packet: &icbm_mc_767::packets::play::serverbound::SContainerClick,
+) {
+    use icbm_gameplay_minecraft::inventory::{ClickEvent, ClickType, handle_click};
+    use icbm_mc_767::packets::play::clientbound::CSetSlot;
+    // 仅处理玩家物品栏（container_id = 0）；其它容器后续阶段
+    if packet.container_id != 0 {
+        return;
+    }
+    let Some(click_type) = ClickType::from_id(packet.click_type) else {
+        return; // 未知点击类型：忽略
+    };
+    let event = ClickEvent {
+        slot: packet.slot,
+        button: packet.button,
+        click_type,
+    };
+    let result = {
+        let inventory = client.inventory.lock().expect("inventory");
+        handle_click(&inventory, event)
+    };
+    // 应用到服务端物品栏
+    *client.inventory.lock().expect("inventory") = result.inventory;
+    // 同步变更槽（CSetSlot，sync_id=0 玩家物品栏）
+    for slot in result.changed_slots {
+        let stack = client
+            .inventory
+            .lock()
+            .expect("inventory")
+            .slot(usize::try_from(slot).unwrap_or(0))
+            .0
+            .clone();
+        let _ = client.send_encoded(CSetSlot::packet_id(), |w| {
+            CSetSlot {
+                sync_id: 0,
+                revision: 0,
+                slot: i16::try_from(slot).unwrap_or(0),
+                stack,
+            }
+            .encode(w);
+        });
+    }
+    // 同步光标（槽 -1）
+    if result.carried_changed {
+        let carried = client
+            .inventory
+            .lock()
+            .expect("inventory")
+            .carried
+            .0
+            .clone();
+        let _ = client.send_encoded(CSetSlot::packet_id(), |w| {
+            CSetSlot {
+                sync_id: 0,
+                revision: 0,
+                slot: -1,
+                stack: carried,
+            }
+            .encode(w);
+        });
+    }
+    // 更新 held_item（热栏选中槽可能被点击移动）
+    update_held_item_from_inventory(client);
+}
+
+/// 从当前选中热栏槽派生 `held_item`（点击/切换热栏后调用）。
+fn update_held_item_from_inventory(client: &Arc<Client>) {
+    use icbm_gameplay_minecraft::inventory::HOTBAR_START;
+    let index = client.carried_slot.load(Ordering::Relaxed).clamp(0, 8) as usize;
+    let item = client
+        .inventory
+        .lock()
+        .expect("inventory")
+        .slot(HOTBAR_START + index)
+        .0
+        .item
+        .clone();
+    *client.held_item.lock().expect("held item") = item;
 }
 
 /// 广播聊天。
