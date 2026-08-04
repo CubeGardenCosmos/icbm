@@ -4,18 +4,10 @@
 //! 地狱 4×4 区块区域，通过 datarouter 与 core 通讯。生命周期状态机：
 //! 注册 → 模拟 → 沉睡 → 卸载（见 [`service`]）。
 
-pub mod crops;
-pub mod entities;
-pub mod fluids;
-pub mod mobs;
-pub mod pistons;
-pub mod portal;
 pub mod protocol;
-pub mod redstone;
 pub mod service;
 pub mod store;
 pub mod ticks;
-pub mod weather;
 
 pub use service::{RegionConfig, RegionError, RegionService, run_region};
 

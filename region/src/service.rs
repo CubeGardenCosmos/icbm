@@ -155,49 +155,11 @@ impl Ticker {
     }
 }
 
-/// Creeper 实体类型注册表 ID（vanilla 1.21.1 `EntityType` 注册序，对照 master
-/// `data/src/generated/entity_type.rs`：`CREEPER` = 23）。
-const ENTITY_TYPE_CREEPER: i32 = 23;
-/// 每区域最多存活的 Creeper 数（vanilla 每区域怪物上限约 70，本实现取小）。
-const MAX_CREEPERS: usize = 12;
-/// 每 tick 生成 Creeper 的概率（夜晚约 2 秒一只；vanilla 每区块多次生成尝试，
-/// 取较高值保证测试与演示可复现）。
-const SPAWN_CHANCE: f64 = 1.0 / 40.0;
-/// Creeper 出生高度（superflat 地表顶 -61 之上）。
-const CREEPER_SPAWN_Y: f64 = crate::OVERWORLD_SURFACE_FEET_Y as f64;
-/// 敌对生物追踪/引爆半径（方块）：vanilla `CreeperEntity` 的
-/// `CHARGED_CREEPER`/`FUSE_TIME` 与 `MobEntity` 目标半径。
-const CREEPER_TARGET_RANGE: f64 = 16.0;
-/// 点燃引信的玩家距离（vanilla 3 格内开始闪烁）。
-const CREEPER_FUSE_RANGE: f64 = 3.0;
-/// 引信时长（tick；vanilla `CreeperEntity.FUSE_TIME` = 30）。
-const CREEPER_FUSE_TICKS: i32 = 30;
-/// 夜晚时间窗（世界时间 % 24000；vanilla 13000..23000 为夜间，敌对生物生成）。
-const NIGHT_START: i64 = 13_000;
-const NIGHT_END: i64 = 23_000;
-
-/// 区域内一只漫游 Creeper（不攻击，仅作 region 存活/卸载信号）。
-struct Creeper {
-    /// 实体 ID（`entity_base + 生成序`）。
-    entity_id: i32,
-    /// 实体 UUID。
-    uuid: Uuid,
-    /// X（方块）。
-    x: f64,
-    /// Y（方块）。
-    y: f64,
-    /// Z（方块）。
-    z: f64,
-    /// 偏航角（度）。
-    yaw: f32,
-    /// 上次移动方向（1/4 方向索引；避免连续折返，寻路更自然）。
-    last_dir: u8,
-    /// 引信倒计时（tick；-1 = 未点燃）。点燃后闪烁并倒计时爆炸（vanilla 30 tick）。
-    fuse: i32,
-}
-
 /// 传送门框架检测结果：`(朝向, 待填充方块列表)`。
-type FoundFrame = (crate::portal::PortalAxis, Vec<(i32, i32, i32)>);
+type FoundFrame = (
+    icbm_gameplay_minecraft::portal::PortalAxis,
+    Vec<(i32, i32, i32)>,
+);
 
 /// region 服务。
 pub struct RegionService {
@@ -218,11 +180,11 @@ pub struct RegionService {
     /// core 分配的实体 ID 基址（`REGISTER_ACK`）。
     entity_base: i32,
     /// 区域内非玩家实体（掉落物/TNT）。
-    entities: crate::entities::EntityManager,
+    entities: icbm_gameplay_minecraft::entities::EntityManager,
     /// 区域内友好生物（牛/猪/鸡/羊）。
-    mobs: crate::mobs::MobManager,
+    mobs: icbm_gameplay_minecraft::mob_behavior::MobManager,
     /// 区域内漫游 Creeper（region 存活信号）。
-    creepers: Vec<Creeper>,
+    creepers: Vec<icbm_gameplay_minecraft::creeper::Creeper>,
     /// xorshift64 状态（种子取自区域坐标，固定种子可复现）。
     rng: u64,
     /// 世界游戏规则（`GAMERULE_UPDATE` 同步；默认原版值）。
@@ -236,10 +198,10 @@ pub struct RegionService {
     /// 上次广播时间（节流：每秒一次）。
     last_time_broadcast: Instant,
     /// 天气状态（雨/雷/梯度）。
-    weather: crate::weather::WeatherState,
+    weather: icbm_gameplay_minecraft::weather::WeatherState,
     /// 流体计划 tick 队列（vanilla `LevelTicks<Fluid>`；放置/邻居变化 →
     /// `scheduleTick(pos, fluid, getTickDelay)`，到期执行 `FlowingFluid.tick`）。
-    fluid_ticks: crate::ticks::LevelTicks<crate::fluids::FluidKind>,
+    fluid_ticks: crate::ticks::LevelTicks<icbm_gameplay_minecraft::fluid::FluidKind>,
     /// 计划 tick 调度顺序计数器（vanilla `subTickOrder`：同 tick 同优先级 FIFO）。
     sub_tick_order: u64,
 }
@@ -280,7 +242,7 @@ impl RegionService {
             let add = icbm_mc_767::packets::play::clientbound::CAddEntity {
                 entity_id: tnt.entity_id,
                 uuid: tnt.uuid,
-                entity_type: crate::entities::entity_type_ids::TNT,
+                entity_type: icbm_gameplay_minecraft::entities::entity_type_ids::TNT,
                 x: tnt.x,
                 y: tnt.y,
                 z: tnt.z,
@@ -306,7 +268,7 @@ impl RegionService {
     /// 以玩家落点 (x, y, z) 为中心建 4×5 黑曜石框架并填充传送门方块，
     /// 向区域玩家广播 `CBlockUpdate`。
     fn create_portal(&mut self, face: Face, x: i32, y: i32, z: i32) -> Result<(), RegionError> {
-        use crate::portal::{PortalAxis, build_portal, portal_state};
+        use icbm_gameplay_minecraft::portal::{PortalAxis, build_portal, portal_state};
         // 朝向确定性选择（坐标奇偶），与 core `portal_center` 落点一致
         let axis = PortalAxis::from_pos(x, z);
         let bottom_y = y - 2;
@@ -339,7 +301,7 @@ impl RegionService {
 
     /// 黑曜石放置后检查 4×5 传送门框架（两种朝向），构成则填充传送门方块并广播。
     fn try_build_portal(&mut self, x: i32, y: i32, z: i32) -> Result<(), RegionError> {
-        use crate::portal::{PortalAxis, detect_portal_frame, portal_state};
+        use icbm_gameplay_minecraft::portal::{PortalAxis, detect_portal_frame, portal_state};
         // 先快照检测窗口内方块（避免闭包持 &mut store 与 set_block 冲突）
         let snapshot: std::collections::HashMap<(i32, i32, i32), i32> = {
             let mut map = std::collections::HashMap::new();
@@ -418,7 +380,7 @@ impl RegionService {
         //    （vanilla `LiquidBlock.onPlace`/`neighborChanged` → `scheduleTick`）。
         for (x, y, z) in self.store.fluid_schedule_positions() {
             let state = self.store.block_at(Face::Overworld, x, y, z).unwrap_or(0);
-            let Some(kind) = crate::fluids::FluidKind::from_state_id(state) else {
+            let Some(kind) = icbm_gameplay_minecraft::fluid::FluidKind::from_state_id(state) else {
                 continue; // 该位置已无流体（被移除/替换），无自身 tick 可调度
             };
             let order = self.next_sub_tick_order();
@@ -442,13 +404,15 @@ impl RegionService {
                 .store
                 .block_at(Face::Overworld, tick.pos.0, tick.pos.1, tick.pos.2)
                 .unwrap_or(0);
-            if crate::fluids::FluidKind::from_state_id(state) != Some(tick.kind) {
+            if icbm_gameplay_minecraft::fluid::FluidKind::from_state_id(state) != Some(tick.kind) {
                 continue; // 方块已变化（vanilla `tickFluid` 校验 fluidState.is(fluid)）
             }
-            let result =
-                crate::fluids::tick_fluid_at(tick.pos.0, tick.pos.1, tick.pos.2, |x, y, z| {
-                    self.store.block_at(Face::Overworld, x, y, z).unwrap_or(0)
-                });
+            let result = icbm_gameplay_minecraft::fluid::tick_fluid_at(
+                tick.pos.0,
+                tick.pos.1,
+                tick.pos.2,
+                |x, y, z| self.store.block_at(Face::Overworld, x, y, z).unwrap_or(0),
+            );
             for update in &result.updates[..result.len] {
                 updates.push((update.x, update.y, update.z, update.state_id));
             }
@@ -516,13 +480,13 @@ impl RegionService {
             unknown_messages: 0,
             pending_chunks: std::collections::VecDeque::new(),
             entity_base: 0,
-            entities: crate::entities::EntityManager::new(),
-            mobs: crate::mobs::MobManager::new(),
+            entities: icbm_gameplay_minecraft::entities::EntityManager::new(),
+            mobs: icbm_gameplay_minecraft::mob_behavior::MobManager::new(),
             creepers: Vec::new(),
             rng: rng | 1,
             gamerules: std::collections::HashMap::new(),
             world_time: 0,
-            weather: crate::weather::WeatherState::new(),
+            weather: icbm_gameplay_minecraft::weather::WeatherState::new(),
             last_time_broadcast: Instant::now(),
             command_block_fired: std::collections::HashMap::new(),
             piston_powered: std::collections::HashMap::new(),
@@ -726,9 +690,9 @@ impl RegionService {
                     // 晴雨切换：广播 START/STOP（对照 vanilla `tickWeather`）
                     if toggled {
                         let event = if raining {
-                            crate::weather::GAME_EVENT_RAIN_STARTED
+                            icbm_gameplay_minecraft::weather::GAME_EVENT_RAIN_STARTED
                         } else {
-                            crate::weather::GAME_EVENT_RAIN_STOPPED
+                            icbm_gameplay_minecraft::weather::GAME_EVENT_RAIN_STOPPED
                         };
                         let packet = icbm_mc_767::packets::play::clientbound::CGameEvent {
                             event,
@@ -875,38 +839,16 @@ impl RegionService {
 
     /// 实体 tick：掉落物物理（下落/衰减）+ TNT 引信与爆炸。
     fn tick_entities(&mut self) -> Result<(), RegionError> {
-        // 掉落物：重力下落 + 随机移动，年龄增加（6000 tick 消失，vanilla 行为）
+        // 掉落物与 TNT 行为由 gameplay 定义（重力/碰撞/拾取/引信），
+        // 此处只编排（调用行为、发包、清理）。
+        let surface_top = f64::from(crate::OVERWORLD_SURFACE_FEET_Y) - 1.0;
         let item_moves: Vec<(i32, i16, i16, i16)> = self
             .entities
             .items
             .iter_mut()
             .filter_map(|item| {
-                item.age = item.age.saturating_add(1);
-                // 1 tick 后变为可拾取
-                if item.age >= 1 {
-                    item.pickable = true;
-                }
-                // 重力：速度积累 + 位置更新
-                let gravity = 0.04;
-                item.vy = (item.vy - gravity).max(-0.6);
-                // 简单地面碰撞：落到 superflat 地表（-61）上方时停止
-                let old_x = item.x;
-                let old_y = item.y;
-                let old_z = item.z;
-                item.x += item.vx;
-                item.y += item.vy;
-                item.z += item.vz;
-                let surface_top = f64::from(crate::OVERWORLD_SURFACE_FEET_Y) - 1.0;
-                if item.y < surface_top {
-                    item.y = surface_top;
-                    item.vy = 0.0;
-                    item.vx = 0.0;
-                    item.vz = 0.0;
-                }
-                let dx = ((item.x - old_x) * 4096.0) as i16;
-                let dy = ((item.y - old_y) * 4096.0) as i16;
-                let dz = ((item.z - old_z) * 4096.0) as i16;
-                (dx != 0 || dy != 0 || dz != 0).then_some((item.entity_id, dx, dy, dz))
+                item.tick(surface_top)
+                    .map(|(dx, dy, dz)| (item.entity_id, dx, dy, dz))
             })
             .collect();
         for (entity_id, dx, dy, dz) in item_moves {
@@ -926,15 +868,12 @@ impl RegionService {
             .entities
             .tnts
             .iter_mut()
-            .filter_map(|tnt| {
-                tnt.fuse = tnt.fuse.saturating_sub(1);
-                (tnt.fuse == 0).then_some((tnt.x, tnt.y, tnt.z))
-            })
+            .filter_map(|tnt| tnt.tick_fuse().then_some((tnt.x, tnt.y, tnt.z)))
             .collect();
         for (x, y, z) in exploded {
             self.detonate_tnt(x, y, z)?;
         }
-        // 清理过期掉落物
+        // 清理过期掉落物（vanilla 6000 tick = 5 分钟）
         self.entities.items.retain(|item| item.age < 6000);
         // 清理已爆炸 TNT
         self.entities.tnts.retain(|tnt| tnt.fuse > 0);
@@ -964,7 +903,8 @@ impl RegionService {
             let mut lookup = |bx: i32, by: i32, bz: i32| {
                 store.block_at(Face::Overworld, bx, by, bz).unwrap_or(0)
             };
-            crate::entities::compute_explosion(x, y, z, radius, &mut lookup).affected_blocks
+            icbm_gameplay_minecraft::entities::compute_explosion(x, y, z, radius, &mut lookup)
+                .affected_blocks
         };
         // 广播 CExplosion（受影响方块 → 客户端渲染爆炸效果）
         let explosion = CExplosion {
@@ -1022,7 +962,7 @@ impl RegionService {
             let add = icbm_mc_767::packets::play::clientbound::CAddEntity {
                 entity_id: item_entity.entity_id,
                 uuid: item_entity.uuid,
-                entity_type: crate::entities::entity_type_ids::ITEM,
+                entity_type: icbm_gameplay_minecraft::entities::entity_type_ids::ITEM,
                 x: item_entity.x,
                 y: item_entity.y,
                 z: item_entity.z,
@@ -1039,7 +979,9 @@ impl RegionService {
     /// 红石 tick：对脏区块内的红石线计算供电（6 方向电源 + 垂直/对角传导）、
     /// 红石灯根据相邻信号点亮/熄灭。
     fn tick_redstone(&mut self) -> Result<(), RegionError> {
-        use crate::redstone::{compute_wire_power, neighbor_has_signal, wire_power, wire_state};
+        use icbm_gameplay_minecraft::redstone::{
+            compute_wire_power, neighbor_has_signal, wire_power, wire_state,
+        };
         use icbm_mc_767::packets::play::block_state_ids as ids;
         let chunks = self.store.redstone_chunks();
         if chunks.is_empty() {
@@ -1079,7 +1021,7 @@ impl RegionService {
         let mut lamp_updates: Vec<(i32, i32, i32, i32)> = Vec::new();
         for (x, y, z) in lamps {
             let lit = neighbor_has_signal(&snapshot, x, y, z);
-            let target = crate::redstone::lamp_state(lit);
+            let target = icbm_gameplay_minecraft::redstone::lamp_state(lit);
             let current = snapshot.get(&(x, y, z)).copied().unwrap_or(0);
             if current != target {
                 lamp_updates.push((x, y, z, target));
@@ -1150,7 +1092,7 @@ impl RegionService {
     /// 循环方块原版每 tick 执行，此处同样只触发一次（避免刷屏）。
     /// 位置表由 store 维护（`set_block` 增量更新），避免全量扫描。
     fn tick_command_blocks(&mut self) -> Result<(), RegionError> {
-        use crate::redstone::neighbor_has_signal;
+        use icbm_gameplay_minecraft::redstone::neighbor_has_signal;
         let positions = self.store.command_block_positions();
         if positions.is_empty() {
             return Ok(());
@@ -1206,7 +1148,7 @@ impl RegionService {
         if positions.is_empty() {
             return Ok(());
         }
-        let actions = crate::pistons::tick_pistons(
+        let actions = icbm_gameplay_minecraft::pistons::tick_pistons(
             &positions,
             &mut self.piston_powered,
             &mut PistonStoreAccess(&mut self.store),
@@ -1250,21 +1192,22 @@ impl RegionService {
                 continue;
             }
             let state = self.store.block_at(Face::Overworld, x, y, z).unwrap_or(0);
-            let Some(crop) = crate::crops::is_crop(state) else {
+            let Some(crop) = icbm_gameplay_minecraft::crops::is_crop(state) else {
                 continue;
             };
             let age = state - crop.base;
             if age >= crop.max_age {
                 continue; // 已成熟
             }
-            // 生长概率：可可 2/3，其余 1/3（对照 `CropBlock`/`CocoaBlock`）
-            let chance = if crop.base == icbm_mc_767::packets::play::block_state_ids::COCOA_AGE_0 {
-                2.0 / 3.0
-            } else {
-                1.0 / 3.0
-            };
-            if self.rand_f64() < chance {
-                growth.push((x, y, z, crate::crops::crop_state(crop, age + 1)));
+            // 生长概率由 gameplay 定义（可可 2/3，其余 1/3，对照
+            // `CropBlock`/`CocoaBlock`）
+            if self.rand_f64() < icbm_gameplay_minecraft::crops::growth_chance(crop) {
+                growth.push((
+                    x,
+                    y,
+                    z,
+                    icbm_gameplay_minecraft::crops::crop_state(crop, age + 1),
+                ));
             }
         }
         for (x, y, z, state) in growth {
@@ -1293,8 +1236,14 @@ impl RegionService {
         let rain = self.weather.rain_gradient();
         let thunder = self.weather.thunder_gradient();
         for (event, value) in [
-            (crate::weather::GAME_EVENT_RAIN_GRADIENT, rain),
-            (crate::weather::GAME_EVENT_THUNDER_GRADIENT, thunder),
+            (
+                icbm_gameplay_minecraft::weather::GAME_EVENT_RAIN_GRADIENT,
+                rain,
+            ),
+            (
+                icbm_gameplay_minecraft::weather::GAME_EVENT_THUNDER_GRADIENT,
+                thunder,
+            ),
         ] {
             let packet = icbm_mc_767::packets::play::clientbound::CGameEvent { event, value };
             self.send_entity_packet(play_ids::CLIENTBOUND_GAME_EVENT, |w| {
@@ -1363,21 +1312,22 @@ impl RegionService {
 
     /// 敌对生物（Creeper）tick：vanilla 生成机制 + 追逐/引爆 AI。
     ///
-    /// 生成：仅在夜晚（`world_time % 24000 ∈ [13000, 23000)`）且 `doMobSpawning`
-    /// 开启时按概率生成，上限 `MAX_CREEPERS`。AI：寻找最近玩家（16 格内），
-    /// 向其靠近；3 格内点燃引信（广播实体状态闪烁），30 tick 后爆炸。
-    #[allow(clippy::too_many_lines)] // 生成 + 追逐 + 引信 + 爆炸的事件流水
+    /// 敌对生物（Creeper）tick：生成机制与追逐/引爆 AI 由 gameplay
+    /// （`creeper` 模块）计算，此处只编排（输入玩家位置/世界时间/RNG，
+    /// 按动作事件发包与爆炸）。
     fn tick_creepers(&mut self) -> Result<(), RegionError> {
+        use icbm_gameplay_minecraft::creeper::{
+            CreeperAction, EXPLOSION_RADIUS, MAX_CREEPERS, NIGHT_END, NIGHT_START, SPAWN_CHANCE,
+        };
         let night = {
             let phase = self.world_time.rem_euclid(24_000);
             (NIGHT_START..NIGHT_END).contains(&phase)
         };
-        if self.gamerule_bool("doMobSpawning")
-            && night
-            && self.creepers.len() < MAX_CREEPERS
-            && self.rand_f64() < SPAWN_CHANCE
-        {
-            self.spawn_creeper()?;
+        if self.gamerule_bool("doMobSpawning") && night && self.creepers.len() < MAX_CREEPERS {
+            // 生成概率由 gameplay 定义（`SPAWN_CHANCE`）
+            if self.rand_f64() < SPAWN_CHANCE {
+                self.spawn_creeper()?;
+            }
         }
         let min_x = f64::from(self.config.id.rx) * 512.0;
         let min_z = f64::from(self.config.id.rz) * 512.0;
@@ -1397,112 +1347,98 @@ impl RegionService {
             best.map(|(_, pos)| pos)
         };
 
-        let mut moves: Vec<(i32, i16, i16)> = Vec::new();
-        let mut fuse_starts: Vec<i32> = Vec::new();
-        let mut explosions: Vec<(i32, f64, f64, f64)> = Vec::new();
-        let mut alive: Vec<Creeper> = Vec::with_capacity(self.creepers.len());
+        // AI 行为由 gameplay 计算，逐只返回动作事件
+        let mut actions: Vec<CreeperAction> = Vec::new();
+        let mut alive: Vec<icbm_gameplay_minecraft::creeper::Creeper> =
+            Vec::with_capacity(self.creepers.len());
+        // 让 gameplay 的 AI 用本 region 的确定性 RNG（闭包捕获 `rng` 状态）
+        let rng_state = &mut self.rng;
+        let mut ai_rand = || {
+            *rng_state ^= *rng_state << 13;
+            *rng_state ^= *rng_state >> 7;
+            *rng_state ^= *rng_state << 17;
+            (*rng_state >> 11) as f64 / (1u64 << 53) as f64
+        };
         for mut creeper in std::mem::take(&mut self.creepers) {
-            if creeper.fuse >= 0 {
-                // 引信倒计时
-                creeper.fuse -= 1;
-                if creeper.fuse <= 0 {
-                    explosions.push((creeper.entity_id, creeper.x, creeper.y, creeper.z));
-                    continue;
+            if let Some(action) = creeper.tick(
+                nearest,
+                min_x,
+                min_x + 512.0,
+                min_z,
+                min_z + 512.0,
+                &mut ai_rand,
+            ) {
+                let is_explode = matches!(action, CreeperAction::Explode(_, _, _, _));
+                if is_explode {
+                    actions.push(action);
+                    continue; // 已爆炸，不再存活
                 }
-                alive.push(creeper);
-                continue;
-            }
-            // 追逐最近玩家
-            if let Some((px, py, pz)) = nearest {
-                let dx = px - creeper.x;
-                let dz = pz - creeper.z;
-                let horizontal = dx.hypot(dz);
-                if horizontal <= CREEPER_FUSE_RANGE {
-                    creeper.fuse = CREEPER_FUSE_TICKS;
-                    fuse_starts.push(creeper.entity_id);
-                    alive.push(creeper);
-                    continue;
-                }
-                if horizontal <= CREEPER_TARGET_RANGE
-                    && (py - creeper.y).abs() < 8.0
-                    && self.rand_f64() < 0.2
-                {
-                    // 朝玩家移动 1 格（vanilla 步行速度约 0.25 格/tick）
-                    let step = if dx.abs() > dz.abs() {
-                        (dx.signum(), 0.0)
-                    } else {
-                        (0.0, dz.signum())
-                    };
-                    let next_x = creeper.x + step.0;
-                    let next_z = creeper.z + step.1;
-                    if (min_x..min_x + 512.0).contains(&next_x)
-                        && (min_z..min_z + 512.0).contains(&next_z)
-                    {
-                        creeper.x = next_x;
-                        creeper.z = next_z;
-                        moves.push((
-                            creeper.entity_id,
-                            (step.0 * 4096.0) as i16,
-                            (step.1 * 4096.0) as i16,
-                        ));
-                    }
-                }
+                actions.push(action);
             }
             alive.push(creeper);
         }
         self.creepers = alive;
 
-        for (entity_id, delta_x, delta_z) in moves {
-            let move_pos = CMoveEntityPos {
-                entity_id,
-                delta_x,
-                delta_y: 0,
-                delta_z,
-                on_ground: true,
-            };
-            self.send_entity_packet(play_ids::CLIENTBOUND_MOVE_ENTITY_POS, |w| {
-                move_pos.encode(w);
-            })?;
-        }
-        for entity_id in fuse_starts {
-            // 实体状态 1 = 苦力怕点燃引信（客户端渲染闪烁）
-            let status = icbm_mc_767::packets::play::clientbound::CEntityStatus {
-                entity_id,
-                status: 1,
-            };
-            self.send_entity_packet(play_ids::CLIENTBOUND_ENTITY_EVENT, |w| {
-                status.encode(w);
-            })?;
-        }
-        for (entity_id, x, y, z) in explosions {
-            // 爆炸后移除 Creeper 实体并破坏方块
-            let remove = icbm_mc_767::packets::play::clientbound::CRemoveEntities {
-                entity_ids: vec![entity_id],
-            };
-            self.send_entity_packet(play_ids::CLIENTBOUND_REMOVE_ENTITIES, |w| {
-                remove.encode(w);
-            })?;
-            self.detonate_explosion(x, y, z, 3.0)?;
+        for action in actions {
+            match action {
+                CreeperAction::Move(entity_id, delta_x, delta_z) => {
+                    let move_pos = CMoveEntityPos {
+                        entity_id,
+                        delta_x,
+                        delta_y: 0,
+                        delta_z,
+                        on_ground: true,
+                    };
+                    self.send_entity_packet(play_ids::CLIENTBOUND_MOVE_ENTITY_POS, |w| {
+                        move_pos.encode(w);
+                    })?;
+                }
+                CreeperAction::FuseStart(entity_id) => {
+                    // 实体状态 1 = 苦力怕点燃引信（客户端渲染闪烁）
+                    let status = icbm_mc_767::packets::play::clientbound::CEntityStatus {
+                        entity_id,
+                        status: 1,
+                    };
+                    self.send_entity_packet(play_ids::CLIENTBOUND_ENTITY_EVENT, |w| {
+                        status.encode(w);
+                    })?;
+                }
+                CreeperAction::Explode(entity_id, x, y, z) => {
+                    // 爆炸后移除 Creeper 实体并破坏方块
+                    let remove = icbm_mc_767::packets::play::clientbound::CRemoveEntities {
+                        entity_ids: vec![entity_id],
+                    };
+                    self.send_entity_packet(play_ids::CLIENTBOUND_REMOVE_ENTITIES, |w| {
+                        remove.encode(w);
+                    })?;
+                    self.detonate_explosion(x, y, z, EXPLOSION_RADIUS)?;
+                }
+            }
         }
         Ok(())
     }
 
-    /// 在区域内随机位置生成一只 Creeper 并广播 `ADD_ENTITY`。
+    /// 在区域内随机位置生成一只 Creeper 并广播 `ADD_ENTITY`（生成逻辑由
+    /// gameplay 计算，此处只发包）。
     fn spawn_creeper(&mut self) -> Result<(), RegionError> {
+        use icbm_gameplay_minecraft::creeper::{ENTITY_TYPE_CREEPER, SpawnParams};
         let index = self.creepers.len();
-        let entity_id = self.entity_base + i32::try_from(index).unwrap_or(i32::MAX);
-        let cx = self.config.id.rx * 32 + (self.next_random() % 32) as i32;
-        let cz = self.config.id.rz * 32 + (self.next_random() % 32) as i32;
-        let creeper = Creeper {
-            entity_id,
-            uuid: Uuid::new_v4(),
-            x: f64::from(cx * 16) + self.rand_f64() * 16.0,
-            y: CREEPER_SPAWN_Y,
-            z: f64::from(cz * 16) + self.rand_f64() * 16.0,
-            yaw: (self.rand_f64() * 360.0) as f32,
-            last_dir: 4, // 初始无方向
-            fuse: -1,    // 未点燃
+        // 让 gameplay 的生成用本 region 的确定性 RNG
+        let rng_state = &mut self.rng;
+        let mut spawn_rand = || {
+            *rng_state ^= *rng_state << 13;
+            *rng_state ^= *rng_state >> 7;
+            *rng_state ^= *rng_state << 17;
+            (*rng_state >> 11) as f64 / (1u64 << 53) as f64
         };
+        let mut params = SpawnParams {
+            rx: self.config.id.rx,
+            rz: self.config.id.rz,
+            spawn_y: crate::OVERWORLD_SURFACE_FEET_Y as f64,
+            entity_base: self.entity_base,
+            rand_f64: &mut spawn_rand,
+        };
+        let creeper = icbm_gameplay_minecraft::creeper::Creeper::spawn(&mut params, index);
         self.send_entity_packet(play_ids::CLIENTBOUND_ADD_ENTITY, |w| {
             CAddEntity {
                 entity_id: creeper.entity_id,
@@ -1516,13 +1452,14 @@ impl RegionService {
             }
             .encode(w);
         })?;
-        debug!(entity_id, "creeper spawned");
+        debug!(entity_id = creeper.entity_id, "creeper spawned");
         self.creepers.push(creeper);
         Ok(())
     }
 
     /// 玩家进入后补发所有已有 Creeper 的 `ADD_ENTITY`。
     fn resend_creepers(&self) -> Result<(), RegionError> {
+        use icbm_gameplay_minecraft::creeper::ENTITY_TYPE_CREEPER;
         for creeper in &self.creepers {
             let add = CAddEntity {
                 entity_id: creeper.entity_id,
@@ -1718,7 +1655,7 @@ mod raycast_tests {
 /// 活塞方块访问适配器（`ChunkStore` → `BlockAccess`）。
 struct PistonStoreAccess<'a>(&'a mut ChunkStore);
 
-impl crate::pistons::BlockAccess for PistonStoreAccess<'_> {
+impl icbm_gameplay_minecraft::pistons::BlockAccess for PistonStoreAccess<'_> {
     fn block_at(&mut self, x: i32, y: i32, z: i32) -> i32 {
         self.0.block_at(Face::Overworld, x, y, z).unwrap_or(0)
     }

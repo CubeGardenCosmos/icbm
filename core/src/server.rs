@@ -103,7 +103,7 @@ pub struct ServerInner {
     /// 全局世界时间（tick；core 管理，广播给所有 region，避免各 region 漂移）。
     pub world_time: Mutex<i64>,
     /// 全局天气（core 管理，广播给所有 region）。
-    pub weather: Mutex<icbm_region::weather::WeatherState>,
+    pub weather: Mutex<icbm_gameplay_minecraft::weather::WeatherState>,
 }
 
 /// 服务器（可克隆共享）。
@@ -157,7 +157,7 @@ impl Server {
                 lists: std::sync::Mutex::new(crate::lists::LoginLists::load(world_dir_for_lists)),
                 chunk_diag: std::sync::atomic::AtomicU64::new(0),
                 world_time: Mutex::new(0),
-                weather: Mutex::new(icbm_region::weather::WeatherState::new()),
+                weather: Mutex::new(icbm_gameplay_minecraft::weather::WeatherState::new()),
             }),
         })
     }

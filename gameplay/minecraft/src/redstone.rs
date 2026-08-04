@@ -96,7 +96,7 @@ pub const fn weak_source_signal(state_id: i32) -> i32 {
 #[must_use]
 pub const fn is_conductor(state_id: i32) -> bool {
     state_id != 0
-        && !crate::fluids::is_fluid(state_id)
+        && !crate::fluid::is_fluid(state_id)
         && wire_power(state_id).is_none()
         && state_id != ids::REDSTONE_LAMP
         && state_id != ids::REDSTONE_LAMP_ON

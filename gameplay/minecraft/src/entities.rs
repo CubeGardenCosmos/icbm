@@ -72,6 +72,50 @@ pub struct TntEntity {
     pub primed: bool,
 }
 
+impl ItemEntity {
+    /// 掉落物单 tick 行为（vanilla `ItemEntity.tick` 简化）：
+    /// 年龄 +1、1 tick 后可拾取、重力下落（0.04/tick²，上限 0.6）、
+    /// 落到地表（`surface_top`）上方停止。
+    ///
+    /// 返回本 tick 的位移（delta × 4096，供 `CMoveEntityPos` 编码）；
+    /// 未移动返回 `None`。
+    pub fn tick(&mut self, surface_top: f64) -> Option<(i16, i16, i16)> {
+        self.age = self.age.saturating_add(1);
+        // 1 tick 后变为可拾取（vanilla 拾取延迟）
+        if self.age >= 1 {
+            self.pickable = true;
+        }
+        // 重力：速度积累 + 位置更新
+        let gravity = 0.04;
+        self.vy = (self.vy - gravity).max(-0.6);
+        let old_x = self.x;
+        let old_y = self.y;
+        let old_z = self.z;
+        self.x += self.vx;
+        self.y += self.vy;
+        self.z += self.vz;
+        if self.y < surface_top {
+            self.y = surface_top;
+            self.vy = 0.0;
+            self.vx = 0.0;
+            self.vz = 0.0;
+        }
+        let dx = ((self.x - old_x) * 4096.0) as i16;
+        let dy = ((self.y - old_y) * 4096.0) as i16;
+        let dz = ((self.z - old_z) * 4096.0) as i16;
+        (dx != 0 || dy != 0 || dz != 0).then_some((dx, dy, dz))
+    }
+}
+
+impl TntEntity {
+    /// TNT 单 tick 行为：引信倒计时，归零返回 `true`（爆炸）。
+    #[allow(clippy::missing_const_for_fn)] // 修改 self.fuse，不能 const
+    pub fn tick_fuse(&mut self) -> bool {
+        self.fuse = self.fuse.saturating_sub(1);
+        self.fuse == 0
+    }
+}
+
 /// 实体管理器（region 内所有非玩家实体）。
 #[derive(Debug)]
 pub struct EntityManager {

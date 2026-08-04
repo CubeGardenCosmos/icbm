@@ -270,15 +270,17 @@ impl ChunkStore {
             // 旧/新任一为流体都记录：放置时 onPlace 调度自身；移除/替换时
             // neighborChanged 会让相邻流体重新求值（方块事件循环内扩散目标
             // 也经 set_block 回流到这里）。
-            if crate::fluids::is_fluid(state_id) || crate::fluids::is_fluid(old_state) {
+            if icbm_gameplay_minecraft::fluid::is_fluid(state_id)
+                || icbm_gameplay_minecraft::fluid::is_fluid(old_state)
+            {
                 self.fluid_schedule.insert((x, y, z));
             }
             // 红石：旧/新状态任一为红石方块都重新计算——拆除电源/导线也必须
             // 触发相邻导线重新求值（旧实现只查新状态，拆掉红石块后导线永远
             // 保持点亮，红石“不传导/无法熄灭”）。同时标记正交邻接区块：
             // 电源在邻区时本区导线也要更新（跨区块传导）。
-            if crate::redstone::is_redstone_block(state_id)
-                || crate::redstone::is_redstone_block(old_state)
+            if icbm_gameplay_minecraft::redstone::is_redstone_block(state_id)
+                || icbm_gameplay_minecraft::redstone::is_redstone_block(old_state)
             {
                 self.mark_redstone_region(cx, cz);
             }
@@ -289,7 +291,7 @@ impl ChunkStore {
                 self.command_blocks.remove(&(x, y, z));
             }
             // 维护活塞位置表（tick_pistons 增量遍历）
-            if crate::pistons::piston_info(state_id).is_some() {
+            if icbm_gameplay_minecraft::pistons::piston_info(state_id).is_some() {
                 self.pistons.insert((x, y, z));
             } else {
                 self.pistons.remove(&(x, y, z));

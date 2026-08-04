@@ -3,10 +3,11 @@ name = "icbm-gameplay-minecraft"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
-description = "Minecraft namespace gameplay content: blocks, mobs, sounds, gamerules, commands"
+description = "Minecraft namespace gameplay content: blocks, mobs, sounds, gamerules, commands, fluid/redstone/crops/weather simulation"
 
 [dependencies]
 icbm-mc-767 = { path = "../../lib/mc-767" }
+uuid = { version = "1", features = ["v4"] }
 
 [lints]
 workspace = true

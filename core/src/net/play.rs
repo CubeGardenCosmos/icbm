@@ -916,10 +916,10 @@ pub fn switch_dimension(
     x: f64,
     z: f64,
 ) -> Result<(), NetError> {
+    use icbm_gameplay_minecraft::portal::{PortalAxis, portal_center};
     use icbm_mc_767::packets::play::clientbound::{CRespawn, PlayerSpawnData};
     use icbm_mc_767::packets::play::dimension_names;
     use icbm_mc_767::packets::play::dimension_type_ids;
-    use icbm_region::portal::{PortalAxis, portal_center};
     let current = client.dimension.load(Ordering::Relaxed);
     if current == dimension {
         return Ok(()); // 已在目标维度

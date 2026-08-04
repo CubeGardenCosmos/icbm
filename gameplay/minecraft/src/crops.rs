@@ -71,10 +71,27 @@ pub const fn crop_state(crop: CropKind, age: i32) -> i32 {
     crop.base + age
 }
 
+/// 该作物每次随机 tick 的生长概率（vanilla `CropBlock.randomTick` 的
+/// `getAvailableMoisture` 加权简化：可可 2/3，其余 1/3）。
+#[must_use]
+pub const fn growth_chance(crop: CropKind) -> f64 {
+    if crop.base == ids::COCOA_AGE_0 {
+        2.0 / 3.0
+    } else {
+        1.0 / 3.0
+    }
+}
+
 #[cfg(test)]
 mod tests {
-    use super::{CROPS, crop_state, is_crop};
+    use super::{CROPS, crop_state, growth_chance, is_crop};
     use icbm_mc_767::packets::play::block_state_ids as ids;
+
+    #[test]
+    fn growth_chances_match_vanilla() {
+        assert_eq!(growth_chance(CROPS[0]), 1.0 / 3.0); // 小麦
+        assert_eq!(growth_chance(CROPS[6]), 2.0 / 3.0); // 可可
+    }
 
     #[test]
     fn crop_ids_match_vanilla() {

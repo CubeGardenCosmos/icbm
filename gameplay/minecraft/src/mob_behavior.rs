@@ -103,9 +103,14 @@ impl FriendlyMob {
     /// 生物在地面的 Y（flat 地表 y=3 上方站立）。
     #[must_use]
     pub const fn ground_y(&self) -> f64 {
-        crate::OVERWORLD_SURFACE_FEET_Y as f64
+        OVERWORLD_SURFACE_FEET_Y as f64
     }
 }
+
+/// 主世界 superflat 地表站立 Y（地表顶 -61 + 1；superflat 自洞穴更新后的
+/// 最低建筑点 Y=-64 起铺设，见 `icbm_terrain_gen` 的 Overworld flat 配置；
+/// 与 region 导出的同名常量同值，来源均为 terrain-gen）。
+pub const OVERWORLD_SURFACE_FEET_Y: i32 = -60;
 
 /// 生物管理器。
 #[derive(Debug)]

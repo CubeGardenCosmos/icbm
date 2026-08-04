@@ -8,6 +8,7 @@ description = "icbm region worker library (same binary as core, --region mode)"
 [dependencies]
 blinkcms-datarouter = { path = "../lib/datarouter" }
 icbm-anvil = { path = "../lib/anvil" }
+icbm-gameplay-minecraft = { path = "../gameplay/minecraft" }
 icbm-mc-767 = { path = "../lib/mc-767" }
 icbm-terrain-gen = { path = "../lib/terrain-gen" }
 tracing = { version = "0.1", default-features = false }
