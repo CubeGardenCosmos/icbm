@@ -4,7 +4,7 @@
 //! datarouter receiver 线程转发区块。
 
 use std::fmt;
-use std::io::{Read, Write};
+use std::io::{self, ErrorKind, Read, Write};
 use std::net::TcpStream;
 use std::sync::atomic::{AtomicBool, AtomicI32, AtomicU8, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
@@ -147,8 +147,12 @@ pub struct Client {
     pub uuid: Mutex<Uuid>,
     /// 玩家名（登录前为空）。
     pub name: Mutex<String>,
-    /// 写流（发送锁）。
-    write: Mutex<TcpStream>,
+    /// 对端 IP（正版验证 `hasJoined&ip=` 参数）。
+    peer_ip: String,
+    /// 出站帧队列（写线程消费；`send_packet` 只入队，永不阻塞调用方）。
+    outbound: std::sync::mpsc::SyncSender<Vec<u8>>,
+    /// 写线程句柄（client 释放时随通道关闭退出，Detach 不 join）。
+    writer: Mutex<Option<std::thread::JoinHandle<()>>>,
     /// 压缩阈值（`None` = 未启用）。
     compression: Mutex<Option<i32>>,
     /// 连接状态。
@@ -203,8 +207,9 @@ pub struct Client {
     tx_log: Mutex<std::collections::VecDeque<(i32, usize)>>,
     /// 登录加密共享密钥（启用后 `Some`；正版验证与 AES-CFB8 用）。
     encryption_key: Mutex<Option<[u8; 16]>>,
-    /// 写侧 AES-CFB8 加密器（启用后持续使用，状态跨包保持）。
-    write_cipher: Mutex<Option<AesCfb8>>,
+    /// 写侧 AES-CFB8 加密器（启用后持续使用；写线程独占，Client 侧仅设置）。
+    write_cipher: Arc<Mutex<Option<AesCfb8>>>,
+
     /// 登录 verify token（`CEncryptionRequest` 发出时生成，回包时比对）。
     verify_token: Mutex<Option<Vec<u8>>>,
     /// 上次传送门检测时间（节流用）。
@@ -244,13 +249,47 @@ const STATE_CONFIG: u8 = 3;
 const STATE_PLAY: u8 = 4;
 
 impl Client {
-    /// 新建客户端。
+    /// 出站队列容量上限（防慢客户端无界积累；入队失败即踢）。
+    const OUTBOUND_CAP: usize = 512;
+
+    /// 新建客户端：以 `write` 启动专属写线程（读侧由调用方保留原句柄）。
     #[must_use]
     pub fn new(uuid: Uuid, name: String, write: TcpStream) -> Arc<Self> {
+        let peer_ip = write
+            .peer_addr()
+            .map(|addr| addr.ip().to_string())
+            .unwrap_or_default();
+        let write_cipher: Arc<Mutex<Option<AesCfb8>>> = Arc::new(Mutex::new(None));
+        let thread_cipher = Arc::clone(&write_cipher);
+        let (outbound, rx) = std::sync::mpsc::sync_channel::<Vec<u8>>(Self::OUTBOUND_CAP);
+        // 写线程：独占 socket 写端；帧已由调用方编码（含压缩），此处仅加密+写出。
+        // 阻塞在 socket 上无害——调用方只入队，不等待。
+        let writer = std::thread::Builder::new()
+            .name("client-writer".into())
+            .spawn(move || {
+                let _ = write.set_write_timeout(Some(Duration::from_secs(30)));
+                let mut write = write;
+                for frame in rx {
+                    let encrypted = match thread_cipher.lock().expect("write cipher").as_mut() {
+                        Some(cipher) => {
+                            let mut encrypted = frame;
+                            cipher.encrypt(&mut encrypted);
+                            encrypted
+                        }
+                        None => frame,
+                    };
+                    if write.write_all(&encrypted).is_err() {
+                        break;
+                    }
+                }
+            })
+            .expect("spawn client writer thread");
         Arc::new(Self {
             uuid: Mutex::new(uuid),
             name: Mutex::new(name),
-            write: Mutex::new(write),
+            peer_ip,
+            outbound,
+            writer: Mutex::new(Some(writer)),
             compression: Mutex::new(None),
             state: AtomicU8::new(STATE_HANDSHAKE),
             gamemode: Mutex::new(GameMode::Survival),
@@ -290,8 +329,8 @@ impl Client {
             icbm_subscribed: AtomicBool::new(false),
             icbm_sequence: AtomicU64::new(0),
             tx_log: Mutex::new(std::collections::VecDeque::new()),
+            write_cipher,
             encryption_key: Mutex::new(None),
-            write_cipher: Mutex::new(None),
             verify_token: Mutex::new(None),
             last_portal_check: Mutex::new(Instant::now()),
             last_player_move_sent: Mutex::new(Instant::now()),
@@ -337,20 +376,19 @@ impl Client {
         *self.compression.lock().expect("compression lock")
     }
 
-    /// 发送一个完整包（自动帧编码与压缩；登录加密启用后经 AES-CFB8 写出）。
+    /// 发送一个完整包：帧编码（含压缩）后入队出站队列，由写线程加密+写出。
+    ///
+    /// 入队是非阻塞的（有界队列满即 `BrokenPipe`）；调用方（含 datarouter
+    /// receiver 线程）绝不在慢客户端 socket 上阻塞。
     pub fn send_packet(&self, packet_id: i32, payload: &[u8]) -> Result<(), NetError> {
         let frame =
             icbm_mc_767::packets::encode_frame(packet_id, payload, self.compression_threshold())?;
-        let mut write = self.write.lock().expect("write lock");
-        let mut cipher = self.write_cipher.lock().expect("write cipher");
-        match cipher.as_mut() {
-            Some(cipher) => {
-                let mut encrypted = frame;
-                cipher.encrypt(&mut encrypted);
-                write.write_all(&encrypted)?;
-            }
-            None => write.write_all(&frame)?,
-        }
+        self.outbound.try_send(frame).map_err(|_| {
+            NetError::Io(io::Error::new(
+                ErrorKind::BrokenPipe,
+                "client outbound queue full or closed",
+            ))
+        })?;
         {
             let mut log = self.tx_log.lock().expect("tx log");
             log.push_back((packet_id, payload.len()));
@@ -537,14 +575,21 @@ impl Client {
     /// 对端 IP（正版验证 `hasJoined&ip=` 参数）。
     #[must_use]
     pub fn peer_ip(&self) -> Option<String> {
-        let write = self.write.lock().expect("write lock");
-        write.peer_addr().ok().map(|addr| addr.ip().to_string())
+        (!self.peer_ip.is_empty()).then(|| self.peer_ip.clone())
     }
 
     /// 登录加密共享密钥（启用后 `Some`；`handle_connection` 读侧据此建立解密器）。
     #[must_use]
     pub fn encryption_key(&self) -> Option<[u8; 16]> {
         *self.encryption_key.lock().expect("encryption key")
+    }
+}
+
+impl Drop for Client {
+    fn drop(&mut self) {
+        // 关闭出站通道：写线程 `recv` 返回 None 后退出并释放 socket。
+        // 不 join（写线程可能阻塞在写超时上，detach 由 OS 回收）。
+        let _ = self.writer.lock().expect("writer lock").take();
     }
 }
 

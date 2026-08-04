@@ -165,7 +165,7 @@ pub fn handle_click(inventory: &PlayerInventory, event: ClickEvent) -> ClickResu
     let mut changed: Vec<i32> = Vec::new();
     let mut carried_changed = false;
 
-    let mut push = |slot: i32, changed: &mut Vec<i32>| {
+    let push = |slot: i32, changed: &mut Vec<i32>| {
         if !changed.contains(&slot) {
             changed.push(slot);
         }

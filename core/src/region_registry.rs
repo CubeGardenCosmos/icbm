@@ -336,6 +336,9 @@ impl WorkerRegistry {
 
     /// 分配一个 region 到负载最低的 worker（region 合并）。
     /// 返回 `(worker_id, worker_service_name)`；无可用 worker 返回 `None`。
+    ///
+    /// 跳过已确认死亡的 worker 进程（进程存活探测失败；`kill(pid,0)`），
+    /// 避免把 region 分配给死进程导致永不注册。
     #[must_use]
     pub fn assign_region(&mut self) -> Option<(u32, String)> {
         // 负载相同取 id 更小的 worker（确定性分配）
@@ -343,6 +346,7 @@ impl WorkerRegistry {
             .workers
             .iter()
             .filter(|(_, entry)| entry.alive)
+            .filter(|(_, entry)| worker_process_alive(entry.pid))
             .min_by_key(|(id, _)| (self.load.get(id).copied().unwrap_or(0), **id))
             .map(|(id, _)| *id);
         let id = best?;
@@ -404,8 +408,10 @@ mod tests {
     #[test]
     fn assigns_to_least_loaded_worker() {
         let mut registry = WorkerRegistry::new();
-        registry.register(0, 100, 1);
-        registry.register(1, 200, 2);
+        // pid 用当前进程（真实存活）；假 pid 会被 `worker_process_alive` 过滤
+        let pid = std::process::id();
+        registry.register(0, pid, 1);
+        registry.register(1, pid, 2);
         // 初始负载都是 0 → 选 id 小的
         let (id, service) = registry.assign_region().unwrap();
         assert_eq!(id, 0);
@@ -435,4 +441,14 @@ mod tests {
         assert_eq!(registry.get(0).unwrap().pid, 100);
         assert_eq!(registry.get(1).unwrap().cpu, 2);
     }
+}
+
+/// worker 进程是否存活（`kill(pid,0)`；权限错误视为存活；pid=0 视为不可用）。
+fn worker_process_alive(pid: u32) -> bool {
+    if pid == 0 {
+        return false;
+    }
+    // SAFETY: 仅查询信号 0（不发送）；pid 为 worker 子进程。
+    let result = unsafe { libc::kill(i32::try_from(pid).unwrap_or(-1), 0) };
+    result == 0 || std::io::Error::last_os_error().kind() == std::io::ErrorKind::PermissionDenied
 }

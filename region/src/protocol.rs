@@ -141,8 +141,19 @@ impl Ipc {
             auth_token,
             ..FrontendOptions::default()
         };
-        let frontend = Frontend::connect(options).map_err(IpcError::Datarouter)?;
-        Ok(Self { frontend })
+        // logon BUSY（`DATAROUTER_ERR_BUSY` = "service is already registered"）
+        // 说明旧实例的注册尚未被 switch 回收（TTL 5s）：重连/重分配时退避重试
+        // 到 TTL + 余量，避免新线程 init 立即失败导致玩家注册超时被踢。
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(8);
+        loop {
+            match Frontend::connect(options.clone()) {
+                Ok(frontend) => return Ok(Self { frontend }),
+                Err(code) if matches!(code, 3 | 4 | 6) && std::time::Instant::now() < deadline => {
+                    std::thread::sleep(std::time::Duration::from_millis(100));
+                }
+                Err(code) => return Err(IpcError::Datarouter(code)),
+            }
+        }
     }
 
     /// 发送 `MSG_CONTROL` 帧（`var_data` 留空；kind 为 body 首字节）。

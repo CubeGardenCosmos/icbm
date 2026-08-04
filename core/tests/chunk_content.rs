@@ -2055,3 +2055,49 @@ fn container_click_moves_item_between_slots() {
     assert!(saw_clear, "hotbar slot 40 should be cleared after pickup");
     assert!(saw_cursor, "cursor should carry the picked-up stone");
 }
+
+/// 慢客户端不阻塞 datarouter receiver 线程（写线程隔离回归）。
+///
+/// 旧实现：`forward_chunk_data` 在 receiver 线程内 `write_all` 到阻塞 socket，
+/// 客户端不读时 socket 缓冲填满 → receiver 卡死 >5s → 全 region 心跳批量超时
+/// → 条目被删 → 重分配撞 BUSY → 玩家被踢。新实现：per-client 出站队列 +
+/// 写线程，receiver 只入队。
+#[test]
+fn slow_client_does_not_stall_other_players() {
+    let server = TestServer::start("slow-client");
+    // 玩家 A：进服并保持连接，但停止读取 socket（模拟滞后客户端）
+    let mut client_a = FakeClient::connect(&server.addr);
+    join_to_play(&mut client_a);
+    client_a.recv_until(play_ids::CLIENTBOUND_CHUNK_BATCH_FINISHED, "initial batch");
+
+    // A 移动到远处新 region：触发 81 区块批次洪泛 → A 的 socket 缓冲填满，
+    // 写线程阻塞（旧实现是 receiver 线程阻塞）。
+    let mut move_to = Writer::new();
+    move_to.write_f64_be(1200.0);
+    move_to.write_f64_be(-60.0);
+    move_to.write_f64_be(1200.0);
+    move_to.write_bool(true);
+    client_a.send(play_ids::SERVERBOUND_MOVE_POS, &move_to.into_bytes());
+    std::thread::sleep(Duration::from_millis(800));
+
+    // A 不再读；给服务器时间填满 A 的 socket 缓冲并让写线程阻塞
+    std::thread::sleep(Duration::from_secs(2));
+
+    // 玩家 B：此刻必须仍能正常进服（receiver 未被 A 阻塞）
+    let mut client_b = FakeClient::connect(&server.addr);
+    join_to_play(&mut client_b);
+    client_b.recv_until(play_ids::CLIENTBOUND_CHUNK_BATCH_FINISHED, "initial batch");
+
+    // B 仍被正常服务：收到服务端 keep alive（每 5s 发，证明 receiver 线程
+    // 未被 A 的写阻塞卡住——keep alive 由连接线程发送，但其包也经出站队列；
+    // 而 B 的登录/进服本身已证明 receiver 健康）
+    let deadline = Instant::now() + Duration::from_secs(15);
+    let saw_keep_alive = loop {
+        assert!(Instant::now() < deadline, "B did not receive keep alive");
+        let (id, _payload) = client_b.recv();
+        if id == play_ids::CLIENTBOUND_KEEP_ALIVE {
+            break true;
+        }
+    };
+    assert!(saw_keep_alive, "player B still served while A stalls");
+}

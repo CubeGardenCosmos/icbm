@@ -30,7 +30,8 @@ pub struct ServerConfig {
     pub difficulty: u8,
     /// 出生游戏模式。
     pub default_gamemode: u8,
-    /// 心跳超时（秒，region 失联判定）。
+    /// 心跳超时（秒，region 失联判定；需大于单次 IPC 处理毛刺——
+    /// 接收线程转发大块区块时不被 socket 阻塞后，10s 足够宽松）。
     pub region_timeout_secs: u64,
     /// 沉睡后卸载延迟（秒）。
     pub sleep_unload_secs: u64,
@@ -52,7 +53,7 @@ impl Default for ServerConfig {
             compression_threshold: 256,
             difficulty: 2,
             default_gamemode: 0,
-            region_timeout_secs: 5,
+            region_timeout_secs: 10,
             sleep_unload_secs: 30,
             worker_count: 0, // 0 = 按 cpu-2 自动
         }

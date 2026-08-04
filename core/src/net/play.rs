@@ -268,36 +268,18 @@ pub fn preload_neighbor_regions(server: &Server, client: &Arc<Client>) {
     let position = client.position.lock().expect("position");
     let center = RegionId::from_overworld_chunk(position.chunk_x(), position.chunk_z());
     drop(position);
-    let world_dir = {
-        let world = server.world.lock().expect("world lock");
-        world.world_dir.clone()
-    };
     for drx in -1..=1 {
         for drz in -1..=1 {
             let id = RegionId {
                 rx: center.rx + drx,
                 rz: center.rz + drz,
             };
-            let known = server
-                .world
-                .lock()
-                .expect("world lock")
-                .regions
-                .contains(&id);
-            if known {
-                continue;
-            }
-            let spawn_result = {
-                let mut world = server.world.lock().expect("world lock");
-                world.regions.spawn(
-                    &id,
-                    &world_dir,
-                    &server.config.shm_name,
-                    server.config.log_level,
-                )
-            };
-            if let Err(err) = spawn_result {
-                warn!(id = %id.service_name(), %err, "preload spawn failed");
+            // 走 worker 池（region 合并），不等待注册——预加载是后台预热，
+            // 玩家进入时 `ensure_region` 会等到注册完成。不再直接 spawn 进程
+            // （旧路径产生 `worker_id=None` 的兼容条目，卸载时走 kill 分支且
+            // 留下 zombie）。
+            if let Err(err) = server.assign_region_if_needed(id) {
+                warn!(id = %id.service_name(), %err, "preload assign failed");
                 continue;
             }
             // 半径 0：只生成 region 中心区块作为“地形已生成”信号，不转发给玩家

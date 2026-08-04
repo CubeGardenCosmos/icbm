@@ -16,13 +16,14 @@
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
-use std::time::Duration;
 
 use tracing::{debug, error, info, warn};
 
-use crate::protocol::{CORE_SERVICE, Ipc, decode_worker_region, encode_worker_register, kind};
+use crate::protocol::{
+    CORE_SERVICE, Ipc, IpcMessage, decode_worker_region, encode_worker_register, kind,
+};
 use crate::service::RegionService;
-use crate::{RegionConfig, RegionError, RegionId};
+use crate::{RegionConfig, RegionId};
 
 /// worker 配置。
 #[derive(Debug, Clone)]
@@ -50,6 +51,7 @@ pub struct WorkerHost {
     config: WorkerConfig,
     ipc: Ipc,
     /// worker 服务名（`icbm.worker.<id>`）。
+    #[allow(dead_code)] // 保留字段：日志/调试用
     service_name: String,
     /// 已分配 region（区域 → 停止标志）。
     regions: Mutex<HashMap<(i32, i32), HostedRegion>>,
@@ -91,7 +93,7 @@ impl WorkerHost {
     /// 编排循环：接收 `WORKER_ASSIGN` / `WORKER_RELEASE`，管理 region 线程。
     fn loop_forever(&self) -> Result<(), WorkerError> {
         while self.running.load(Ordering::Relaxed) {
-            let Some(message) = self.ipc.recv(1000).map_err(WorkerError::Ipc)? else {
+            let Some(message) = self.recv_retry()? else {
                 continue;
             };
             match message.kind {
@@ -115,6 +117,26 @@ impl WorkerHost {
             }
         }
         Ok(())
+    }
+
+    /// 接收一帧，对 datarouter 暂态错误（BUSY/FULL/AGAIN）短退避重试。
+    ///
+    /// 任何非暂态 recv 错误都让 worker 进程退出会让宿主 region 全部无清理
+    /// 死亡（心跳批量超时 + 陈旧注册），故暂态错误不能致命。
+    fn recv_retry(&self) -> Result<Option<IpcMessage>, WorkerError> {
+        let mut attempts = 0;
+        loop {
+            match self.ipc.recv(1000) {
+                Ok(message) => return Ok(message),
+                Err(crate::protocol::IpcError::Datarouter(code))
+                    if matches!(code, 3 | 4 | 6) && attempts < 50 =>
+                {
+                    attempts += 1;
+                    std::thread::sleep(std::time::Duration::from_millis(20));
+                }
+                Err(err) => return Err(WorkerError::Ipc(err)),
+            }
+        }
     }
 
     /// 分配一个 region：若未在本 worker 内启动，则拉起 region 模拟线程。

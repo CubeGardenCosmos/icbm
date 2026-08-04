@@ -309,7 +309,6 @@ impl Server {
     /// 宿主内启动 region 模拟线程（注册 `icbm.region.<id>`）。不再每 region
     /// spawn 一个进程，卸载也不杀进程。
     pub fn ensure_region(&self, id: RegionId) -> Result<(), NetError> {
-        // 已注册：直接返回
         if self
             .world
             .lock()
@@ -317,6 +316,26 @@ impl Server {
             .regions
             .get(&id)
             .is_some_and(|entry| entry.alive)
+        {
+            return Ok(());
+        }
+        self.assign_region_if_needed(id)?;
+        self.wait_region_registered(id)
+    }
+
+    /// 把 region 分配出去（worker 或直接 spawn），不等待注册。
+    ///
+    /// 预加载（`preload_neighbor_regions`）用：region 已在 worker 内注册中时
+    /// 幂等返回；无 worker 回退直接 spawn（兼容）。
+    pub fn assign_region_if_needed(&self, id: RegionId) -> Result<(), NetError> {
+        // 已注册或已分配（注册中）：直接返回
+        if self
+            .world
+            .lock()
+            .expect("world lock")
+            .regions
+            .get(&id)
+            .is_some_and(|entry| entry.alive || entry.worker_id.is_some())
         {
             return Ok(());
         }
@@ -343,7 +362,7 @@ impl Server {
                     &self.config.shm_name,
                     self.config.log_level,
                 )?;
-                return self.wait_region_registered(id);
+                return Ok(());
             };
             worker_id
         };
@@ -358,7 +377,7 @@ impl Server {
         if let Err(err) = self.ipc.send(&worker_service, kind::WORKER_ASSIGN, &body) {
             warn!(%err, worker_id, id = %id.service_name(), "worker assign failed");
         }
-        self.wait_region_registered(id)
+        Ok(())
     }
 
     /// 等待 region 完成注册（最多 10 秒）。
@@ -650,8 +669,16 @@ fn maintain_regions(server: &Server) {
     };
     for id in timed_out {
         warn_timed_out(&id);
-        let mut world = server.world.lock().expect("world lock");
-        world.regions.remove(&id);
+        let (pid, worker_id) = {
+            let world = server.world.lock().expect("world lock");
+            let entry = world.regions.get(&id);
+            (entry.map(|e| e.pid), entry.and_then(|e| e.worker_id))
+        };
+        // 主动拆除失联实例：只删条目不停止旧实例会让它继续持有 datarouter
+        // 注册（keepalive 使 TTL 永不回收），重分配时新线程 logon 报 BUSY
+        // （"service is already registered"）→ 玩家注册超时被踢。
+        stop_region_instance(server, id, pid, worker_id);
+        server.world.lock().expect("world lock").regions.remove(&id);
     }
     for id in sleep_unloads {
         let (pid, worker_id) = {
@@ -665,43 +692,52 @@ fn maintain_regions(server: &Server) {
             .expect("world lock")
             .regions
             .entity_base(&id);
-        // worker 模型：向所属 worker 发 `WORKER_RELEASE`（worker 内停止 region
-        // 线程并 flush，进程存活）；不 kill 进程，消除"flush 超时被杀"竞态。
-        if let Some(worker_id) = worker_id {
-            let worker_service = format!("icbm.worker.{worker_id}");
-            let body = encode_worker_region(id.rx, id.rz);
-            let _ = server
-                .ipc
-                .send(&worker_service, kind::WORKER_RELEASE, &body);
-            // 释放 worker 负载计数
-            server
-                .world
-                .lock()
-                .expect("world lock")
-                .workers
-                .release_region(worker_id);
-        } else if let Some(pid) = pid {
-            // 兼容回退：直接 spawn 的 region（无 worker），旧流程发 UNLOAD + 等退出
-            let _ = server.ipc.send(
-                &id.service_name(),
-                kind::REGION_UNLOAD,
-                &encode_unload(DIM_OVERWORLD, id.rx, id.rz),
-            );
-            let deadline = Instant::now() + Duration::from_secs(3);
-            while Instant::now() < deadline && process_alive(pid) {
-                std::thread::sleep(Duration::from_millis(50));
-            }
-            if process_alive(pid) {
-                warn!(id = %id.service_name(), pid, "region did not exit after unload, killing");
-                let _ = kill_process(pid);
-            }
-        }
+        // 停止实例（worker 发 `WORKER_RELEASE`；direct spawn 发 UNLOAD + 收割/杀）
+        stop_region_instance(server, id, pid, worker_id);
         server.world.lock().expect("world lock").regions.remove(&id);
         // 通知在线玩家移除该区域的实体（客户端不感知 region 卸载，需显式 REMOVE_ENTITIES）
         if let Some(base) = entity_base {
             remove_region_entities(server, base);
         }
         info!(id = %id.service_name(), worker_id, "region unloaded after sleep");
+    }
+}
+
+/// 停止一个 region 实例（心跳超时/沉睡卸载共用）。
+///
+/// - worker 宿主：发 `WORKER_RELEASE`（worker 内停止 region 线程并 flush，进程
+///   存活；线程 Drop 时 datarouter 注销，重分配不再撞 BUSY）。
+/// - 直接 spawn（无 worker 的兼容路径）：发 `REGION_UNLOAD` 等退出，先收割
+///   zombie（未收割子进程的 `kill(pid,0)` 恒真），仍存活才 SIGTERM。
+fn stop_region_instance(server: &Server, id: RegionId, pid: Option<u32>, worker_id: Option<u32>) {
+    if let Some(worker_id) = worker_id {
+        let worker_service = format!("icbm.worker.{worker_id}");
+        let body = encode_worker_region(id.rx, id.rz);
+        let _ = server
+            .ipc
+            .send(&worker_service, kind::WORKER_RELEASE, &body);
+        // 释放 worker 负载计数
+        server
+            .world
+            .lock()
+            .expect("world lock")
+            .workers
+            .release_region(worker_id);
+    } else if let Some(pid) = pid {
+        // 兼容回退：直接 spawn 的 region（无 worker），发 UNLOAD + 等退出
+        let _ = server.ipc.send(
+            &id.service_name(),
+            kind::REGION_UNLOAD,
+            &encode_unload(DIM_OVERWORLD, id.rx, id.rz),
+        );
+        let deadline = Instant::now() + Duration::from_secs(3);
+        while Instant::now() < deadline && process_alive(pid) {
+            std::thread::sleep(Duration::from_millis(50));
+        }
+        if process_alive(pid) {
+            warn!(id = %id.service_name(), pid, "region did not exit after unload, killing");
+            let _ = kill_process(pid);
+        }
     }
 }
 
@@ -1038,7 +1074,13 @@ fn parse_worker_service_id(name: &str) -> Option<u32> {
 
 /// 终止 region 子进程（直接发 SIGTERM 信号，不依赖外部 `kill` 命令——
 /// 保持 release 单二进制自包含，可在最小 Linux 环境运行）。
+///
+/// `pid == 0` 表示 worker 占位条目（未记真实进程），发送 SIGTERM 到进程组
+/// 会误伤整组进程——防御性跳过。
 fn kill_process(pid: u32) -> std::io::Result<()> {
+    if pid == 0 {
+        return Ok(());
+    }
     // SAFETY: 仅向已知子进程 PID 发送 SIGTERM；pid 合法则必有返回。
     let result = unsafe { libc::kill(i32::try_from(pid).unwrap_or(-1), libc::SIGTERM) };
     if result == 0 {
@@ -1048,8 +1090,34 @@ fn kill_process(pid: u32) -> std::io::Result<()> {
     }
 }
 
+/// 收割已退出但未被 `waitpid` 的子进程（zombie）。
+///
+/// Rust `Command::spawn` 丢弃 `Child` 后不自动收割，退出进程留 zombie；
+/// 此时 `kill(pid, 0)` 仍返回成功（进程存在），导致 compat 卸载路径恒判
+/// "未退出"。用 `waitpid(WNOHANG)` 收割后再判断。
+fn reap_zombie(pid: u32) {
+    if pid == 0 {
+        return;
+    }
+    // SAFETY: WNOHANG 不阻塞；pid 为已知子进程，回收其退出状态。
+    let mut status: libc::c_int = 0;
+    unsafe {
+        libc::waitpid(
+            i32::try_from(pid).unwrap_or(-1),
+            &raw mut status,
+            libc::WNOHANG,
+        );
+    }
+}
+
 /// 进程是否仍存活（`kill(pid, 0)`；权限错误视为存活）。
+///
+/// 先收割 zombie：`kill(pid,0)` 对僵尸返回成功，会误判已退出进程为存活。
 fn process_alive(pid: u32) -> bool {
+    reap_zombie(pid);
+    if pid == 0 {
+        return false;
+    }
     // SAFETY: 仅查询信号 0（不发送）；pid 为已知子进程。
     let result = unsafe { libc::kill(i32::try_from(pid).unwrap_or(-1), 0) };
     result == 0 || std::io::Error::last_os_error().kind() == std::io::ErrorKind::PermissionDenied
@@ -1072,5 +1140,30 @@ mod tests {
         );
         assert_eq!(parse_region_service_name("icbm.core"), None);
         assert_eq!(parse_region_service_name("icbm.region.n_0_0"), None);
+    }
+
+    #[test]
+    fn zombie_process_is_reaped_and_detected_dead() {
+        use std::process::{Command, Stdio};
+        // 子进程立即退出，句柄丢弃（不 wait）→ 变 zombie；`process_alive`
+        // 应先 `waitpid(WNOHANG)` 收割再判定死亡，避免 compat 卸载路径恒判
+        // "未退出" 并误发 SIGTERM（pid 复用风险）。
+        let child = Command::new("/bin/sh")
+            .args(["-c", "exit 0"])
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .expect("spawn child");
+        let pid = child.id();
+        drop(child);
+        // 等子进程退出成 zombie
+        std::thread::sleep(std::time::Duration::from_millis(200));
+        assert!(
+            !super::process_alive(pid),
+            "zombie child should be reaped and reported dead"
+        );
+        // pid=0 防御：不指向任何进程
+        assert!(!super::process_alive(0));
+        assert!(super::kill_process(0).is_ok());
     }
 }
