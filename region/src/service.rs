@@ -237,6 +237,11 @@ pub struct RegionService {
     last_time_broadcast: Instant,
     /// 天气状态（雨/雷/梯度）。
     weather: crate::weather::WeatherState,
+    /// 流体计划 tick 队列（vanilla `LevelTicks<Fluid>`；放置/邻居变化 →
+    /// `scheduleTick(pos, fluid, getTickDelay)`，到期执行 `FlowingFluid.tick`）。
+    fluid_ticks: crate::ticks::LevelTicks<crate::fluids::FluidKind>,
+    /// 计划 tick 调度顺序计数器（vanilla `subTickOrder`：同 tick 同优先级 FIFO）。
+    sub_tick_order: u64,
 }
 
 impl RegionService {
@@ -401,57 +406,90 @@ impl RegionService {
         Ok(())
     }
 
-    /// 流体 tick：对已加载区块内水/岩浆执行扩散（简化模型），更新与广播。
+    /// 流体计划 tick（vanilla `LevelTicks.tick` 的 fluidTicks 段 + `LiquidBlock`
+    /// onPlace/neighborChanged → `scheduleTick`）。
     ///
-    /// 每 tick 检查已加载区块列（高度范围），收集扩散更新后统一写入并广播
-    /// `CBlockUpdate`（避免 tick 中多次借锁）。
-    fn tick_fluids(&mut self) -> Result<(), RegionError> {
-        // 只遍历含流体的区块（流体脏区块跟踪，避免每 tick 全量扫描 384 高度
-        // 拖慢 region tick、延迟 IPC 响应）
-        let chunks = self.store.fluid_chunks();
-        if chunks.is_empty() {
+    /// 分两阶段：先调度（放置/邻居变化的流体方块 → `scheduleTick(pos, fluid,
+    /// getTickDelay)`），再执行到期 tick（vanilla `FlowingFluid.tick`：非源块
+    /// getNewLiquid 更新自身 + spread 扩散）。
+    fn tick_fluid_ticks(&mut self) -> Result<(), RegionError> {
+        use crate::ticks::{MAX_TICKS_PER_TICK, ScheduledTick, TickPriority};
+        // 1. 调度阶段：放置/移除/邻居变化的流体方块 → 计划 tick
+        //    （vanilla `LiquidBlock.onPlace`/`neighborChanged` → `scheduleTick`）。
+        for (x, y, z) in self.store.fluid_schedule_positions() {
+            let state = self.store.block_at(Face::Overworld, x, y, z).unwrap_or(0);
+            let Some(kind) = crate::fluids::FluidKind::from_state_id(state) else {
+                continue; // 该位置已无流体（被移除/替换），无自身 tick 可调度
+            };
+            let order = self.next_sub_tick_order();
+            self.fluid_ticks.schedule(ScheduledTick {
+                kind,
+                pos: (x, y, z),
+                trigger_tick: self.world_time.max(0) as u64 + kind.tick_delay(),
+                priority: TickPriority::Normal,
+                sub_tick_order: order,
+            });
+        }
+        // 2. 执行到期 tick（vanilla `LevelTicks.tick(l, 65536, this::tickFluid)`）。
+        let game_time = self.world_time.max(0) as u64;
+        let due = self.fluid_ticks.drain_due(game_time, MAX_TICKS_PER_TICK);
+        if due.is_empty() {
             return Ok(());
         }
         let mut updates: Vec<(i32, i32, i32, i32)> = Vec::new();
-        for (cx, cz) in chunks {
-            let min_x = cx * 16;
-            let min_z = cz * 16;
-            let mut pending: Vec<(i32, i32, i32, i32)> = Vec::new();
-            let store = &mut self.store;
-            crate::fluids::tick_fluid(
-                min_x,
-                -64,
-                min_z,
-                min_x + 15,
-                319,
-                min_z + 15,
-                |x, y, z| store.block_at(Face::Overworld, x, y, z).unwrap_or(0),
-                |update| {
-                    pending.push((update.x, update.y, update.z, update.state_id));
-                },
-            );
-            for (x, y, z, state) in pending {
-                if self
-                    .store
-                    .set_block(Face::Overworld, x, y, z, state)
-                    .is_ok()
-                {
-                    updates.push((x, y, z, state));
-                    // 扩散未稳定：下一 tick 继续
-                    self.store.mark_fluid_dirty(cx, cz);
-                }
+        for tick in due {
+            let state = self
+                .store
+                .block_at(Face::Overworld, tick.pos.0, tick.pos.1, tick.pos.2)
+                .unwrap_or(0);
+            if crate::fluids::FluidKind::from_state_id(state) != Some(tick.kind) {
+                continue; // 方块已变化（vanilla `tickFluid` 校验 fluidState.is(fluid)）
+            }
+            let result =
+                crate::fluids::tick_fluid_at(tick.pos.0, tick.pos.1, tick.pos.2, |x, y, z| {
+                    self.store.block_at(Face::Overworld, x, y, z).unwrap_or(0)
+                });
+            for update in &result.updates[..result.len] {
+                updates.push((update.x, update.y, update.z, update.state_id));
+            }
+            // 非源块状态变化：vanilla 重新调度自身（`scheduleTick(self, delay)`）
+            if result.reschedule_self {
+                let order = self.next_sub_tick_order();
+                self.fluid_ticks.schedule(ScheduledTick {
+                    kind: tick.kind,
+                    pos: tick.pos,
+                    trigger_tick: game_time + tick.kind.tick_delay(),
+                    priority: TickPriority::Normal,
+                    sub_tick_order: order,
+                });
             }
         }
+        // 3. 应用更新并广播（vanilla `spreadTo` → `setBlock`；新流体方块经
+        //    `store.set_block` 回流到 fluid_schedule，下一 tick 继续调度扩散）。
         for (x, y, z, state) in updates {
-            let packet = icbm_mc_767::packets::play::clientbound::CBlockUpdate {
-                position: icbm_mc_767::packets::play::BlockPos::new(x, y, z),
-                state_id: state,
-            };
-            self.send_entity_packet(play_ids::CLIENTBOUND_BLOCK_UPDATE, |w| {
-                packet.encode(w);
-            })?;
+            if self
+                .store
+                .set_block(Face::Overworld, x, y, z, state)
+                .is_ok()
+            {
+                let packet = icbm_mc_767::packets::play::clientbound::CBlockUpdate {
+                    position: icbm_mc_767::packets::play::BlockPos::new(x, y, z),
+                    state_id: state,
+                };
+                self.send_entity_packet(play_ids::CLIENTBOUND_BLOCK_UPDATE, |w| {
+                    packet.encode(w);
+                })?;
+            }
         }
         Ok(())
+    }
+
+    /// 下一个调度顺序号（vanilla `subTickOrder`：同 tick 同优先级 FIFO 决胜）。
+    #[allow(clippy::missing_const_for_fn)] // 修改 self.sub_tick_order，不能 const
+    fn next_sub_tick_order(&mut self) -> u64 {
+        let order = self.sub_tick_order;
+        self.sub_tick_order = self.sub_tick_order.wrapping_add(1);
+        order
     }
 
     /// 新建服务（连接 datarouter、打开存档）。
@@ -488,6 +526,8 @@ impl RegionService {
             last_time_broadcast: Instant::now(),
             command_block_fired: std::collections::HashMap::new(),
             piston_powered: std::collections::HashMap::new(),
+            fluid_ticks: crate::ticks::LevelTicks::new(),
+            sub_tick_order: 0,
         })
     }
 
@@ -547,18 +587,20 @@ impl RegionService {
         Err(RegionError::RegistrationRejected)
     }
 
-    /// 模拟 tick。
+    /// 模拟 tick（vanilla `ServerLevel.tick` 顺序：weather → tickTime →
+    /// blockTicks → fluidTicks → blockEvents → entities → blockEntities；
+    /// icbm 无 world border/raids/sleep，对应段省略）。
     fn tick_simulate(&mut self) -> Result<(), RegionError> {
         self.ticker.begin();
         self.drain_messages()?;
         self.flush_chunks()?;
-        self.tick_fluids()?;
+        self.tick_weather()?;
+        self.tick_time()?;
+        self.tick_fluid_ticks()?;
         self.tick_redstone()?;
         self.tick_command_blocks()?;
         self.tick_pistons()?;
         self.tick_crops()?;
-        self.tick_time()?;
-        self.tick_weather()?;
         self.tick_entities()?;
         self.tick_mobs()?;
         // Phase 1 世界 tick：仅随机漫游 Creeper（region 存活信号）

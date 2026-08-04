@@ -24,7 +24,7 @@
 use icbm_mc_767::packets::play::block_state_ids;
 
 /// 流体类型。
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum FluidKind {
     /// 水。
     Water,
@@ -76,6 +76,15 @@ impl FluidKind {
             level
         };
         base + level
+    }
+
+    /// 计划 tick 延迟（vanilla `getTickDelay`：水 5、岩浆 30）。
+    #[must_use]
+    pub const fn tick_delay(self) -> u64 {
+        match self {
+            Self::Water => 5,
+            Self::Lava => 30,
+        }
     }
 
     /// 每格流动衰减（vanilla `getDropOff`：水 1 / 岩浆 2）。
@@ -137,6 +146,231 @@ pub struct FluidUpdate {
     /// 新状态 ID（`0` = 空气，表示消散）。
     pub state_id: i32,
 }
+
+/// 单位置流体 tick 的结果。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct FluidTickResult {
+    /// 本次 tick 产生的方块更新。
+    pub updates: [FluidUpdate; 6],
+    /// 实际产生的更新数（`updates` 前 `len` 项有效）。
+    pub len: usize,
+    /// 非源块状态变化后需重新调度自身（vanilla `FlowingFluid.tick`：
+    /// `getNewLiquid` 变化时 `scheduleTick(self, getSpreadDelay)`）。
+    pub reschedule_self: bool,
+}
+
+/// 单方块 `FlowingFluid.tick`（vanilla）：getNewLiquid 更新自身 + spread 扩散。
+///
+/// 由计划 tick 引擎驱动（每个流体方块在放置/邻居变化时被调度）；与
+/// [`tick_fluid`] 的区域扫描模型并存，供计划 tick 路径使用。
+///
+/// `block_at(x, y, z)` 返回当前状态 ID（`0` = 空气）。越界视为空气。
+#[must_use]
+pub fn tick_fluid_at(
+    x: i32,
+    y: i32,
+    z: i32,
+    mut block_at: impl FnMut(i32, i32, i32) -> i32,
+) -> FluidTickResult {
+    let directions = [(1, 0), (-1, 0), (0, 1), (0, -1)];
+    let state = block_at(x, y, z);
+    let Some(kind) = FluidKind::from_state_id(state) else {
+        return FluidTickResult {
+            updates: [FluidUpdate {
+                x,
+                y,
+                z,
+                state_id: 0,
+            }; 6],
+            len: 0,
+            reschedule_self: false,
+        };
+    };
+    let level = FluidKind::level_from_state_id(state).expect("fluid just matched");
+    let amount = FluidKind::amount_of(level);
+    let is_source = FluidKind::is_source(level);
+    let dropoff = kind.dropoff();
+
+    let mut updates: [FluidUpdate; 6] = [FluidUpdate {
+        x,
+        y,
+        z,
+        state_id: 0,
+    }; 6];
+    let mut n = 0;
+    let mut reschedule_self = false;
+
+    // 1. 非源块先更新自身（vanilla `FlowingFluid.tick` 的 getNewLiquid 段）
+    let mut current = level;
+    let mut current_amount = amount;
+    if !is_source {
+        let new_level = new_self_level(x, y, z, kind, dropoff, &mut block_at, directions);
+        let Some(new_level) = new_level else {
+            // 消散（vanilla：置空气），不再扩散
+            updates[n] = FluidUpdate {
+                x,
+                y,
+                z,
+                state_id: 0,
+            };
+            return FluidTickResult {
+                updates,
+                len: n + 1,
+                reschedule_self: false,
+            };
+        };
+        if new_level != current {
+            current = new_level;
+            current_amount = FluidKind::amount_of(current);
+            reschedule_self = true; // 非源块变化 → 重新调度自身
+            updates[n] = FluidUpdate {
+                x,
+                y,
+                z,
+                state_id: kind.state_id(current),
+            };
+            n += 1;
+        }
+    }
+
+    // 2. 扩散（vanilla `FlowingFluid.spread`）
+    let below = block_at(x, y - 1, z);
+    let below_kind = FluidKind::from_state_id(below);
+    let below_spreadable = below == 0 || (below_kind.is_some() && below_kind != Some(kind));
+    if below_spreadable {
+        updates[n] = FluidUpdate {
+            x,
+            y: y - 1,
+            z,
+            state_id: kind.state_id(8), // falling
+        };
+        n += 1;
+        // 源块 + 至少 3 个源邻居：下落的同时也向侧边扩散
+        if is_source && source_neighbor_count_at(&mut block_at, x, y, z, kind, directions) >= 3 {
+            n += spread_to_sides_at(
+                &mut block_at,
+                &mut updates[n..],
+                x,
+                y,
+                z,
+                kind,
+                current_amount,
+                dropoff,
+                false,
+                directions,
+            );
+        }
+    } else if below_kind != Some(kind) {
+        // 下方是实体方块：源块/流动态/falling 一律向侧边扩散
+        n += spread_to_sides_at(
+            &mut block_at,
+            &mut updates[n..],
+            x,
+            y,
+            z,
+            kind,
+            current_amount,
+            dropoff,
+            FluidKind::is_falling(current),
+            directions,
+        );
+    }
+
+    FluidTickResult {
+        updates,
+        len: n,
+        reschedule_self,
+    }
+}
+
+/// `getNewLiquid` 的自身 LEVEL 计算（vanilla `FlowingFluid.getNewLiquid`）：
+/// 上方同流体 → falling（8）；否则水平邻居最高 amount - dropoff，≤ 0 → 消散
+/// （返回 `None`）。
+fn new_self_level(
+    x: i32,
+    y: i32,
+    z: i32,
+    kind: FluidKind,
+    dropoff: i32,
+    block_at: &mut impl FnMut(i32, i32, i32) -> i32,
+    directions: [(i32, i32); 4],
+) -> Option<i32> {
+    if FluidKind::from_state_id(block_at(x, y + 1, z)) == Some(kind) {
+        return Some(8); // falling：上方有流体
+    }
+    let mut highest = 0;
+    for (dx, dz) in directions {
+        let ns = block_at(x + dx, y, z + dz);
+        if FluidKind::from_state_id(ns) == Some(kind) {
+            let nl = FluidKind::level_from_state_id(ns).expect("fluid just matched");
+            highest = highest.max(FluidKind::amount_of(nl));
+        }
+    }
+    let k = highest - dropoff;
+    if k <= 0 {
+        return None; // 消散（vanilla：置空气）
+    }
+    Some(FluidKind::level_of(k))
+}
+
+/// 水平方向同流体源块（LEVEL 0）数量（vanilla `sourceNeighborCount`；单位置版）。
+fn source_neighbor_count_at(
+    block_at: &mut impl FnMut(i32, i32, i32) -> i32,
+    x: i32,
+    y: i32,
+    z: i32,
+    kind: FluidKind,
+    directions: [(i32, i32); 4],
+) -> i32 {
+    let mut count = 0;
+    for (dx, dz) in directions {
+        let ns = block_at(x + dx, y, z + dz);
+        if FluidKind::from_state_id(ns) == Some(kind)
+            && FluidKind::level_from_state_id(ns) == Some(0)
+        {
+            count += 1;
+        }
+    }
+    count
+}
+
+/// 水平扩散（vanilla `spreadToSides`；单位置版，写入 `updates` 并返回写入数）。
+#[allow(clippy::too_many_arguments)] // 扩散参数多但语义单一
+fn spread_to_sides_at(
+    block_at: &mut impl FnMut(i32, i32, i32) -> i32,
+    updates: &mut [FluidUpdate],
+    x: i32,
+    y: i32,
+    z: i32,
+    kind: FluidKind,
+    amount: i32,
+    dropoff: i32,
+    falling: bool,
+    directions: [(i32, i32); 4],
+) -> usize {
+    let side_amount = if falling { 7 } else { amount - dropoff };
+    if side_amount <= 0 {
+        return 0; // 边缘（amount 1 / 岩浆 amount ≤ 2）不再扩散
+    }
+    let side_level = FluidKind::level_of(side_amount);
+    let side_state = kind.state_id(side_level);
+    let mut n = 0;
+    for (dx, dz) in directions {
+        let ns = block_at(x + dx, y, z + dz);
+        let neighbor_kind = FluidKind::from_state_id(ns);
+        if ns == 0 || (neighbor_kind.is_some() && neighbor_kind != Some(kind)) {
+            updates[n] = FluidUpdate {
+                x: x + dx,
+                y,
+                z: z + dz,
+                state_id: side_state,
+            };
+            n += 1;
+        }
+    }
+    n
+}
+
 /// 流体扩散：遍历指定区域内的流体方块，生成更新。
 ///
 /// `block_at(x, y, z)` 返回当前状态 ID（`0` = 空气）；`set` 收集更新，由调用方
@@ -518,5 +752,73 @@ mod tests {
         assert!(blocks.get(&(2, 0, 0)).is_some(), "lava 2 blocks");
         assert!(blocks.get(&(3, 0, 0)).is_some(), "lava 3 blocks");
         assert_eq!(blocks.get(&(4, 0, 0)), None, "lava stops at 3 blocks");
+    }
+
+    #[test]
+    fn tick_fluid_at_spreads_from_source() {
+        // 单位置 tick（计划 tick 路径）：源块下方为实体（基岩）→ 侧边扩散
+        // （vanilla `spread` 的 else 分支；下方可扩散且源邻居 < 3 时只下落，
+        // 见 water_flows_down_as_falling_column）
+        let mut blocks = std::collections::HashMap::new();
+        blocks.insert((0, -1, 0), block_state_ids::BEDROCK);
+        blocks.insert((0, 0, 0), block_state_ids::WATER); // 源块
+        let result = super::tick_fluid_at(0, 0, 0, |x, y, z| *blocks.get(&(x, y, z)).unwrap_or(&0));
+        // 4 个水平邻居各放流动态（amount 7 → LEVEL 1）
+        assert_eq!(result.len, 4, "4 sides");
+        assert!(
+            !result.reschedule_self,
+            "source unchanged, no self-reschedule"
+        );
+        for update in &result.updates[..result.len] {
+            assert_eq!(update.y, 0);
+            assert_eq!(FluidKind::level_from_state_id(update.state_id), Some(1));
+        }
+    }
+
+    #[test]
+    fn tick_fluid_at_falls_when_below_air() {
+        // 单位置 tick：源块下方为空气 → 下落为 falling（LEVEL 8），源邻居
+        // 不足 3 个时不再侧边扩散（vanilla `spread` 的 canSpreadTo(DOWN) 分支）
+        let mut blocks = std::collections::HashMap::new();
+        blocks.insert((0, 0, 0), block_state_ids::WATER); // 源块，下方为空气
+        let result = super::tick_fluid_at(0, 0, 0, |x, y, z| *blocks.get(&(x, y, z)).unwrap_or(&0));
+        assert_eq!(result.len, 1, "down only");
+        let down = result.updates[0];
+        assert_eq!((down.x, down.y, down.z), (0, -1, 0));
+        assert_eq!(FluidKind::level_from_state_id(down.state_id), Some(8));
+    }
+
+    #[test]
+    fn tick_fluid_at_drains_isolated_flow() {
+        // 单位置 tick：孤立流动态（无源、下方实体）→ 消散为空气
+        let mut blocks = std::collections::HashMap::new();
+        blocks.insert((0, -1, 0), block_state_ids::BEDROCK);
+        blocks.insert((0, 0, 0), block_state_ids::WATER + 1); // LEVEL 1 孤立流
+        let result = super::tick_fluid_at(0, 0, 0, |x, y, z| *blocks.get(&(x, y, z)).unwrap_or(&0));
+        assert_eq!(result.len, 1);
+        assert_eq!(result.updates[0].state_id, 0, "drains to air");
+        assert!(!result.reschedule_self);
+    }
+
+    #[test]
+    fn tick_fluid_at_reschedules_changed_flow() {
+        // 单位置 tick：流动态 level 4 → 邻居源驱动后 level 下降 → reschedule_self
+        let mut blocks = std::collections::HashMap::new();
+        blocks.insert((0, -1, 0), block_state_ids::BEDROCK);
+        blocks.insert((0, 0, 0), block_state_ids::WATER + 4); // LEVEL 4
+        blocks.insert((1, 0, 0), block_state_ids::WATER); // 邻居源（amount 8）
+        let result = super::tick_fluid_at(0, 0, 0, |x, y, z| *blocks.get(&(x, y, z)).unwrap_or(&0));
+        // 自身更新为 higher amount（源邻居 8 - dropoff 1 = 7 → LEVEL 1）
+        assert!(result.reschedule_self);
+        let self_update = result
+            .updates
+            .iter()
+            .take(result.len)
+            .find(|u| (u.x, u.y, u.z) == (0, 0, 0))
+            .expect("self update");
+        assert_eq!(
+            FluidKind::level_from_state_id(self_update.state_id),
+            Some(1)
+        );
     }
 }

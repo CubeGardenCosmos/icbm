@@ -66,11 +66,11 @@ pub struct ChunkStore {
     overworld: HashMap<(i32, i32), ChunkColumn>,
     nether: HashMap<(i32, i32), ChunkColumn>,
     loaded: u32,
-    /// 被 `set_block` 修改的主世界区块（流体 tick 用，处理后清空）。
-    /// 被修改的主世界区块（原流体 tick 全量扫描用；已改为仅含流体的区块）。
+    /// 被 `set_block` 修改的主世界区块（原流体 tick 全量扫描用；已改为仅含流体的区块）。
     dirty: std::collections::HashSet<(i32, i32)>,
-    /// 含流体的主世界区块（流体 tick 用，避免全量 384 高度扫描）。
-    fluid_dirty: std::collections::HashSet<(i32, i32)>,
+    /// 流体相关位置变化（`set_block` 维护：放置/移除/邻居变化 → 计划 tick 调度，
+    /// 对应 vanilla `LiquidBlock.onPlace`/`neighborChanged` → `scheduleTick`）。
+    fluid_schedule: std::collections::HashSet<(i32, i32, i32)>,
     /// 含红石方块的主世界区块（红石 tick 用）。
     redstone_dirty: std::collections::HashSet<(i32, i32)>,
     /// 方块实体 NBT（世界坐标 → NBT；命令方块命令等 `/data` 操作目标）。
@@ -97,7 +97,7 @@ impl ChunkStore {
             nether: HashMap::new(),
             loaded: 0,
             dirty: std::collections::HashSet::new(),
-            fluid_dirty: std::collections::HashSet::new(),
+            fluid_schedule: std::collections::HashSet::new(),
             redstone_dirty: std::collections::HashSet::new(),
             block_entities: std::collections::HashMap::new(),
             command_blocks: std::collections::HashSet::new(),
@@ -265,10 +265,13 @@ impl ChunkStore {
         }
         if face == Face::Overworld {
             self.dirty.insert((cx, cz));
-            // 仅含流体的区块进入流体 tick（旧/新状态任一为水/岩浆）——避免
-            // 每次普通放置都全量扫描 384 高度拖慢 region tick（IPC 响应延迟）
+            // 流体相关位置变化 → 计划 tick 调度（vanilla `LiquidBlock.onPlace`/
+            // `neighborChanged` → `scheduleTick(pos, fluid, getTickDelay)`）。
+            // 旧/新任一为流体都记录：放置时 onPlace 调度自身；移除/替换时
+            // neighborChanged 会让相邻流体重新求值（方块事件循环内扩散目标
+            // 也经 set_block 回流到这里）。
             if crate::fluids::is_fluid(state_id) || crate::fluids::is_fluid(old_state) {
-                self.fluid_dirty.insert((cx, cz));
+                self.fluid_schedule.insert((x, y, z));
             }
             // 红石：旧/新状态任一为红石方块都重新计算——拆除电源/导线也必须
             // 触发相邻导线重新求值（旧实现只查新状态，拆掉红石块后导线永远
@@ -314,16 +317,11 @@ impl ChunkStore {
         self.overworld.keys().copied().collect()
     }
 
-    /// 含流体的主世界区块（流体 tick 用），并清空标记。
-    pub fn fluid_chunks(&mut self) -> Vec<(i32, i32)> {
-        let chunks: Vec<(i32, i32)> = self.fluid_dirty.iter().copied().collect();
-        self.fluid_dirty.clear();
-        chunks
-    }
-
-    /// 流体更新后重新标记区块（扩散未稳定时由 `tick_fluids` 调回）。
-    pub fn mark_fluid_dirty(&mut self, cx: i32, cz: i32) {
-        self.fluid_dirty.insert((cx, cz));
+    /// 需要调度流体计划 tick 的位置（vanilla onPlace/neighborChanged），并清空标记。
+    pub fn fluid_schedule_positions(&mut self) -> Vec<(i32, i32, i32)> {
+        let positions: Vec<(i32, i32, i32)> = self.fluid_schedule.iter().copied().collect();
+        self.fluid_schedule.clear();
+        positions
     }
 
     /// 含红石方块的主世界区块（红石 tick 用），并清空标记。
