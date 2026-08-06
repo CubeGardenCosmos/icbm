@@ -898,6 +898,118 @@ fn piston_pushes_blocks_on_power() {
     assert!(stone_seen, "stone should be pushed to z=8");
 }
 
+/// 粘性活塞缩回：下降沿把前方第 2 格方块拉回头部位置；活塞本体状态按
+/// vanilla 布局（默认 1998 = unextended+north → 伸出 1992 → 缩回 1998）。
+#[test]
+fn sticky_piston_retracts_pulled_block() {
+    let server = TestServer::start("sticky-piston");
+    let mut client = FakeClient::connect(&server.addr);
+    join_to_play(&mut client);
+    client.recv_until(play_ids::CLIENTBOUND_CHUNK_BATCH_FINISHED, "initial batch");
+
+    // 默认粘性活塞朝北（1998），stone 放 z=9（前方）；侧方红石块供电后
+    // 伸出把 stone 推至 z=8。
+    send_chat_command(&mut client, "setblock 20 -60 10 sticky_piston");
+    recv_chat_until(&mut client, "已放置");
+    send_chat_command(&mut client, "setblock 20 -60 9 stone");
+    recv_chat_until(&mut client, "已放置");
+    send_chat_command(&mut client, "setblock 19 -60 10 redstone_block");
+    recv_chat_until(&mut client, "已放置");
+
+    // 伸出：头 2025（north）、stone 推至 z=8、本体 1992（extended+north）
+    let deadline = Instant::now() + Duration::from_secs(15);
+    let mut extended_body = false;
+    let mut pushed = false;
+    while Instant::now() < deadline && !(extended_body && pushed) {
+        let (id, payload) = client.recv();
+        if id == play_ids::CLIENTBOUND_BLOCK_UPDATE {
+            let mut r = Reader::new(&payload);
+            let pos = icbm_mc_767::packets::play::BlockPos::from_long(r.read_i64_be().unwrap());
+            let state = r.read_var_int().unwrap();
+            if pos == icbm_mc_767::packets::play::BlockPos::new(20, -60, 10) {
+                extended_body = state == 1992;
+            }
+            if pos == icbm_mc_767::packets::play::BlockPos::new(20, -60, 8) {
+                pushed = state == 1;
+            }
+        }
+    }
+    assert!(
+        extended_body,
+        "sticky piston body should be extended (1992)"
+    );
+    assert!(pushed, "stone should be pushed to z=8");
+
+    // 撤电源 → 缩回：stone 拉回 z=9、z=8 变空气、本体回 1998
+    send_chat_command(&mut client, "setblock 19 -60 10 air");
+    recv_chat_until(&mut client, "已放置");
+    let deadline = Instant::now() + Duration::from_secs(15);
+    let mut pulled_back = false;
+    let mut unextended_body = false;
+    while Instant::now() < deadline && !(pulled_back && unextended_body) {
+        let (id, payload) = client.recv();
+        if id == play_ids::CLIENTBOUND_BLOCK_UPDATE {
+            let mut r = Reader::new(&payload);
+            let pos = icbm_mc_767::packets::play::BlockPos::from_long(r.read_i64_be().unwrap());
+            let state = r.read_var_int().unwrap();
+            if pos == icbm_mc_767::packets::play::BlockPos::new(20, -60, 9) {
+                pulled_back = state == 1;
+            }
+            if pos == icbm_mc_767::packets::play::BlockPos::new(20, -60, 10) {
+                unextended_body = state == 1998;
+            }
+        }
+    }
+    assert!(pulled_back, "sticky piston should pull stone back to z=9");
+    assert!(
+        unextended_body,
+        "sticky piston body should be unextended (1998)"
+    );
+}
+
+/// BUD 准连接（QC）：红石火把放在正上方方块的顶面——不是活塞直接邻居，
+/// 只经 `getNeighborSignal` 的 pos.above() 段供电（vanilla 第 3 段，BUD
+/// 电路基础）。布局：活塞 (20,-60,10) + 石头 (20,-59,10) + 火把 (20,-58,10)。
+#[test]
+fn piston_bud_powers_via_torch_above_block() {
+    let server = TestServer::start("piston-bud");
+    let mut client = FakeClient::connect(&server.addr);
+    join_to_play(&mut client);
+    client.recv_until(play_ids::CLIENTBOUND_CHUNK_BATCH_FINISHED, "initial batch");
+
+    send_chat_command(&mut client, "setblock 20 -60 10 piston");
+    recv_chat_until(&mut client, "已放置");
+    send_chat_command(&mut client, "setblock 20 -59 10 stone");
+    recv_chat_until(&mut client, "已放置");
+    // 火把在石头顶面（(20,-58,10)），经 QC 供电活塞 → 伸出
+    send_chat_command(&mut client, "setblock 20 -58 10 redstone_torch");
+    recv_chat_until(&mut client, "已放置");
+
+    // 活塞伸出：本体 2011（extended+north），头 2025 出现在 z=9
+    let deadline = Instant::now() + Duration::from_secs(15);
+    let mut extended_body = false;
+    let mut head_seen = false;
+    while Instant::now() < deadline && !(extended_body && head_seen) {
+        let (id, payload) = client.recv();
+        if id == play_ids::CLIENTBOUND_BLOCK_UPDATE {
+            let mut r = Reader::new(&payload);
+            let pos = icbm_mc_767::packets::play::BlockPos::from_long(r.read_i64_be().unwrap());
+            let state = r.read_var_int().unwrap();
+            if pos == icbm_mc_767::packets::play::BlockPos::new(20, -60, 10) {
+                extended_body = state == 2011;
+            }
+            if pos == icbm_mc_767::packets::play::BlockPos::new(20, -60, 9) {
+                head_seen = state == 2025;
+            }
+        }
+    }
+    assert!(
+        extended_body,
+        "piston should extend via QC from torch above"
+    );
+    assert!(head_seen, "piston head should appear at z=9");
+}
+
 /// 地狱传送门：经典 4×5 黑曜石框架自动填充传送门方块；玩家站入触发维度切换。
 #[test]
 fn nether_portal_builds_and_activates() {
