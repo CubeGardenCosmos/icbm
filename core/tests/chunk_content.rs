@@ -865,16 +865,17 @@ fn piston_pushes_blocks_on_power() {
     join_to_play(&mut client);
     client.recv_until(play_ids::CLIENTBOUND_CHUNK_BATCH_FINISHED, "initial batch");
 
-    // 朝南（+z）的活塞 + 前方石头（/setblock 放置默认态，facing=south）
+    // `/setblock piston` 放置默认态 2017 = (extended=false, facing=north)：
+    // 朝北（-z）伸出。旧实现状态数学错误把默认态反解成朝南（+z）。
     send_chat_command(&mut client, "setblock 20 -60 10 piston");
     recv_chat_until(&mut client, "已放置");
-    send_chat_command(&mut client, "setblock 20 -60 11 stone");
+    send_chat_command(&mut client, "setblock 20 -60 9 stone");
     recv_chat_until(&mut client, "已放置");
     // 侧方红石块供电 → 上升沿伸出
     send_chat_command(&mut client, "setblock 19 -60 10 redstone_block");
     recv_chat_until(&mut client, "已放置");
 
-    // 等待：z=11 变活塞头（2025 子态 0）、z=12 变石头（前移）、z=13 无
+    // 等待：z=9 变活塞头（north 头 2025）、z=8 变石头（前移）、z=7 无
     let deadline = Instant::now() + Duration::from_secs(15);
     let mut head_seen = false;
     let mut stone_seen = false;
@@ -884,17 +885,17 @@ fn piston_pushes_blocks_on_power() {
             let mut r = Reader::new(&payload);
             let pos = icbm_mc_767::packets::play::BlockPos::from_long(r.read_i64_be().unwrap());
             let state = r.read_var_int().unwrap();
-            if pos == icbm_mc_767::packets::play::BlockPos::new(20, -60, 11) {
-                // 活塞头（south 朝向 = 2023 + 3*4 = 2035）
-                head_seen = state == 2035;
+            if pos == icbm_mc_767::packets::play::BlockPos::new(20, -60, 9) {
+                // 活塞头（north 朝向 = 2023 + 0*4 + 2 = 2025）
+                head_seen = state == 2025;
             }
-            if pos == icbm_mc_767::packets::play::BlockPos::new(20, -60, 12) {
+            if pos == icbm_mc_767::packets::play::BlockPos::new(20, -60, 8) {
                 stone_seen = state == 1;
             }
         }
     }
-    assert!(head_seen, "piston head should appear at z=11");
-    assert!(stone_seen, "stone should be pushed to z=12");
+    assert!(head_seen, "piston head should appear at z=9");
+    assert!(stone_seen, "stone should be pushed to z=8");
 }
 
 /// 地狱传送门：经典 4×5 黑曜石框架自动填充传送门方块；玩家站入触发维度切换。
@@ -1231,6 +1232,42 @@ fn redstone_wire_turns_off_when_source_removed() {
     );
 }
 
+/// 红石线经导体点亮隔一块方块的灯（vanilla `getSignal`/`getDirectSignalTo`：
+/// 线是强信号源，导体把它透传给相邻灯；旧实现 `strong_signal_around` 不含
+/// 导线，灯隔块不亮）。布局：线 (20,-60,10) → 石头 (21,-60,10) → 灯 (22,-60,10)。
+#[test]
+fn redstone_lamp_lights_through_conductor() {
+    let server = TestServer::start("lamp-through-conductor");
+    let mut client = FakeClient::connect(&server.addr);
+    join_to_play(&mut client);
+    client.recv_until(play_ids::CLIENTBOUND_CHUNK_BATCH_FINISHED, "initial batch");
+
+    send_chat_command(&mut client, "setblock 20 -60 10 redstone_wire");
+    recv_chat_until(&mut client, "已放置");
+    send_chat_command(&mut client, "setblock 21 -60 10 stone");
+    recv_chat_until(&mut client, "已放置");
+    send_chat_command(&mut client, "setblock 22 -60 10 redstone_lamp");
+    recv_chat_until(&mut client, "已放置");
+    send_chat_command(&mut client, "setblock 19 -60 10 redstone_block");
+    recv_chat_until(&mut client, "已放置");
+
+    // 灯 (22,-60,10) 应点亮为 7417（lit=true）
+    let deadline = Instant::now() + Duration::from_secs(15);
+    let mut lit = false;
+    while Instant::now() < deadline && !lit {
+        let (id, payload) = client.recv();
+        if id == play_ids::CLIENTBOUND_BLOCK_UPDATE {
+            let mut r = Reader::new(&payload);
+            let pos = icbm_mc_767::packets::play::BlockPos::from_long(r.read_i64_be().unwrap());
+            let state = r.read_var_int().unwrap();
+            if pos == icbm_mc_767::packets::play::BlockPos::new(22, -60, 10) {
+                lit = state == 7417;
+            }
+        }
+    }
+    assert!(lit, "lamp should light through conductor from wire");
+}
+
 /// 地狱门往返：主世界 → 地狱（目的端自动生成返回传送门）→ 走回传送门返回
 /// 主世界（地狱门无法打开 BUG：无返回传送门 + 地狱面检测不到）。
 #[test]
@@ -1314,6 +1351,49 @@ fn nether_portal_round_trip_generates_return_portal() {
         back_to_overworld,
         "must return to overworld via nether portal"
     );
+}
+
+/// TNT 放置（setblock 即生成点火实体）→ 80 tick 后爆炸破坏地表方块并生成
+/// 掉落物（ADD_ENTITY ITEM）——二阶段「TNT、掉落物实体」链路 + 掉落物按列
+/// 落地的 region 编排。
+#[test]
+fn tnt_explodes_and_drops_items() {
+    let server = TestServer::start("tnt-drop");
+    let mut client = FakeClient::connect(&server.addr);
+    join_to_play(&mut client);
+    client.recv_until(play_ids::CLIENTBOUND_CHUNK_BATCH_FINISHED, "initial batch");
+
+    send_chat_command(&mut client, "setblock 20 -60 10 tnt");
+    recv_chat_until(&mut client, "已放置");
+
+    // 等待：TNT 爆炸（CBlockUpdate 空气：地表草方块被破坏）与掉落物
+    // ADD_ENTITY（ITEM 实体类型 58）出现。
+    let deadline = Instant::now() + Duration::from_secs(20);
+    let mut explosion_seen = false;
+    let mut item_seen = false;
+    while Instant::now() < deadline && !(explosion_seen && item_seen) {
+        let (id, payload) = client.recv();
+        if id == play_ids::CLIENTBOUND_BLOCK_UPDATE {
+            let mut r = Reader::new(&payload);
+            let pos = icbm_mc_767::packets::play::BlockPos::from_long(r.read_i64_be().unwrap());
+            let state = r.read_var_int().unwrap();
+            // 爆炸破坏地表方块（草/泥土变空气）
+            if state == 0 && (pos.y == -61 || pos.y == -62) {
+                explosion_seen = true;
+            }
+        }
+        if id == play_ids::CLIENTBOUND_ADD_ENTITY {
+            let mut r = Reader::new(&payload);
+            let _entity_id = r.read_var_int().unwrap();
+            let _uuid = r.read_uuid().unwrap();
+            let entity_type = r.read_var_int().unwrap();
+            if entity_type == 58 {
+                item_seen = true;
+            }
+        }
+    }
+    assert!(explosion_seen, "TNT explosion should break surface blocks");
+    assert!(item_seen, "explosion should drop item entities");
 }
 
 /// 玩家数据持久化：离线后重新进入恢复游戏模式与位置。

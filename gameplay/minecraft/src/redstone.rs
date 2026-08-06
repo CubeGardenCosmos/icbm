@@ -109,7 +109,13 @@ pub const fn is_conductor(state_id: i32) -> bool {
 
 /// `getDirectSignalTo(blockPos)`：6 方向邻居的强信号最大值（火把/红石块 15，
 /// 红石线在 `shouldSignal=false` 期间 0）。用于导体方块穿透传导。
-fn strong_signal_around(snapshot: &HashMap<(i32, i32, i32), i32>, x: i32, y: i32, z: i32) -> i32 {
+fn strong_signal_around(
+    snapshot: &HashMap<(i32, i32, i32), i32>,
+    x: i32,
+    y: i32,
+    z: i32,
+    include_wires: bool,
+) -> i32 {
     let mut best = 0;
     for (dx, dy, dz) in [
         (1, 0, 0),
@@ -125,6 +131,11 @@ fn strong_signal_around(snapshot: &HashMap<(i32, i32, i32), i32>, x: i32, y: i32
             .unwrap_or(0);
         if is_power_source(state) {
             best = 15;
+        } else if include_wires && let Some(p) = wire_power(state) {
+            // 红石线是强信号源（`RedStoneWireBlock.getDirectSignal = POWER`）；
+            // 仅在 `shouldSignal=true` 上下文（灯/命令方块/活塞）计入，线求值
+            // 期间（`shouldSignal=false`）导线贡献 0。
+            best = best.max(p);
         }
     }
     best
@@ -137,7 +148,27 @@ fn neighbor_signal(snapshot: &HashMap<(i32, i32, i32), i32>, x: i32, y: i32, z: 
     let state = snapshot.get(&(x, y, z)).copied().unwrap_or(0);
     let mut sig = weak_source_signal(state);
     if is_conductor(state) {
-        sig = sig.max(strong_signal_around(snapshot, x, y, z));
+        sig = sig.max(strong_signal_around(snapshot, x, y, z, false));
+    }
+    sig
+}
+
+/// `SignalGetter.getSignal(pos, dir)`（`shouldSignal=true` 上下文）。
+///
+/// 方块自身弱/线信号，导体时并入 6 方向强信号（**含红石线 power**——
+/// `RedStoneWireBlock.getDirectSignal = POWER`，线 → 导体 → 灯/活塞/命令方块
+/// 可被穿透点亮）。用于灯、命令方块与活塞的供电检测；与 [`neighbor_signal`]
+/// （线求值，`shouldSignal=false`）严格区分。
+#[must_use]
+#[allow(clippy::implicit_hasher)] // 内部状态快照，hasher 无关紧要
+pub fn signal_at(snapshot: &HashMap<(i32, i32, i32), i32>, x: i32, y: i32, z: i32) -> i32 {
+    let state = snapshot.get(&(x, y, z)).copied().unwrap_or(0);
+    let mut sig = source_power(state);
+    if let Some(p) = wire_power(state) {
+        sig = sig.max(p); // 线按全额强度（shouldSignal=true）
+    }
+    if is_conductor(state) {
+        sig = sig.max(strong_signal_around(snapshot, x, y, z, true));
     }
     sig
 }
@@ -193,7 +224,8 @@ pub fn compute_wire_power(snapshot: &HashMap<(i32, i32, i32), i32>, x: i32, y: i
 
 /// 红石灯是否应点亮（vanilla `hasNeighborSignal(lampPos)`）：6 方向邻居任一
 /// `getSignal > 0`。与 [`compute_wire_power`] 不同：此处 `shouldSignal=true`，
-/// 相邻红石线按**原始强度**计（不 -1）——功率 1 的线也必须点亮灯。
+/// 相邻红石线按**原始强度**计（不 -1）——功率 1 的线也必须点亮灯；且导体
+/// 邻居会透传相邻红石线的强信号（线 → 方块 → 灯）。
 #[must_use]
 #[allow(clippy::implicit_hasher)] // 内部状态快照，hasher 无关紧要
 pub fn neighbor_has_signal(
@@ -210,18 +242,7 @@ pub fn neighbor_has_signal(
         (0, 0, 1),
         (0, 0, -1),
     ] {
-        let nx = x + dx;
-        let ny = y + dy;
-        let nz = z + dz;
-        let state = snapshot.get(&(nx, ny, nz)).copied().unwrap_or(0);
-        let mut sig = source_power(state);
-        if let Some(p) = wire_power(state) {
-            sig = sig.max(p); // 线按全额强度（shouldSignal=true）
-        }
-        if is_conductor(state) {
-            sig = sig.max(strong_signal_around(snapshot, nx, ny, nz));
-        }
-        if sig > 0 {
+        if signal_at(snapshot, x + dx, y + dy, z + dz) > 0 {
             return true;
         }
     }
@@ -240,7 +261,7 @@ pub const fn lamp_state(lit: bool) -> i32 {
 
 #[cfg(test)]
 mod tests {
-    use super::{compute_wire_power, is_conductor, neighbor_has_signal, wire_power, wire_state};
+    use super::{compute_wire_power, is_conductor, neighbor_has_signal, wire_power};
     use icbm_mc_767::packets::play::block_state_ids as ids;
     use std::collections::HashMap;
 
@@ -365,5 +386,44 @@ mod tests {
         blocks.insert((0, -1, 0), ids::STONE);
         let snap = snapshot_at(&blocks, 1, 0, 0);
         assert!(neighbor_has_signal(&snap, 1, 0, 0));
+    }
+
+    #[test]
+    fn lamp_lights_through_conductor_from_wire() {
+        // vanilla `getSignal`：红石线是强信号源（`getDirectSignal = POWER`），
+        // 导体方块把它透传给相邻灯。线 (0,0,0) → 石头 (1,0,0) → 灯 (2,0,0)：
+        // 灯必须点亮（旧实现 `strong_signal_around` 不含导线，灯不亮）。
+        let mut blocks = HashMap::new();
+        blocks.insert((0, 0, 0), super::wire_state(15));
+        blocks.insert((1, 0, 0), ids::STONE);
+        blocks.insert((2, 0, 0), ids::REDSTONE_LAMP);
+        blocks.insert((0, -1, 0), ids::STONE);
+        blocks.insert((1, -1, 0), ids::STONE);
+        blocks.insert((2, -1, 0), ids::STONE);
+        let snap = snapshot_at(&blocks, 2, 0, 0);
+        assert!(
+            neighbor_has_signal(&snap, 2, 0, 0),
+            "lamp behind conductor must light"
+        );
+    }
+
+    #[test]
+    fn wire_through_conductor_does_not_power_second_wire() {
+        // 对照 vanilla：线求值期间 `shouldSignal=false`，导体不透传导线信号——
+        // 线 A (0,0,0)=15 → 石头 (1,0,0) → 线 B (2,0,0)：B 必须为 0
+        // （旧实现如果简单把导线计入穿透会错，这里钉住 shouldSignal 语义）。
+        let mut blocks = HashMap::new();
+        blocks.insert((0, 0, 0), super::wire_state(15));
+        blocks.insert((1, 0, 0), ids::STONE);
+        blocks.insert((2, 0, 0), ids::REDSTONE_WIRE);
+        blocks.insert((0, -1, 0), ids::STONE);
+        blocks.insert((1, -1, 0), ids::STONE);
+        blocks.insert((2, -1, 0), ids::STONE);
+        let snap = snapshot_at(&blocks, 2, 0, 0);
+        assert_eq!(
+            compute_wire_power(&snap, 2, 0, 0),
+            0,
+            "wire B must not be powered through conductor"
+        );
     }
 }

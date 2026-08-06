@@ -75,11 +75,12 @@ pub struct TntEntity {
 impl ItemEntity {
     /// 掉落物单 tick 行为（vanilla `ItemEntity.tick` 简化）：
     /// 年龄 +1、1 tick 后可拾取、重力下落（0.04/tick²，上限 0.6）、
-    /// 落到地表（`surface_top`）上方停止。
+    /// 落到该列地表（`ground_y` = 脚下方块顶面，即该列最高非空气方块 y+1）
+    /// 上方停止。
     ///
     /// 返回本 tick 的位移（delta × 4096，供 `CMoveEntityPos` 编码）；
     /// 未移动返回 `None`。
-    pub fn tick(&mut self, surface_top: f64) -> Option<(i16, i16, i16)> {
+    pub fn tick(&mut self, ground_y: f64) -> Option<(i16, i16, i16)> {
         self.age = self.age.saturating_add(1);
         // 1 tick 后变为可拾取（vanilla 拾取延迟）
         if self.age >= 1 {
@@ -94,8 +95,8 @@ impl ItemEntity {
         self.x += self.vx;
         self.y += self.vy;
         self.z += self.vz;
-        if self.y < surface_top {
-            self.y = surface_top;
+        if self.y < ground_y {
+            self.y = ground_y;
             self.vy = 0.0;
             self.vx = 0.0;
             self.vz = 0.0;
@@ -272,6 +273,50 @@ mod tests {
         assert_eq!(item.item, "stone");
         assert_eq!(item.count, 3);
         assert!(!item.pickable);
+    }
+
+    #[test]
+    fn item_rests_on_ground_and_becomes_pickable() {
+        // 掉落物脚部静止在该列地表高度（对照 vanilla `ItemEntity` 停在
+        // 方块顶面；旧实现全局 -61 会沉入草方块内部一格）。
+        let mut manager = EntityManager::new();
+        manager.spawn_item(100, 8.5, 4.0, 8.5, "stone", 1);
+        // 地表高度 -60（草方块顶面）：下落后静止在 -60，不再继续下坠
+        for _ in 0..200 {
+            let _ = manager.items[0].tick(-60.0);
+        }
+        let item = &manager.items[0];
+        assert_eq!(item.y, -60.0, "item must rest on surface top");
+        assert!(item.pickable, "item must be pickable after 1 tick");
+        // 挖坑（地表 -61）：掉落物应落到坑底 -61
+        let mut dug = EntityManager::new();
+        dug.spawn_item(101, 8.5, 0.0, 8.5, "stone", 1);
+        for _ in 0..200 {
+            let _ = dug.items[0].tick(-61.0);
+        }
+        assert_eq!(dug.items[0].y, -61.0, "item must rest in dug hole");
+    }
+
+    #[test]
+    fn item_falls_with_gravity_then_rests() {
+        let mut manager = EntityManager::new();
+        manager.spawn_item(100, 0.5, 10.0, 0.5, "stone", 1);
+        // 从高处下落：速度持续为负、位移单调下降，直到触地
+        let mut prev_y = manager.items[0].y;
+        let mut fell = false;
+        for _ in 0..500 {
+            let _ = manager.items[0].tick(-60.0);
+            let y = manager.items[0].y;
+            if y < prev_y {
+                fell = true;
+            }
+            prev_y = y;
+            if y <= -60.0 {
+                break;
+            }
+        }
+        assert!(fell, "item must fall under gravity");
+        assert_eq!(manager.items[0].y, -60.0);
     }
 
     #[test]

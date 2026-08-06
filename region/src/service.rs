@@ -847,15 +847,36 @@ impl RegionService {
 
     /// 实体 tick：掉落物物理（下落/衰减）+ TNT 引信与爆炸。
     fn tick_entities(&mut self) -> Result<(), RegionError> {
+        // 掉落物静止高度按列查询 heightmap（最高非空气方块 y + 1 = 站立高度）：
+        // 未破坏地表 = -60（草方块顶面），挖坑后 = 坑底上方。旧实现全局取
+        // `OVERWORLD_SURFACE_FEET_Y - 1`（-61）把掉落物钳进草方块内部，
+        // 渲染沉入地底一格（对照 vanilla `ItemEntity` 脚部停在方块顶面）。
+        let grounds: Vec<f64> = self
+            .entities
+            .items
+            .iter()
+            .map(|item| {
+                let cx = (item.x as i32).div_euclid(16);
+                let cz = (item.z as i32).div_euclid(16);
+                self.store.get_chunk(Face::Overworld, cx, cz).map_or_else(
+                    |_| f64::from(crate::OVERWORLD_SURFACE_FEET_Y),
+                    |column| {
+                        let local_x = (item.x as i32 & 0xF) as u32;
+                        let local_z = (item.z as i32 & 0xF) as u32;
+                        f64::from(column.heightmap_heights()[(local_z * 16 + local_x) as usize])
+                    },
+                )
+            })
+            .collect();
         // 掉落物与 TNT 行为由 gameplay 定义（重力/碰撞/拾取/引信），
         // 此处只编排（调用行为、发包、清理）。
-        let surface_top = f64::from(crate::OVERWORLD_SURFACE_FEET_Y) - 1.0;
         let item_moves: Vec<(i32, i16, i16, i16)> = self
             .entities
             .items
             .iter_mut()
-            .filter_map(|item| {
-                item.tick(surface_top)
+            .zip(grounds)
+            .filter_map(|(item, ground_y)| {
+                item.tick(ground_y)
                     .map(|(dx, dy, dz)| (item.entity_id, dx, dy, dz))
             })
             .collect();

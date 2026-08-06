@@ -140,6 +140,33 @@ world/
 | 地狱门 | 地狱门依然无法打开（进入时无传送门生成/激活失败） | 已修复（1.2.25） |
 | 流体 | 水/岩浆无法放置与流动（水桶放置无反应） | 已修复（1.2.25） |
 | 皮肤 | 皮肤依然不工作（客户端不显示皮肤/披风），但正版 UUID 已可正常获取 | 已修复（1.2.25） |
+| 活塞朝向 | 活塞伸出方向错误（`/setblock piston` 默认态被反解为朝南，实际 vanilla 朝北） | 已修复（1.2.32） |
+| 红石穿透 | 线隔一块导体点亮灯/驱动活塞/命令方块失效（强信号不穿透） | 已修复（1.2.32） |
+| 掉落物下沉 | 爆炸掉落物沉入地底一格（静止高度低于地表 1 格） | 已修复（1.2.32） |
+
+> 1.2.32 修复说明：
+> - **活塞朝向**：活塞状态数学与朝向序不匹配 vanilla 1.21.1——旧实现按
+>   `base + facing*2 + extended` 且 `facing_offset` 用 `Direction.values()` 序
+>   （下上北南西东）；vanilla `blocks.json` 报告为
+>   `extended[true,false] × facing[north,east,south,west,up,down]`（facing 序
+>   北东南西上下）。`/setblock piston` 默认态 2017 被反解为朝南，活塞伸错方向。
+>   修复为 vanilla 布局（`id = base + extended*6 + facing`、活塞头
+>   `base + facing*4 + short*2 + type`），供电检查补全 vanilla
+>   `getNeighborSignal`（直接邻居排除 facing 方向 + 正上方方块 5 邻居的 QC
+>   BUD），`piston_pushes_blocks_on_power` 测试改为北向默认活塞。
+> - **红石穿透**：`getSignal`/`getDirectSignalTo` 语义——红石线是强信号源
+>   （`RedStoneWireBlock.getDirectSignal = POWER`），导体方块可把它透传给相邻
+>   灯/活塞/命令方块（线 → 方块 → 灯）。旧实现 `strong_signal_around` 只识别
+>   红石块/火把，隔块不亮。修复拆分 `neighbor_signal`（线求值 `shouldSignal`
+>   =false，导线贡献 0，保持原衰减语义）与 `signal_at`（灯/命令方块/活塞路径
+>   `shouldSignal=true`，导体透传含导线 power）。
+> - **掉落物下沉**：掉落物静止高度按列查询 heightmap（最高非空气方块 y+1 =
+>   站立高度）。旧实现全局取 `OVERWORLD_SURFACE_FEET_Y - 1`（-61）把脚部钳进
+>   草方块内部，渲染沉入地底一格；挖坑后也不会落到坑底。修复后未破坏地表
+>   静止在 -60（草方块顶面），挖坑后落到坑底（对照 vanilla `ItemEntity`）。
+> - **TNT 掉落链路**：新增 `tnt_explodes_and_drops_items` 端到端测试（setblock
+>   放 TNT → 80 tick 爆炸 → 地表方块破坏 → 掉落物 ADD_ENTITY），验证
+>   二阶段「TNT、掉落物实体」链路完整可用。
 
 > 1.2.25 修复说明：
 > - **区域切换显示**：视野跨区域时 core 向每个覆盖 region 分别请求区块（沉睡
