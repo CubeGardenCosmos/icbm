@@ -355,7 +355,11 @@ checksum = "6dbf3de79e51f3d586ab4cb9d5c3e2c14aa28ed23d180cf89b4df0454a69cc87"
 
 [[package]]
 name = "icbm-anvil"
+<<<<<<< HEAD
 version = "1.2.32+1.21.1"
+=======
+version = "1.2.31+1.21.1"
+>>>>>>> 5fc30fa (license: 升级为 CubeGarden 通则软件许可（CGSGL）Version 2（通则形式，便于跨项目复用）)
 dependencies = [
  "flate2",
  "icbm-mc-767",
@@ -366,7 +370,11 @@ dependencies = [
 
 [[package]]
 name = "icbm-core"
+<<<<<<< HEAD
 version = "1.2.32+1.21.1"
+=======
+version = "1.2.31+1.21.1"
+>>>>>>> 5fc30fa (license: 升级为 CubeGarden 通则软件许可（CGSGL）Version 2（通则形式，便于跨项目复用）)
 dependencies = [
  "aes",
  "base64",
@@ -397,14 +405,22 @@ dependencies = [
 
 [[package]]
 name = "icbm-gameplay-icbm"
+<<<<<<< HEAD
 version = "1.2.32+1.21.1"
+=======
+version = "1.2.31+1.21.1"
+>>>>>>> 5fc30fa (license: 升级为 CubeGarden 通则软件许可（CGSGL）Version 2（通则形式，便于跨项目复用）)
 dependencies = [
  "icbm-mc-767",
 ]
 
 [[package]]
 name = "icbm-gameplay-minecraft"
+<<<<<<< HEAD
 version = "1.2.32+1.21.1"
+=======
+version = "1.2.31+1.21.1"
+>>>>>>> 5fc30fa (license: 升级为 CubeGarden 通则软件许可（CGSGL）Version 2（通则形式，便于跨项目复用）)
 dependencies = [
  "icbm-mc-767",
  "uuid",
@@ -412,11 +428,19 @@ dependencies = [
 
 [[package]]
 name = "icbm-i18n"
+<<<<<<< HEAD
 version = "1.2.32+1.21.1"
 
 [[package]]
 name = "icbm-mc-767"
 version = "1.2.32+1.21.1"
+=======
+version = "1.2.31+1.21.1"
+
+[[package]]
+name = "icbm-mc-767"
+version = "1.2.31+1.21.1"
+>>>>>>> 5fc30fa (license: 升级为 CubeGarden 通则软件许可（CGSGL）Version 2（通则形式，便于跨项目复用）)
 dependencies = [
  "base64",
  "flate2",
@@ -427,7 +451,11 @@ dependencies = [
 
 [[package]]
 name = "icbm-region"
+<<<<<<< HEAD
 version = "1.2.32+1.21.1"
+=======
+version = "1.2.31+1.21.1"
+>>>>>>> 5fc30fa (license: 升级为 CubeGarden 通则软件许可（CGSGL）Version 2（通则形式，便于跨项目复用）)
 dependencies = [
  "blinkcms-datarouter",
  "icbm-anvil",
@@ -441,7 +469,11 @@ dependencies = [
 
 [[package]]
 name = "icbm-terrain-gen"
+<<<<<<< HEAD
 version = "1.2.32+1.21.1"
+=======
+version = "1.2.31+1.21.1"
+>>>>>>> 5fc30fa (license: 升级为 CubeGarden 通则软件许可（CGSGL）Version 2（通则形式，便于跨项目复用）)
 dependencies = [
  "icbm-mc-767",
 ]
